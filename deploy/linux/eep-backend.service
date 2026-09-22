@@ -1,0 +1,69 @@
+# ══════════════════════════════════════════════════════════════
+# 能源产效管理系统 · 后端服务（Django + gunicorn）
+#
+# 安装：
+#   sudo cp deploy/linux/eep-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now eep-backend
+#
+# 查看日志：
+#   sudo journalctl -u eep-backend -f --since "10 min ago"
+# ══════════════════════════════════════════════════════════════
+
+[Unit]
+Description=EEP Django Backend (gunicorn)
+Documentation=file:///opt/eep-backend/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=eep
+Group=eep
+WorkingDirectory=/opt/eep-backend
+
+# 环境变量从文件读取（密钥不写进 unit 文件，避免随配置管理工具泄露）
+# 前面的 - 表示文件不存在也不报错
+EnvironmentFile=-/opt/eep-backend/.env
+
+# ⚠ 只监听回环，外部访问统一走 Nginx，避免绕过 Nginx 的鉴权与限流
+ExecStart=/opt/eep-backend/.venv/bin/gunicorn \
+          --workers 3 \
+          --threads 4 \
+          --bind 127.0.0.1:8000 \
+          --timeout 120 \
+          --graceful-timeout 30 \
+          --keep-alive 5 \
+          --access-logfile /var/log/eep/backend-access.log \
+          --error-logfile  /var/log/eep/backend-error.log \
+          --capture-output \
+          config.wsgi:application
+
+ExecReload=/bin/kill -s HUP $MAINPID
+
+# 崩溃自动重启
+Restart=always
+RestartSec=5
+
+# 停止时给 30 秒优雅退出（正在处理的整点聚合任务不至于被硬杀）
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# ── 安全加固 ────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# 仅允许写这两处：项目目录（日志/临时文件）与日志目录
+ReadWritePaths=/opt/eep-backend /var/log/eep
+
+# ── 资源限制 ────────────────────────────────────────────────
+LimitNOFILE=65535
+
+# ── 日志 ────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=eep-backend
+
+[Install]
+WantedBy=multi-user.target

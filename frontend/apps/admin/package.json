@@ -1,0 +1,31 @@
+{
+  "name": "@eep/admin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "能源产效管理系统 · 后台管理（Element Plus + 源力设计系统）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "build:only": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@eep/shared": "workspace:*",
+    "@element-plus/icons-vue": "^2.3.1",
+    "@vueuse/core": "^12.2.0",
+    "echarts": "^5.5.1",
+    "element-plus": "^2.9.1",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "sass": "^1.83.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  }
+}

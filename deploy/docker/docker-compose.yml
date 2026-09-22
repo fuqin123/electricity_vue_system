@@ -1,0 +1,121 @@
+# ══════════════════════════════════════════════════════════════
+# 能源产效管理系统 · Docker Compose 编排
+#
+# 启动：
+#   cd deploy/docker
+#   cp .env.example .env        # 然后填写密钥
+#   docker compose up -d --build
+#
+# 更新前端：
+#   docker compose build frontend && docker compose up -d frontend
+#
+# 注意：本文件的 build.context 是**仓库根目录**（../..），
+#       因为 Dockerfile 需要同时访问 frontend/ 与 deploy/。
+#       仓库根目录的 .dockerignore 已排除 node_modules，避免上下文过大。
+# ══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── 前端：大屏 + 后台（Nginx 托管静态产物）───────────────
+  frontend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: eep-frontend:1.1.0
+    container_name: eep-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      # 后端未就绪也允许前端先起来（前端有 mock 兜底，不会白屏）
+      backend:
+        condition: service_started
+    networks:
+      - eep-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── 后端：Django + gunicorn ─────────────────────────────
+  # 本期后端尚未实现，默认用 profiles 关闭。
+  # 后端就绪后：去掉 profiles 注释，或执行 docker compose --profile backend up -d
+  backend:
+    image: eep-backend:1.1.0
+    container_name: eep-backend
+    restart: unless-stopped
+    profiles: ["backend"]
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    volumes:
+      - ./data/backend-logs:/var/log/eep
+      - ./data/reports:/opt/eep-data/reports
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - eep-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── 数据库：PostgreSQL ──────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: eep-db
+    restart: unless-stopped
+    profiles: ["backend"]
+    environment:
+      POSTGRES_DB: ${EEP_DB_NAME:-eep_db}
+      POSTGRES_USER: ${EEP_DB_USER:-eep}
+      POSTGRES_PASSWORD: ${EEP_DB_PASSWORD:?必须设置 EEP_DB_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    networks:
+      - eep-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── 视频转流网关：go2rtc ────────────────────────────────
+  # 现场目前用 Windows 版 go2rtc（E:\能源产效管理平台\go2rtc_win64），
+  # 若改为容器化部署再启用本服务；否则保持注释，前端直连现有网关即可。
+  stream:
+    image: alexxit/go2rtc:latest
+    container_name: eep-stream
+    restart: unless-stopped
+    profiles: ["stream"]
+    ports:
+      - "1984:1984"     # HTTP API / 播放页 / MSE / HLS / MJPEG
+      - "8555:8555"     # WebRTC（TCP+UDP）
+      - "8554:8554"     # RTSP（供录像机再拉流）
+    volumes:
+      - ../go2rtc/go2rtc.example.yaml:/config/go2rtc.yaml:ro
+    networks:
+      - eep-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  eep-net:
+    driver: bridge
+
+volumes:
+  db-data:
+    driver: local

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ══════════════════════════════════════════════════════════════
+  IIS 站点配置 —— 数据中心大屏
+
+  放置位置：C:\inetpub\eep\screen\web.config
+
+  大屏使用 hash 路由（#/overview、#/line/A1），
+  服务端**不需要任何 rewrite**，本文件只做 MIME 与缓存优化。
+  ══════════════════════════════════════════════════════════════
+-->
+<configuration>
+  <system.webServer>
+
+    <httpProtocol>
+      <customHeaders>
+        <remove name="X-Powered-By" />
+        <add name="X-Content-Type-Options" value="nosniff" />
+        <add name="Referrer-Policy" value="same-origin" />
+      </customHeaders>
+    </httpProtocol>
+
+    <staticContent>
+      <remove fileExtension=".mjs" />
+      <mimeMap fileExtension=".mjs" mimeType="application/javascript" />
+      <remove fileExtension=".woff2" />
+      <mimeMap fileExtension=".woff2" mimeType="font/woff2" />
+
+      <!-- 带内容哈希的产物文件名可长期强缓存
+           大屏墙挂终端长期在线，强缓存能显著减少重复加载 -->
+      <clientCache cacheControlMode="UseMaxAge" cacheControlMaxAge="365.00:00:00" />
+    </staticContent>
+
+    <httpCompression>
+      <dynamicTypes>
+        <add mimeType="application/javascript" enabled="true" />
+        <add mimeType="application/json" enabled="true" />
+      </dynamicTypes>
+    </httpCompression>
+
+    <httpErrors errorMode="Detailed" />
+
+  </system.webServer>
+</configuration>

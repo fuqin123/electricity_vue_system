@@ -1,0 +1,53 @@
+# ══════════════════════════════════════════════════════════════
+# 能源产效管理系统 · 日志轮转
+#
+# 安装：
+#   sudo cp deploy/linux/logrotate.eep /etc/logrotate.d/eep
+#
+# 校验（不实际执行）：
+#   sudo logrotate -d /etc/logrotate.d/eep
+#
+# 规范要求（《项目规范》5.3）：本地日志至少保留 30 天，且按大小滚动。
+# 本配置同时满足：daily + rotate 30 + size 50M。
+# ══════════════════════════════════════════════════════════════
+
+/var/log/eep/*.log {
+    daily
+    rotate 30
+    size 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 eep eep
+    sharedscripts
+    postrotate
+        # 让 gunicorn 重新打开日志文件句柄（HUP = 平滑重载）
+        systemctl reload eep-backend > /dev/null 2>&1 || true
+    endscript
+}
+
+# Nginx 日志由 Nginx 自己管理，这里一并纳入统一策略
+/var/log/nginx/eep-*.log {
+    daily
+    rotate 30
+    size 100M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 nginx adm
+    sharedscripts
+    postrotate
+        [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid) 2>/dev/null || true
+    endscript
+}
+
+# 部署备份包不打日志，只保留有限份数（同时由 deploy.sh 自身控制）
+# 如需额外兜底，取消下面注释
+# /opt/eep/_backup/admin-*.tar.gz {
+#     monthly
+#     rotate 6
+#     missingok
+#     notifempty
+# }

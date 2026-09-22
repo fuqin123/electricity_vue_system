@@ -1,0 +1,158 @@
+# ══════════════════════════════════════════════════════════════
+# 能源产效管理系统 · 后端配置示例
+#
+# 使用方式：
+#   cp config/settings.example.yaml config/settings.local.yaml
+#   然后填写真实值。settings.local.yaml 已在 .gitignore 中，不会入库。
+#
+# 配置优先级（《项目规范》5.3）：环境变量 > 配置文件 > 默认值
+#   即同名的环境变量会覆盖此处的值，便于容器化部署。
+#
+# ⚠ 严禁把生产密钥、数据库口令提交进代码库。
+# ══════════════════════════════════════════════════════════════
+
+app:
+  name: 能源产效管理系统
+  code: PLANT01
+  # 运行环境：development | staging | production
+  env: development
+  # 生产环境必须关闭
+  debug: true
+  # 允许访问的 Host（生产环境填实际域名/IP，禁止用 *）
+  allowed_hosts:
+    - 127.0.0.1
+    - localhost
+    - 10.20.31.100
+
+# ── 数据库 ───────────────────────────────────────────────────
+# 口令请用环境变量覆盖：EEP_DB_PASSWORD
+database:
+  engine: postgresql          # postgresql | mysql
+  host: 127.0.0.1
+  port: 5432
+  name: eep_db
+  user: eep
+  password: CHANGE_ME         # ← 用环境变量覆盖，不要在此写真实口令
+  # 连接池
+  conn_max_age: 600
+  conn_health_checks: true
+
+# ── 鉴权 ─────────────────────────────────────────────────────
+# ⚠ 按《项目规范》3.1：登录必须走统一身份认证（SSO），不允许独立账号体系。
+#   下方的 JWT 配置仅用于 SSO 接入前的过渡期与本地联调。
+auth:
+  # 会话 Token 签名密钥，生产环境必须替换为随机长串并用环境变量注入
+  secret_key: CHANGE_ME_PLEASE_USE_ENV
+  access_token_ttl_minutes: 480
+  refresh_token_ttl_days: 7
+  # 连续失败锁定
+  max_login_failures: 3
+  lock_minutes: 5
+  # 统一身份认证（SSO）—— 接入后把 enabled 改为 true
+  sso:
+    enabled: false
+    protocol: oidc            # oidc | saml
+    issuer: ''
+    client_id: ''
+    client_secret: ''         # ← 用环境变量覆盖
+    redirect_uri: ''
+
+# ── 跨域白名单（规范要求必须配置，禁止用 *）──────────────────
+cors:
+  # 前端部署地址：大屏 /screen/、后台 /admin/
+  allowed_origins:
+    - http://10.20.31.100
+    - http://127.0.0.1:5173   # 大屏开发服务器
+    - http://127.0.0.1:5174   # 后台开发服务器
+  allow_credentials: true
+
+# ── 数据采集 ─────────────────────────────────────────────────
+collect:
+  # 原始采样周期（秒）。整点聚合前的轮询频率
+  interval_seconds: 60
+  # 单次读写超时（毫秒）
+  timeout_ms: 5000
+  # 失败重试次数与退避（规范要求外部调用必须重试）
+  retry_times: 3
+  retry_backoff_seconds: 2
+  # 每轮采集最多并发点位，避免把网关打满
+  max_concurrency: 8
+
+  # 电表异常值过滤 —— 会直接影响大屏数字可信度，务必配置
+  filter:
+    # 电表是累计值，入库前做差分。单小时电量超过「额定产能对应能耗 × 该倍数」判为异常
+    kwh_spike_multiple: 2.0
+    # 判定为异常时：null（置空，前端标为电表缺失）/ zero（置 0，不推荐）
+    on_abnormal: null
+    # 累计值回退（换表 / 归零）超过该比例时按换表处理
+    reset_threshold_ratio: 0.5
+
+  # 整点聚合任务的执行偏移（秒）。错开整点避免与采样抢资源
+  aggregate_offset_seconds: 30
+
+# ── 告警 ─────────────────────────────────────────────────────
+alarm:
+  # 通知渠道（规范要求失败必须有告警）
+  notify_channels:
+    - mail
+    - wecom
+  # 是否启用告警判定任务
+  enabled: true
+  # 同类告警合并窗口（分钟），避免刷屏
+  dedup_window_minutes: 30
+  # 值班接收人（企业微信群 / 邮箱）
+  receivers:
+    critical: []
+    major: []
+  mail:
+    host: ''
+    port: 465
+    use_ssl: true
+    user: ''
+    password: ''              # ← 用环境变量覆盖
+    from_addr: eep@plant01.local
+  wecom:
+    webhook: ''               # ← 用环境变量覆盖
+
+# ── 报表 ─────────────────────────────────────────────────────
+report:
+  output_dir: /opt/eep-data/reports
+  # 定时生成（cron 表达式，服务器本地时区）
+  schedules:
+    daily: '0 5 * * *'        # 每日 05:00 生成前一日日报
+    weekly: '0 6 * * 1'       # 每周一 06:00
+    monthly: '0 7 1 * *'      # 每月 1 日 07:00
+
+# ── 日志 ─────────────────────────────────────────────────────
+# 规范要求：本地日志至少保留 30 天，且按大小滚动
+logging:
+  level: INFO                 # DEBUG | INFO | WARNING | ERROR
+  dir: /var/log/eep
+  max_bytes: 52428800         # 单文件 50MB 滚动
+  backup_count: 30            # 保留 30 份
+  # 禁止用 print 调试，统一走 logging
+  console: true
+
+# ── 视频网关（go2rtc）────────────────────────────────────────
+# 说明：视频链路默认由浏览器直连网关，不经过后端。此处仅登记管理信息，
+#       供后台「视频监控」页做展示与自检；如改为后端转发再启用 proxy。
+video:
+  provider: go2rtc
+  gateway_base: http://10.113.1.61:1984
+  api_port: 1984
+  webrtc_port: 8555
+  # 是否由后端反向代理视频流（默认关闭，避免后端成为视频瓶颈）
+  proxy: false
+
+# ── 业务阈值（运行时以数据库中的「系统参数」为准）────────────
+# 此处仅为首次初始化的默认值；上线后由能源管理员在后台维护，
+# 避免出现「配置文件与页面两套口径」。
+# ⚠ 上线前必须用真实历史数据回填。
+energy_defaults:
+  target_unit_kwh: 8.20           # 单位电耗考核目标 kWh/千瓶
+  alarm_unit_kwh_high: 9.60       # 单位电耗告警上限 kWh/千瓶
+  output_low_rate: 0.75           # 低产判定（占额定比）
+  base_load_kwh_per_hour: 20      # 单线基础负荷 kWh/h
+  variable_kwh_per_bottle: 0.0068 # 单线变动电耗 kWh/瓶
+  water_per_bottle_l: 2.8         # 车间水耗强度 L/瓶
+  steam_per_bottle_kg: 0.21       # 车间汽耗强度 kg/瓶

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ══════════════════════════════════════════════════════════════
+  IIS 站点配置 —— 后台管理系统（history 路由）
+
+  放置位置：C:\inetpub\eep\admin\web.config
+  前置依赖：必须安装 URL Rewrite 模块
+            https://www.iis.net/downloads/microsoft/url-rewrite
+
+  ⚠ 部署到子路径 /admin/ 时，<action url> 与 assets 排除规则都要带 /admin/ 前缀，
+    且必须与 frontend/apps/admin/vite.config.ts 的 base 保持一致。
+    若部署在站点根目录，把下面两处 /admin/ 去掉即可。
+
+  ⚠ 更新版本时不要删掉本文件（建议先备份再替换 dist 内容），
+    否则 history 回退失效 → 刷新子路由 404。
+
+  自检：curl -s -o NUL -w "%{http_code}" http://<IP>:8081/system/user
+        期望 200；404 说明回退没生效。
+  ══════════════════════════════════════════════════════════════
+-->
+<configuration>
+  <system.webServer>
+
+    <!-- ① history 模式路由回退 -->
+    <rewrite>
+      <rules>
+        <rule name="Vue History Fallback" stopProcessing="true">
+          <match url=".*" />
+          <conditions logicalGrouping="MatchAll">
+            <!-- 真实存在的文件/目录不走回退 -->
+            <add input="{REQUEST_FILENAME}" matchType="IsFile" negate="true" />
+            <add input="{REQUEST_FILENAME}" matchType="IsDirectory" negate="true" />
+            <!-- 静态资源与 API 不走回退 -->
+            <add input="{REQUEST_URI}" pattern="^/admin/assets/" negate="true" />
+            <add input="{REQUEST_URI}" pattern="^/api/" negate="true" />
+          </conditions>
+          <action type="Rewrite" url="/admin/index.html" />
+        </rule>
+      </rules>
+    </rewrite>
+
+    <!-- ② 安全响应头 + 入口文件不缓存
+         注意：这里只设 no-cache 兜底，带内容哈希的 assets 由 staticContent
+         的 clientCache 单独给长缓存（IIS 会以更具体的路径规则优先）。 -->
+    <httpProtocol>
+      <customHeaders>
+        <remove name="X-Powered-By" />
+        <add name="X-Content-Type-Options" value="nosniff" />
+        <add name="X-Frame-Options" value="SAMEORIGIN" />
+        <add name="Referrer-Policy" value="same-origin" />
+      </customHeaders>
+    </httpProtocol>
+
+    <!-- ③ 静态内容 MIME 类型
+         老版本 IIS 不认识 .mjs / .woff2，会返回 404 导致页面白屏 -->
+    <staticContent>
+      <remove fileExtension=".mjs" />
+      <mimeMap fileExtension=".mjs" mimeType="application/javascript" />
+      <remove fileExtension=".woff2" />
+      <mimeMap fileExtension=".woff2" mimeType="font/woff2" />
+      <remove fileExtension=".webmanifest" />
+      <mimeMap fileExtension=".webmanifest" mimeType="application/manifest+json" />
+    </staticContent>
+
+    <!-- ④ 压缩 -->
+    <httpCompression>
+      <dynamicTypes>
+        <add mimeType="application/javascript" enabled="true" />
+        <add mimeType="application/json" enabled="true" />
+      </dynamicTypes>
+    </httpCompression>
+
+    <httpErrors errorMode="Detailed" />
+
+  </system.webServer>
+</configuration>

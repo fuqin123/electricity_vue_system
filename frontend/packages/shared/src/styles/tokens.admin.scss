@@ -1,0 +1,129 @@
+// ══════════════════════════════════════════════════════════════
+// 后台管理设计令牌 —— 源力设计系统（Yuanli Design System）
+// 主色源力蓝 #1664FF · 4px 栅格 · 48px 顶栏 · 32px 操作高度 · 仅亮色模式
+// 来源：Volcengine_design/colors_and_type.css（取其与后台相关的子集并收敛命名）
+// ══════════════════════════════════════════════════════════════
+
+:root {
+  /* ── 主色（源力蓝）── */
+  --yl-primary-1: #f3f7ff;
+  --yl-primary-2: #ebf1ff;
+  --yl-primary-3: #a0c0ff;
+  --yl-primary-4: #ccddff;
+  --yl-primary-5: #387bff;
+  --yl-primary-6: #1664ff; // 主色
+  --yl-primary-7: #0055ff; // hover / active
+  --yl-primary-disabled: #a2c1ff;
+
+  /* ── 文本 ── */
+  --yl-text-strong: #0c0d0e;
+  --yl-text-regular: #1d2129;
+  --yl-text-secondary: #42464e;
+  --yl-text-subtle: #86909c;
+  --yl-text-3: #737a87;
+  --yl-text-disabled: #c9cdd4;
+
+  /* ── 边框 ── */
+  --yl-border-1: #eaedf1;
+  --yl-border-2: #e1e4e8;
+  --yl-border-3: #d1d5da;
+  --yl-border-4: #959da5;
+
+  /* ── 背景 / 表面 ── */
+  --yl-bg: #ffffff;
+  --yl-surface: #ffffff;
+  --yl-surface-container: #f7f9fb;
+  --yl-surface-container-high: #f1f4f8;
+  --yl-bg-sidebar: #f6f8fa;
+  --yl-bg-hover: #f2f3f5;
+  --yl-inverse-surface: #1d2129;
+
+  /* ── 状态色 ── */
+  --yl-success: #2a814b;
+  --yl-success-bg: #e2f5eb;
+  --yl-warning: #bd7e00;
+  --yl-warning-bg: #fdf3de;
+  --yl-danger: #d7312a;
+  --yl-danger-bg: #feeced;
+  --yl-info: #1664ff;
+  --yl-info-bg: #ebf1ff;
+
+  /* ── 交互态 ── */
+  --yl-state-hover: rgba(22, 100, 255, 0.08);
+  --yl-state-focus: rgba(22, 100, 255, 0.12);
+  --yl-state-press: rgba(22, 100, 255, 0.16);
+
+  /* ── 圆角 ── */
+  --yl-radius-sm: 4px;
+  --yl-radius-md: 8px;
+  --yl-radius-lg: 12px;
+  --yl-radius-full: 9999px;
+
+  /* ── 间距（4px 栅格）── */
+  --yl-space-1: 4px;
+  --yl-space-2: 8px;
+  --yl-space-3: 12px;
+  --yl-space-4: 16px;
+  --yl-space-5: 20px;
+  --yl-space-6: 24px;
+  --yl-space-8: 32px;
+  --yl-space-10: 40px;
+
+  /* ── 尺寸基准 ── */
+  --yl-topnav-height: 48px; // 顶栏 48px
+  --yl-sidebar-width: 200px;
+  --yl-control-height: 32px; // 操作高度 32px
+  --yl-page-gutter: 24px;
+
+  /* ── 字体 ── */
+  --yl-font-sans: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --yl-font-mono: "SFMono-Regular", "SF Mono", "Roboto Mono", Consolas, monospace;
+  --yl-font-size-display: 24px;
+  --yl-font-size-h1: 20px;
+  --yl-font-size-h2: 18px;
+  --yl-font-size-h3: 16px;
+  --yl-font-size-h4: 14px;
+  --yl-font-size-body: 12px;
+  --yl-font-size-lead: 13px;
+  --yl-font-size-caption: 10px;
+
+  /* ── 阴影 ── */
+  --yl-shadow-1: 0 1px 2px 0 rgba(12, 13, 14, 0.05);
+  --yl-shadow-2: 0 2px 6px 0 rgba(12, 13, 14, 0.08);
+  --yl-shadow-3: 0 5px 15px 0 rgba(12, 13, 14, 0.08), 0 2px 4px 0 rgba(12, 13, 14, 0.04);
+  --yl-shadow-card: 0 2px 6px 0 rgba(0, 0, 0, 0.05);
+
+  /* ── 图表色板（与源力 chart-1..5 对齐）── */
+  --yl-chart-1: #1664ff;
+  --yl-chart-2: #2a814b;
+  --yl-chart-3: #bd7e00;
+  --yl-chart-4: #d7312a;
+  --yl-chart-5: #4e5969;
+}
+
+// ── SCSS 变量（供组件内计算使用）──
+$yl-primary: #1664ff;
+$yl-primary-hover: #0055ff;
+$yl-primary-1: #f3f7ff;
+$yl-primary-2: #ebf1ff;
+$yl-primary-disabled: #a2c1ff;
+
+$yl-text-strong: #0c0d0e;
+$yl-text-regular: #1d2129;
+$yl-text-subtle: #86909c;
+$yl-text-disabled: #c9cdd4;
+
+$yl-border: #eaedf1;
+$yl-border-strong: #dde2e9;
+$yl-bg: #ffffff;
+$yl-bg-sidebar: #f6f8fa;
+$yl-bg-hover: #f2f3f5;
+
+$yl-success: #2a814b;
+$yl-warning: #bd7e00;
+$yl-danger: #d7312a;
+
+$yl-radius: 4px;
+$yl-topnav-h: 48px;
+$yl-sidebar-w: 200px;
+$yl-control-h: 32px;

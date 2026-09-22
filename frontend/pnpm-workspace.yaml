@@ -1,0 +1,19 @@
+# ⚠ pnpm v10 起，工作区级设置以「本文件」为准（.npmrc 中的同名项会被忽略）
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# 依赖安装脚本白名单：pnpm 默认禁止依赖执行 postinstall，
+# esbuild 与 vue-demi 需要放行，否则 vite 构建会报「平台二进制缺失」。
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true
+  vue-demi: true
+
+# Windows 未开启「开发者模式」时，pnpm 默认的符号链接式 node_modules
+# 会因权限不足而只创建出空目录（现象：Cannot find module / 命令找不到）。
+# 改用 hoisted 扁平布局，全部以硬链接落到实体目录，规避符号链接权限问题。
+nodeLinker: hoisted
+
+# 仓库缓存放在项目上一级目录，避免 E:\ 根目录写入权限不足
+storeDir: E:\能源产效管理平台\.pnpm-store

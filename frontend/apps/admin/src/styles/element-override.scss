@@ -1,0 +1,154 @@
+/* ══════════════════════════════════════════════════════════════
+   element-override.scss —— Element Plus 主题对齐源力设计系统
+   目标：主色源力蓝 #1664FF、4px 圆角、32px 控件高度、亮色模式的
+        中性灰阶与 #1664FF 系品牌色完全一致。
+   ⚠ 仅在后台管理应用中生效。
+   ══════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── 主色与衍生梯度（对应源力 primary-1…8）── */
+  --el-color-primary: #1664ff;
+  --el-color-primary-dark-2: #0055ff;
+  --el-color-primary-light-3: #6e9fff;
+  --el-color-primary-light-5: #97bcff;
+  --el-color-primary-light-7: #c0d5ff;
+  --el-color-primary-light-8: #d6e5ff;
+  --el-color-primary-light-9: #ebf1ff;
+
+  /* ── 状态色 ── */
+  --el-color-success: #2a814b;
+  --el-color-success-light-3: #6aa886;
+  --el-color-success-light-5: #a2c9b4;
+  --el-color-success-light-7: #c8e0d4;
+  --el-color-success-light-8: #dbece4;
+  --el-color-success-light-9: #e2f5eb;
+
+  --el-color-warning: #bd7e00;
+  --el-color-warning-light-3: #d2a44d;
+  --el-color-warning-light-5: #e2c389;
+  --el-color-warning-light-7: #eedcb9;
+  --el-color-warning-light-8: #f4e7d0;
+  --el-color-warning-light-9: #fdf3de;
+
+  --el-color-danger: #d7312a;
+  --el-color-danger-light-3: #e4706b;
+  --el-color-danger-light-5: #eda39f;
+  --el-color-danger-light-7: #f4c6c4;
+  --el-color-danger-light-8: #f8d8d7;
+  --el-color-danger-light-9: #feeced;
+
+  --el-color-error: #d7312a;
+  --el-color-error-light-9: #feeced;
+
+  --el-color-info: #86909c;
+  --el-color-info-light-3: #b0b6be;
+  --el-color-info-light-5: #c9cdd4;
+  --el-color-info-light-7: #dfe2e6;
+  --el-color-info-light-8: #ebedef;
+  --el-color-info-light-9: #f2f3f5;
+
+  /* ── 文本与边框 ── */
+  --el-text-color-primary: #1d2129;
+  --el-text-color-regular: #1d2129;
+  --el-text-color-secondary: #737a87;
+  --el-text-color-placeholder: #c9cdd4;
+  --el-text-color-disabled: #c9cdd4;
+  --el-text-color-primary-heading: #0c0d0e;
+
+  --el-border-color: #dde2e9;
+  --el-border-color-light: #e1e4e8;
+  --el-border-color-lighter: #eaedf1;
+  --el-border-color-extra-light: #f1f4f8;
+  --el-border-color-dark: #d1d5da;
+  --el-border-color-darker: #959da5;
+
+  --el-bg-color: #ffffff;
+  --el-bg-color-page: #f7f9fb;
+  --el-bg-color-overlay: #ffffff;
+  --el-fill-color: #f2f3f5;
+  --el-fill-color-light: #f7f9fb;
+  --el-fill-color-lighter: #fcfdfe;
+  --el-fill-color-blank: #ffffff;
+
+  /* ── 尺寸与圆角：4px 栅格 · 32px 操作高度 ── */
+  --el-border-radius-base: 4px;
+  --el-border-radius-small: 4px;
+  --el-border-radius-round: 9999px;
+  --el-component-size: 32px;
+  --el-component-size-small: 26px;
+  --el-component-size-large: 40px;
+
+  /* ── 字体 ── */
+  --el-font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  --el-font-size-base: 13px;
+  --el-font-size-small: 12px;
+  --el-font-size-extra-small: 11px;
+
+  /* ── 阴影 ── */
+  --el-box-shadow-light: 0 2px 6px 0 rgba(12, 13, 14, 0.08);
+  --el-box-shadow: 0 5px 15px 0 rgba(12, 13, 14, 0.08), 0 2px 4px 0 rgba(12, 13, 14, 0.04);
+  --el-box-shadow-lighter: 0 1px 2px 0 rgba(12, 13, 14, 0.05);
+
+  --el-disabled-bg-color: #f7f9fb;
+}
+
+/* ── 组件级微调 ───────────────────────────────────────── */
+
+/* 按钮：默认高度 32px，去掉默认的字体加粗感 */
+.el-button {
+  font-weight: 400;
+  padding: 0 12px;
+}
+.el-button--primary { font-weight: 500; }
+
+/* 表格：表头浅灰底 + 无竖向分割线，贴近源力列表页样式 */
+.el-table {
+  font-size: 13px;
+  --el-table-border-color: var(--el-border-color-lighter);
+  --el-table-header-bg-color: #f7f9fb;
+  --el-table-header-text-color: #737a87;
+  --el-table-row-hover-bg-color: #f3f7ff;
+  --el-table-text-color: #1d2129;
+}
+.el-table th.el-table__cell {
+  font-weight: 400;
+  font-size: 12px;
+  background: #f7f9fb;
+}
+.el-table .el-table__cell { padding: 9px 0; }
+.el-table .cell { line-height: 20px; }
+
+/* 表单：标签右对齐，控件 32px */
+.el-form-item__label { color: #737a87; font-weight: 400; }
+
+/* 分页：右对齐、尺寸紧凑 */
+.el-pagination { justify-content: flex-end; margin-top: 16px; }
+.el-pagination.is-background .el-pager li { border-radius: 4px; }
+
+/* 标签：源力状态标签的半透明底色风格 */
+.el-tag { border-radius: 4px; border: none; font-weight: 400; }
+.el-tag--primary { color: #1664ff; background: #ebf1ff; }
+.el-tag--success { color: #2a814b; background: #e2f5eb; }
+.el-tag--warning { color: #bd7e00; background: #fdf3de; }
+.el-tag--danger { color: #d7312a; background: #feeced; }
+.el-tag--info { color: #737a87; background: #f2f3f5; }
+
+/* 卡片 / 弹窗 */
+.el-card { border-radius: 4px; border-color: var(--el-border-color-lighter); }
+.el-dialog { border-radius: 8px; }
+.el-dialog__header { margin-right: 0; padding-bottom: 12px; border-bottom: 1px solid var(--el-border-color-lighter); }
+.el-dialog__title { font-size: 16px; font-weight: 500; color: #0c0d0e; }
+.el-dialog__body { padding-top: 16px; }
+.el-drawer__header { margin-bottom: 0; padding-bottom: 16px; border-bottom: 1px solid var(--el-border-color-lighter); }
+
+/* 菜单：源力侧边栏选中态（浅蓝底 + 主色文字） */
+.el-menu { border-right: none; }
+.el-menu-item.is-active { background: rgba(22, 100, 255, 0.06) !important; }
+.el-sub-menu.is-active > .el-sub-menu__title { color: #1664ff; }
+
+/* 消息 / 通知 */
+.el-message { border-radius: 4px; }
+.el-message-box { border-radius: 8px; }
+
+/* 描述列表 */
+.el-descriptions__label { color: #737a87 !important; font-weight: 400 !important; }

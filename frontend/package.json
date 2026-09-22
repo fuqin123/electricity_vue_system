@@ -1,0 +1,30 @@
+{
+  "name": "energy-efficiency-platform-frontend",
+  "version": "1.1.0",
+  "private": true,
+  "description": "能源产效管理系统 · 前端工程（数据中心大屏 + 后台管理系统，pnpm monorepo）",
+  "engines": {
+    "node": ">=20.19.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev:screen": "pnpm -F @eep/screen dev",
+    "dev:admin": "pnpm -F @eep/admin dev",
+    "build:screen": "pnpm -F @eep/screen build",
+    "build:admin": "pnpm -F @eep/admin build",
+    "//build": "⚠ 必须串行：vue-tsc 单个进程峰值可达 1.5GB，两个应用并行会触发换页，构建时间从 20s 涨到 10min+",
+    "build": "pnpm build:screen && pnpm build:admin",
+    "preview:screen": "pnpm -F @eep/screen preview",
+    "preview:admin": "pnpm -F @eep/admin preview",
+    "//typecheck": "同样串行，理由同 build",
+    "typecheck": "pnpm -r --workspace-concurrency=1 typecheck",
+    "format": "prettier --write \"**/*.{ts,vue,scss,css,json,md}\"",
+    "clean": "pnpm -F @eep/screen exec rm -rf dist && pnpm -F @eep/admin exec rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "prettier": "^3.4.2",
+    "sass": "^1.83.0",
+    "typescript": "~5.7.2"
+  }
+}

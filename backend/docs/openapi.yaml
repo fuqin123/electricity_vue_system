@@ -1,0 +1,1044 @@
+# ══════════════════════════════════════════════════════════════
+# 能源产效管理系统 · OpenAPI 3.0 描述文件
+#
+# 用途：
+#   · 生成 Swagger UI（drf-spectacular 可直接引用）
+#   · 前端联调时作为接口约定的机器可读版本
+#   · CI 中做契约校验
+#
+# ⚠ 字段级语义说明以 docs/api-contract.md 为准，本文件是它的机器可读镜像。
+#    修改任一处都必须同步另一处，并同步 frontend/packages/shared/src/types.ts
+#
+# 校验方式：
+#   npx @redocly/cli lint backend/docs/openapi.yaml
+# ══════════════════════════════════════════════════════════════
+
+openapi: 3.0.3
+
+info:
+  title: 能源产效管理系统 API
+  version: 1.1.0
+  description: |
+    车间电 / 水 / 汽 能源数据与产量数据的统一接口。
+
+    ## 三条必须遵守的口径约定
+
+    1. **未采集 ≠ 0**。未到时段的数值字段返回 `null` 并置 `future: true`；
+       应报未报返回 `null`。补 0 会让大屏显示成「产量暴跌」，属于造假曲线。
+
+    2. **单位电耗 = 小时电量 ÷ 小时产量 × 1000**，产量为 0 时返回 `null`（不是 0）。
+
+    3. **水、汽只有车间总表**，不可拆分到产线；车间级按「合计产量 × 强度系数」折算。
+
+    ## 鉴权
+
+    所有接口需 `Authorization: Bearer <token>`（白名单接口需评审通过）。
+    正式环境登录走公司统一身份认证（SSO）。
+  contact:
+    name: 能源产效管理平台项目组
+  license:
+    name: 内部项目：仅限公司内网使用
+
+servers:
+  - url: /api
+    description: 与前端同域（由 Nginx 反向代理到后端）
+  - url: http://127.0.0.1:8000/api
+    description: 本地开发
+
+tags:
+  - name: energy
+    description: 大屏数据（能源与产量聚合）
+  - name: auth
+    description: 认证
+  - name: admin
+    description: 后台管理
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ════════════════════════════════════════════════════════════
+  # 大屏
+  # ════════════════════════════════════════════════════════════
+  /energy/overview:
+    get:
+      tags: [energy]
+      summary: 大屏总览聚合数据
+      description: |
+        一次返回大屏「车间总览」所需的全部数据：6 条产线、年/月/日/时趋势、水汽用量、告警。
+
+        ⚠ 顶层必须包含 `workshop` 字段 —— 前端据此判定接口结构是否符合约定，
+        缺失会直接抛出「接口返回结构不符合约定」。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnergySnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /energy/line/{lineId}:
+    get:
+      tags: [energy]
+      summary: 单条产线聚合数据
+      parameters:
+        - name: lineId
+          in: path
+          required: true
+          description: 产线编号
+          schema:
+            type: string
+            example: A1
+            enum: [A1, A2, A3, A4, A5, A6]
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [now, line]
+                properties:
+                  now:
+                    type: string
+                    format: date-time
+                  line:
+                    $ref: '#/components/schemas/LineData'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /energy/hourly:
+    get:
+      tags: [energy]
+      summary: 原始小时明细（导出与对账用）
+      parameters:
+        - name: date
+          in: query
+          description: 统计日期，默认今天
+          schema:
+            type: string
+            format: date
+            example: '2026-09-22'
+        - name: lineId
+          in: query
+          description: 产线编号，不传返回全部
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [lineId, hour, reported]
+                  properties:
+                    lineId: { type: string, example: A1 }
+                    hour: { type: integer, minimum: 0, maximum: 23, example: 9 }
+                    output: { type: integer, nullable: true, description: 产量（瓶） }
+                    kwh: { type: number, nullable: true, description: 电量（kWh） }
+                    unitKwh: { type: number, nullable: true, description: 单位电耗（kWh/千瓶） }
+                    stopped: { type: boolean, description: 是否计划停机 }
+                    reported: { type: boolean, description: 该整点是否已上报 }
+
+  # ════════════════════════════════════════════════════════════
+  # 认证
+  # ════════════════════════════════════════════════════════════
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: 登录（过渡期接口）
+      description: |
+        ⚠ 正式环境应替换为 SSO 回调流程。本接口仅保留给前端框架联调与极端降级场景。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: admin }
+                password: { type: string, format: password }
+                remember: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, user]
+                properties:
+                  token: { type: string }
+                  user:
+                    type: object
+                    required: [username, nickname, roleName, avatarText]
+                    properties:
+                      username: { type: string }
+                      nickname: { type: string }
+                      roleName: { type: string }
+                      avatarText: { type: string, maxLength: 2 }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: 退出登录
+      responses:
+        '204':
+          description: 已退出
+
+  # ════════════════════════════════════════════════════════════
+  # 后台管理
+  # ════════════════════════════════════════════════════════════
+  /admin/overview:
+    get:
+      tags: [admin]
+      summary: 后台首页看板
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminOverview'
+
+  /admin/users:
+    get:
+      tags: [admin]
+      summary: 用户列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: status
+          in: query
+          schema: { type: string, enum: [enabled, disabled] }
+        - name: roleName
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/SysUser' }
+
+  /admin/roles:
+    get:
+      tags: [admin]
+      summary: 角色列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/SysRole' }
+
+  /admin/menus:
+    get:
+      tags: [admin]
+      summary: 菜单树
+      description: 不分页，返回完整菜单树
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SysMenu' }
+
+  /admin/params:
+    get:
+      tags: [admin]
+      summary: 系统参数列表
+      description: |
+        能耗阈值等参数的**唯一真值来源**。告警规则与页面展示都必须引用这里，
+        避免出现两套口径。
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/SysParam' }
+
+  /admin/dicts:
+    get:
+      tags: [admin]
+      summary: 数据字典列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: dictType
+          in: query
+          description: 字典类型，如 line_status / alarm_level
+          schema: { type: string }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/DictItem' }
+
+  /admin/lines:
+    get:
+      tags: [admin]
+      summary: 产线主数据列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/LineMaster' }
+
+  /admin/meters:
+    get:
+      tags: [admin]
+      summary: 计量点位列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: category
+          in: query
+          schema: { type: string, enum: [电, 水, 汽, 气] }
+        - name: protocol
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [online, offline, fault] }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/MeterPoint' }
+
+  /admin/gateways:
+    get:
+      tags: [admin]
+      summary: 采集网关列表
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Gateway' }
+
+  /admin/quality:
+    get:
+      tags: [admin]
+      summary: 数据质量统计（按产线）
+      description: |
+        大屏数值可信度的体检表。完整率低于 98% 时，单位电耗等折算指标会失真，
+        **不可直接用于能耗考核**。
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DataQualityRow' }
+
+  /admin/alarms:
+    get:
+      tags: [admin]
+      summary: 告警列表
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, acked, resolved] }
+        - name: level
+          in: query
+          schema: { type: string, enum: [critical, major, minor, info] }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/AlarmRecord' }
+
+  /admin/alarms/{id}/ack:
+    post:
+      tags: [admin]
+      summary: 确认告警
+      description: 敏感操作，**必须写入操作审计日志**
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '204':
+          description: 已确认
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/logs/collect:
+    get:
+      tags: [admin]
+      summary: 数据采集日志
+      description: 定时任务必须记录开始/结束时间、执行结果与影响行数
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: result
+          in: query
+          schema: { type: string, enum: [success, partial, failed] }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/CollectLog' }
+
+  /admin/logs/operation:
+    get:
+      tags: [admin]
+      summary: 操作审计日志
+      description: 仅可追加，不可修改或删除
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: module
+          in: query
+          schema: { type: string }
+        - name: result
+          in: query
+          schema: { type: string, enum: [success, failed] }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/OperationLog' }
+
+  /admin/logs/login:
+    get:
+      tags: [admin]
+      summary: 登录日志
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Keyword'
+        - name: result
+          in: query
+          schema: { type: string, enum: [success, failed] }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageMeta'
+                  - type: object
+                    properties:
+                      list:
+                        type: array
+                        items: { $ref: '#/components/schemas/LoginLog' }
+
+  /admin/reports:
+    get:
+      tags: [admin]
+      summary: 报表模板列表
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ReportTemplate' }
+
+# ══════════════════════════════════════════════════════════════
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: 页码，从 1 开始
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      description: 每页条数
+      schema: { type: integer, minimum: 1, maximum: 200, default: 10 }
+    Keyword:
+      name: keyword
+      in: query
+      description: 关键词模糊检索
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: 参数错误
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string, example: '字段 pageSize 必须为正整数' }
+    Unauthorized:
+      description: 未登录或 Token 失效（前端跳转登录页）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string, example: '身份认证信息未提供。' }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string, example: '未找到。' }
+    ServerError:
+      description: 服务端异常（前端保留上一帧画面，不闪屏）
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string }
+
+  schemas:
+
+    # ── 通用 ────────────────────────────────────────────────
+    PageMeta:
+      type: object
+      required: [total, page, pageSize]
+      properties:
+        total: { type: integer, example: 128 }
+        page: { type: integer, example: 1 }
+        pageSize: { type: integer, example: 10 }
+
+    TrendPoint:
+      type: object
+      required: [label, output, kwh]
+      properties:
+        label: { type: string, example: '8/23' }
+        output: { type: integer, description: 产量（瓶） }
+        kwh: { type: number, description: 用电量（kWh） }
+        unitKwh:
+          type: number
+          nullable: true
+          description: 单位电耗（kWh/千瓶）；产量为 0 时为 null
+
+    HourPoint:
+      type: object
+      required: [hour, future]
+      properties:
+        hour: { type: integer, minimum: 0, maximum: 23 }
+        output:
+          type: integer
+          nullable: true
+          description: 产量（瓶）。未到时段或未上报为 null —— **不要补 0**
+        kwh:
+          type: number
+          nullable: true
+          description: 电量（kWh）。刚过整点可能带 1 位小数
+        unitKwh:
+          type: number
+          nullable: true
+          description: 单位电耗（kWh/千瓶）
+        stopped: { type: boolean, description: 计划停机（与「无数据」是两回事） }
+        future: { type: boolean, description: 'true = 未到时段，三个数值字段均为 null' }
+        partial: { type: boolean, description: 'true = 进行中，数值为已过时间的累计值' }
+        projected:
+          type: integer
+          nullable: true
+          description: 仅 partial 时有值。整点预期产量，**状态判定必须用它**，否则整点会误判低产
+        progress:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+          description: 仅 partial 时有值。已过时间占比
+
+    UtilityMetric:
+      type: object
+      required: [today, yesterday, rateNow, unit, trend]
+      properties:
+        today: { type: number, example: 2340.1 }
+        yesterday: { type: number, example: 2176 }
+        rateNow: { type: number, description: 当前瞬时流量 t/h }
+        unit: { type: string, example: t }
+        trend:
+          type: array
+          description: 24 小时趋势，未到时段为 null
+          items: { type: number, nullable: true }
+
+    AlertItem:
+      type: object
+      required: [level, text, time]
+      properties:
+        level: { type: string, enum: [err, warn, info], description: 'err 严重 / warn 警告 / info 提示' }
+        text: { type: string, example: 'A4 线本小时预计产量 16.6 千瓶，低于额定 75%' }
+        time: { type: string, example: '09:00:00' }
+
+    LineData:
+      type: object
+      required: [id, name, rated, product, status, hours, today, yesterday, daily30, heat, heatDays, month, year, dayOfYear]
+      properties:
+        id: { type: string, example: A1 }
+        name: { type: string, example: 'A1 生产线' }
+        rated: { type: integer, description: 额定产能（瓶/小时）, example: 30000 }
+        product: { type: string, example: '冰红茶 500ml' }
+        status:
+          type: string
+          enum: [running, slow, stopped]
+          description: 'slow 必须用 projected 判定，不能用已缩放的 output'
+        note: { type: string, description: 停机原因备注，如「CIP 清洗停机」 }
+        dayOfYear: { type: integer, example: 265 }
+        hours:
+          type: array
+          description: 长度固定 24，下标 = 小时
+          items: { $ref: '#/components/schemas/HourPoint' }
+        today:
+          type: object
+          required: [output, kwh, plan, planFull, rate]
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+            unitKwh: { type: number, nullable: true }
+            plan: { type: integer, description: '截至当前小时的应产（日达成率分母）' }
+            planFull: { type: integer, description: 全天计划 }
+            rate: { type: number, description: 达成率 % }
+        yesterday:
+          type: object
+          required: [output, kwh, fullOutput, fullKwh]
+          properties:
+            output: { type: integer, description: 昨日同期产量 }
+            kwh: { type: number }
+            unitKwh: { type: number, nullable: true }
+            fullOutput: { type: integer, description: 昨日全天产量 }
+            fullKwh: { type: number }
+        daily30:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        heat:
+          type: array
+          description: 近 7 日 × 24 小时产量，单位「百瓶」，未上报为 null
+          items:
+            type: array
+            items: { type: integer, nullable: true }
+        heatDays:
+          type: array
+          items: { type: string }
+          example: ['9/16', '9/17', '9/22 今日']
+        month:
+          type: object
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+        year:
+          type: object
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+            full: { type: integer }
+            fullKwh: { type: number }
+
+    WorkshopData:
+      type: object
+      required: [lines, today, yesterday, month, year, hours, daily30, monthly12, yearly5, utility, targetUnitKwh, alerts, currentHour]
+      properties:
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/LineData' }
+        today:
+          type: object
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+            unitKwh: { type: number }
+            plan: { type: integer }
+            waterT: { type: number }
+            steamT: { type: number }
+        yesterday:
+          type: object
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+            unitKwh: { type: number }
+            waterT: { type: number }
+            steamT: { type: number }
+        month:
+          type: object
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+        year:
+          type: object
+          properties:
+            output: { type: integer }
+            kwh: { type: number }
+        hours:
+          type: array
+          items: { $ref: '#/components/schemas/HourPoint' }
+        daily30:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        monthly12:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        yearly5:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        utility:
+          type: object
+          required: [water, steam]
+          properties:
+            water: { $ref: '#/components/schemas/UtilityMetric' }
+            steam: { $ref: '#/components/schemas/UtilityMetric' }
+        targetUnitKwh: { type: number, example: 8.2 }
+        alerts:
+          type: array
+          items: { $ref: '#/components/schemas/AlertItem' }
+        currentHour: { type: integer, minimum: 0, maximum: 23 }
+
+    EnergySnapshot:
+      type: object
+      required: [now, workshop]
+      properties:
+        now: { type: string, format: date-time }
+        workshop: { $ref: '#/components/schemas/WorkshopData' }
+
+    AdminOverview:
+      type: object
+      required: [kpi, hourly, daily30, monthly12, lineUnitKwh, latestAlarms]
+      properties:
+        kpi:
+          type: object
+          properties:
+            todayOutput: { type: integer }
+            todayKwh: { type: number }
+            unitKwh: { type: number }
+            activeAlarms: { type: integer }
+            onlineGateways: { type: integer }
+            totalGateways: { type: integer }
+            dataQualityRate: { type: number, description: 数据上报完整率 % }
+        hourly:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        daily30:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        monthly12:
+          type: array
+          items: { $ref: '#/components/schemas/TrendPoint' }
+        lineUnitKwh:
+          type: array
+          items:
+            type: object
+            properties:
+              lineCode: { type: string }
+              lineName: { type: string }
+              unitKwh: { type: number }
+              output: { type: integer }
+        latestAlarms:
+          type: array
+          items: { $ref: '#/components/schemas/AlarmRecord' }
+
+    # ── 系统管理 ────────────────────────────────────────────
+    SysUser:
+      type: object
+      required: [id, username, nickname, status]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        nickname: { type: string }
+        deptName: { type: string }
+        roleName: { type: string }
+        phone: { type: string }
+        email: { type: string, format: email }
+        status: { type: string, enum: [enabled, disabled] }
+        lastLoginAt: { type: string, example: '2026-09-22 08:31:00' }
+        createdAt: { type: string, example: '2026-01-11 09:20:11' }
+
+    SysRole:
+      type: object
+      required: [id, code, name]
+      properties:
+        id: { type: integer }
+        code: { type: string, example: energy_admin }
+        name: { type: string, example: 能源管理员 }
+        userCount: { type: integer }
+        remark: { type: string }
+        createdAt: { type: string }
+
+    SysMenu:
+      type: object
+      required: [id, parentId, name, path, type]
+      properties:
+        id: { type: integer }
+        parentId: { type: integer, description: 0 表示顶层 }
+        name: { type: string }
+        path: { type: string }
+        icon: { type: string }
+        type: { type: string, enum: [catalog, menu, button] }
+        sort: { type: integer }
+        visible: { type: boolean }
+
+    SysParam:
+      type: object
+      required: [id, key, name, value]
+      properties:
+        id: { type: integer }
+        key: { type: string, example: energy.target.unitKwh }
+        name: { type: string, example: 单位电耗考核目标 }
+        value: { type: string, example: '8.20', description: 统一用字符串承载，避免浮点精度问题 }
+        unit: { type: string, example: kWh/千瓶 }
+        group: { type: string, example: 能耗阈值 }
+        remark: { type: string }
+
+    DictItem:
+      type: object
+      required: [id, dictType, label, value]
+      properties:
+        id: { type: integer }
+        dictType: { type: string, example: line_status }
+        label: { type: string, example: 运行中 }
+        value: { type: string, example: running }
+        sort: { type: integer }
+        status: { type: string, enum: [enabled, disabled] }
+        remark: { type: string }
+
+    # ── 生产与设备 ──────────────────────────────────────────
+    LineMaster:
+      type: object
+      required: [id, code, name, rated]
+      properties:
+        id: { type: integer }
+        code: { type: string, example: A1 }
+        name: { type: string, example: 'A1 生产线' }
+        product: { type: string, example: '冰红茶 500ml' }
+        rated: { type: integer, example: 30000 }
+        workshop: { type: string, example: 灌装一车间 }
+        meterNo: { type: string, example: EM-A1-1001 }
+        counterNo: { type: string, example: CT-A1-2001 }
+        status: { type: string, enum: [running, idle, maintenance] }
+        commissionedAt: { type: string, example: '2019-01-11' }
+
+    MeterPoint:
+      type: object
+      required: [id, code, name, category, protocol, unit, factor, status]
+      properties:
+        id: { type: integer }
+        code: { type: string, example: EM-A1-1001 }
+        name: { type: string }
+        category: { type: string, enum: [电, 水, 汽, 气] }
+        lineCode: { type: string, description: '车间总表填 —' }
+        protocol: { type: string, enum: [Modbus TCP, Modbus RTU, OPC UA, MQTT, DL/T645] }
+        address: { type: string, example: '10.20.31.11:502' }
+        unit: { type: string, example: kWh }
+        factor:
+          type: number
+          description: 变比系数。**填错会导致该点位所有用量整体偏移**
+          example: 1
+        status: { type: string, enum: [online, offline, fault] }
+        lastAt: { type: string }
+
+    Gateway:
+      type: object
+      required: [id, name, ip, port, status]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        ip: { type: string, format: ipv4 }
+        port: { type: integer }
+        protocol: { type: string }
+        pointCount: { type: integer }
+        status: { type: string, enum: [online, offline] }
+        lastHeartbeat: { type: string }
+
+    DataQualityRow:
+      type: object
+      required: [lineCode, lineName, expectPoints, receivedPoints, missingPoints, rate]
+      properties:
+        lineCode: { type: string }
+        lineName: { type: string }
+        expectPoints: { type: integer, example: 24 }
+        receivedPoints: { type: integer }
+        missingPoints: { type: integer }
+        rate: { type: number, description: '完整率 %。低于 98% 时折算指标不可用于考核' }
+        missingHours: { type: string, example: '13:00、14:00' }
+        lastAt: { type: string }
+
+    # ── 告警 ────────────────────────────────────────────────
+    AlarmRecord:
+      type: object
+      required: [id, code, level, source, content, status, occurredAt]
+      properties:
+        id: { type: integer }
+        code: { type: string, example: ALM-20260922-0001 }
+        level: { type: string, enum: [critical, major, minor, info] }
+        source: { type: string, example: 'A4 生产线' }
+        content: { type: string, example: 单位电耗超告警上限 }
+        value: { type: string, description: 触发值。承载字符串以兼容「+12.4%」等非纯数值 }
+        threshold: { type: string, description: 阈值 }
+        status: { type: string, enum: [active, acked, resolved] }
+        occurredAt: { type: string }
+        ackedBy: { type: string }
+        ackedAt: { type: string }
+
+    # ── 日志 ────────────────────────────────────────────────
+    CollectLog:
+      type: object
+      required: [id, taskName, result, startedAt]
+      properties:
+        id: { type: integer }
+        taskName: { type: string, example: '整点数据采集 09:00' }
+        gateway: { type: string }
+        pointCount: { type: integer }
+        rows: { type: integer, description: 影响行数（规范强制要求记录） }
+        durationMs: { type: integer }
+        result: { type: string, enum: [success, partial, failed] }
+        message: { type: string }
+        startedAt: { type: string }
+
+    OperationLog:
+      type: object
+      required: [id, username, module, action, result, operatedAt]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        module: { type: string }
+        action: { type: string }
+        target: { type: string }
+        ip: { type: string }
+        ua: { type: string }
+        result: { type: string, enum: [success, failed] }
+        operatedAt: { type: string }
+
+    LoginLog:
+      type: object
+      required: [id, username, result, loginAt]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        ip: { type: string }
+        location: { type: string }
+        browser: { type: string }
+        os: { type: string }
+        result: { type: string, enum: [success, failed] }
+        message: { type: string }
+        loginAt: { type: string }
+
+    # ── 报表 ────────────────────────────────────────────────
+    ReportTemplate:
+      type: object
+      required: [id, name, cycle, format, enabled]
+      properties:
+        id: { type: integer }
+        name: { type: string, example: 车间能源日报 }
+        cycle: { type: string, enum: [日报, 周报, 月报, 年报] }
+        scope: { type: string, example: 全车间 }
+        format: { type: string, enum: [xlsx, pdf, csv] }
+        enabled: { type: boolean }
+        lastGeneratedAt: { type: string }

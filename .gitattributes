@@ -1,0 +1,43 @@
+# ══════════════════════════════════════════════════════════════
+# Git 属性 —— 统一换行符与文本处理
+#
+# 为什么必须有这个文件：
+#   开发机是 Windows（CRLF），服务器是 Linux（LF）。
+#   不做统一时，每次在 Windows 上检出/提交都会把 LF 改成 CRLF，
+#   导致「代码没改但 git diff 显示整个文件都变了」；
+#   更严重的是会把 shell 脚本改成 CRLF，在 Linux 上直接报
+#   `bad interpreter: /bin/bash^M` 无法执行。
+# ══════════════════════════════════════════════════════════════
+
+# 默认：由 Git 自动判断文本文件，仓库内统一存为 LF
+* text=auto eol=lf
+
+# ── Shell 脚本必须 LF ───────────────────────────────────────
+*.sh    text eol=lf
+
+# ── Windows 脚本保持 CRLF ───────────────────────────────────
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# ── 二进制文件，禁止任何转换（否则会被改坏）────────────────
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.exe   binary
+
+# ── 语言统计 ────────────────────────────────────────────────
+# 锁文件在语言统计中折叠，但 diff 保持可见 ——
+# 依赖变更必须被评审（《项目规范》5.4：新增依赖必须经过评审）
+pnpm-lock.yaml linguist-generated=true

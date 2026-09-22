@@ -1,0 +1,38 @@
+# ══════════════════════════════════════════════════════════════
+# 编辑器统一配置
+#
+# 目的：避免「同一份文件在不同编辑器里缩进/换行不一致」，
+#       减少无意义的 diff 噪音。
+# ══════════════════════════════════════════════════════════════
+
+root = true
+
+# ── 通用 ────────────────────────────────────────────────────
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# ── 语言细化 ────────────────────────────────────────────────
+[*.{ts,tsx,js,mjs,cjs,vue,json,scss,css,html,yaml,yml}]
+indent_size = 2
+
+[*.md]
+# Markdown 行尾两个空格表示换行，不能裁掉
+trim_trailing_whitespace = false
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[Makefile]
+indent_style = tab
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf
+
+[*.sh]
+end_of_line = lf

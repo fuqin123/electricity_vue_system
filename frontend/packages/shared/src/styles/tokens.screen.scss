@@ -1,0 +1,71 @@
+// ══════════════════════════════════════════════════════════════
+// 大屏设计令牌（深色）—— 与既有设计稿保持同一套视觉系统
+// 深靛蓝画布 + 蓝紫 / 科技青 / 电光绿 / 品红 和弦
+// 仅用于 apps/screen，勿在后台管理中引用
+// ══════════════════════════════════════════════════════════════
+
+:root {
+  /* 画布与面板 */
+  --bg-deep: #04061f;
+  --bg-canvas: #0a0d3a;
+  --bg-mid: #12163f;
+  --panel-bg: rgba(36, 41, 92, 0.7);
+  --panel-bg-2: rgba(30, 35, 83, 0.55);
+  --panel-line: rgba(255, 255, 255, 0.08);
+  --panel-line-2: rgba(255, 255, 255, 0.12);
+  --row-tint: rgba(88, 101, 242, 0.1);
+
+  /* 品牌与强调色 */
+  --primary: #5865f2;
+  --cyan: #00b0f4;
+  --green: #35ed7e;
+  --magenta: #ec48bd;
+  --violet: #8b7bf7;
+  --purple: #b96bee;
+  --amber: #ffb020;
+
+  /* 文本层级 */
+  --t1: #ffffff;
+  --t2: #c9d0f5;
+  --t3: #8a93c8;
+  --t4: #6e78b4;
+  --t5: #5f6ba8;
+
+  /* 圆角：数据大屏克制使用 */
+  --r-xs: 5px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+
+  /* 字体 */
+  --font-cn: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", sans-serif;
+  --font-num: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-en: "Rajdhani", "Barlow Condensed", var(--font-cn);
+
+  /* 布局 */
+  --gap: 14px;
+  --pad: 16px;
+  --side-w: 430px;
+}
+
+// SCSS 变量映射，便于在组件内做计算
+$screen-w: 1920px;
+$screen-h: 1080px;
+$gap: 14px;
+$pad: 16px;
+$side-w: 430px;
+
+$c-primary: #5865f2;
+$c-cyan: #00b0f4;
+$c-green: #35ed7e;
+$c-magenta: #ec48bd;
+$c-violet: #8b7bf7;
+$c-purple: #b96bee;
+$c-amber: #ffb020;
+
+$t1: #ffffff;
+$t2: #c9d0f5;
+$t3: #8a93c8;
+$t4: #6e78b4;
+$t5: #5f6ba8;

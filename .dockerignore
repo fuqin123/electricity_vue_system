@@ -1,0 +1,37 @@
+# ══════════════════════════════════════════════════════════════
+# Docker 构建上下文忽略清单
+#
+# 重要性：构建上下文是**仓库根目录**，若不排除 node_modules，
+# docker build 会先把几百 MB 的依赖传给守护进程，构建慢十倍以上。
+# ══════════════════════════════════════════════════════════════
+
+# 依赖与构建产物（容器内会重新安装、重新构建）
+**/node_modules
+**/dist
+**/dist-ssr
+**/.vite
+**/.cache
+
+# 版本控制与工具数据
+.git
+.gitignore
+.workbuddy
+.vscode
+.idea
+
+# 部署与文档（镜像里不需要）
+deploy/linux
+deploy/windows
+docs
+backend
+*.md
+
+# 环境变量与密钥 —— 绝不能进镜像
+.env
+.env.*
+!.env.example
+
+# 日志与临时文件
+**/*.log
+**/logs
+**/*.tsbuildinfo
