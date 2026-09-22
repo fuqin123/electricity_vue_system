@@ -11,7 +11,7 @@
 用一块 1920×1080 大屏做车间实时监控，用一个后台管理系统做数据治理与台账管理，
 让能源管理员能指着数字说清「哪条线、哪个时段、浪费在哪」。
 
-仓库为**前后端分离**结构：`frontend/` 是已交付的前端工程，
+仓库为**前后端分离**结构：`frontend/` 是前端工程（大屏 + 后台），`backend/` 是采集与数据接口（v1.2.0 起已接现场网关跑通），
 `backend/` 是预留的数据接口层（本期尚未实现，契约已先行确定）。
 
 ---
@@ -46,7 +46,7 @@ electricity_vue_system/
 │  └─ packages/
 │     └─ shared/                # 共享层：类型 / 配置 / Mock 引擎 / API SDK / 设计令牌
 │
-├─ backend/                     # ★ 后端（预留，本期未实现）
+├─ backend/                     # ★ 后端（v1.2.0：采集 + MySQL + 只读接口，已实测）
 │  ├─ README.md                 # 后端规划与规范要求
 │  ├─ requirements.txt          # 依赖（版本已锁定）
 │  ├─ config/settings.example.yaml
@@ -86,7 +86,7 @@ electricity_vue_system/
 | 后台 `frontend/apps/admin` | Vue / Vite / **Element Plus** / ECharts / Pinia / Vue Router(history) / VueUse / SCSS | Element Plus 2.9 |
 | 共享层 `frontend/packages/shared` | TypeScript 类型 · 全局配置 · Mock 引擎 · API SDK · 设计令牌 | TypeScript 5.7 |
 | 视频 | **go2rtc** 转流网关（RTSP → 浏览器可播协议；大屏走 HLS → MJPEG 可校验链路） | 现场已验证 |
-| 后端（预留） | Django + DRF + OpenAPI/Swagger + PostgreSQL | Python 3.10+ |
+| 后端（v1.2.0） | Django 5.1 + MySQL 8 + pymodbus（Modbus RTU over TCP）+ PyMySQL | Python 3.10+ |
 | 工具链 | pnpm workspace · vue-tsc · Prettier · Sass | Node ≥ 20.19 · pnpm ≥ 9 |
 
 **视觉基准**
@@ -174,7 +174,8 @@ pnpm format                 # Prettier 格式化
 | 前端 · 大屏 | ✅ 完成（Vue 3.5 + Vite，视觉与原设计一致） |
 | 前端 · 后台 | ✅ 完成（21 个页面骨架，路由/菜单/跳转打通） |
 | 浏览器视频监控 | ✅ 完成（go2rtc，四协议自动降级） |
-| 后端接口 | 🟡 **预留** —— 契约已定（`backend/docs/api-contract.md`），实现待开发 |
+| 后端采集 | ✅ 13 路电表 + 蒸汽总表已接通，MySQL 存原始读数与小时差值（现场实测 14/14 点位 1.4 秒） |
+| 后端接口 | 🟡 能源只读接口已实现（`/api/energy/*`）；**产量接口留空（501）**；系统管理类接口待开发 |
 | 数据源 | 🟡 前端使用虚拟数据（`dataConfig.mode = 'mock'`） |
 | 业务函数 | ⬜ 写操作统一给出「待接入」提示，无假死 |
 
@@ -230,7 +231,8 @@ pnpm format                 # Prettier 格式化
 | `docs/03-版本部署-Windows版.md` | IIS / Nginx for Windows 部署 |
 | `docs/04-版本部署-Linux版.md` | Nginx + systemd / Docker / 一键脚本 |
 | `docs/05-运维手册.md` | 巡检、监控、告警处置、故障排查、备份恢复、应急预案 |
-| `backend/docs/api-contract.md` | ★ 后端接口契约（前后端唯一约定） |
+| `backend/docs/采集说明.md` | ★ 后端采集侧施工图（现场取数、差值口径、部署、踩坑） |
+| `backend/docs/api-contract.md` | ★ 后端接口契约（前后端唯一约定，含实现状态） |
 | `deploy/README.md` | 部署资源索引 |
 | `deploy/go2rtc/README.md` | 视频网关部署与排障 |
 | `docs/reference/项目框架及技术栈.md` | 技术选型原始约定 |

@@ -1,7 +1,19 @@
-# 后端（backend）—— 数据接口层
+# 后端（backend）—— 数据采集与接口层
 
-> **当前状态：预留目录，尚未实现。**
-> v1.1.0 交付的是前端工程（大屏 + 后台管理系统），后端数据接口按本文档约定的契约逐步实现。
+> **当前状态：v1.2.0 —— 采集与存储已实现并接现场实测通过。**
+>
+> | 能力 | 状态 |
+> | :--- | :--- |
+> | 13 路产线电表（4 台 485 串口服务器，Modbus RTU over TCP） | ✅ 实测 14/14 点位 1.4 秒采完 |
+> | 车间蒸汽总表（第三方平台 API） | ✅ 已接通 |
+> | 小时差值（每小时用了多少）＋ 异常过滤 | ✅ 含缺数 / 换表 / 尖峰 / 偏离整点四类处理 |
+> | MySQL 存储 | ✅ 已建表入库 |
+> | 能源数据只读接口 | ✅ `/api/energy/*`（与前端契约同构） |
+> | 产量（瓶子数） | ⬜ **本次留空**，`/api/energy/production` 返回 501 |
+> | 车间进水总表 | ⬜ 接口地址待现场提供（配置已登记，`enabled: false`） |
+> | 告警引擎 / 报表 / 权限 / SSO | ⬜ 后续版本 |
+>
+> **怎么跑、口径是什么、踩过哪些坑 —— 见 `docs/采集说明.md`（先读这个）。**
 
 ---
 
@@ -9,10 +21,10 @@
 
 后端是整个系统的**唯一数据入口与真值来源**，承担四件事：
 
-1. **采集与聚合** —— 从 PLC / 智能电表 / 流量计 / 计数器拉取原始值，按整点聚合入库；
+1. **采集与聚合** —— 从智能电表 / 流量计 / PLC / 计数器拉取原始值，按整点差分成小时用量；
 2. **口径计算** —— 单位电耗、达成率、环比等派生指标一律在后端算好再下发（避免前端各算一遍导致口径分叉）；
 3. **对外接口** —— 按 `docs/api-contract.md` 向大屏与后台提供 REST 接口；
-4. **鉴权与审计** —— 统一身份认证（SSO）、接口鉴权、敏感操作审计日志。
+4. **鉴权与审计** —— 统一身份认证（SSO）、接口鉴权、敏感操作审计日志（待实现）。
 
 > 关键设计原则：**前端不做任何业务口径计算，只做展示**。
 > 大屏与后台拿到的是同一份已算好的数据，因此不可能出现「两处数字对不上」。
@@ -23,67 +35,80 @@
 
 | 项 | 选型 | 说明 |
 | :--- | :--- | :--- |
-| 语言 | Python 3.10+ | 按《项目规范》3.3 统一基线 |
-| 框架 | Django + Django REST Framework | 项目框架文档约定 |
-| 接口文档 | OpenAPI 3.0 / Swagger | **B/S 项目必备交付物**（《项目规范》3.1） |
-| 数据库 | PostgreSQL（推荐）/ MySQL | 时序数据量大时考虑按月分表或 TimescaleDB |
-| 采集 | pymodbus / pyserial | Modbus TCP / RTU 读写 |
-| 定时任务 | APScheduler / Celery Beat | 整点聚合、报表生成、告警判定 |
-| 鉴权 | 统一身份认证（SSO） | **不允许独立账号体系**（《项目规范》3.1） |
+| 语言 | Python 3.10+ | 按《项目规范》3.3 统一基线（现场实测用 3.13） |
+| 框架 | Django 5.1 | 本次只用了 Django 核心 + DjangoJSONEncoder，未引入 DRF |
+| 数据库 | **MySQL 8.0** + PyMySQL | 现场指定；PyMySQL 是纯 Python 驱动，Windows 上免编译 |
+| 采集 | **pymodbus 3.7**（`FramerType.RTU`） | 串口服务器是「485 报文进 TCP」，必须用 RTU 组帧 |
+| 定时任务 | 系统计划任务（schtasks / cron） | 比常驻进程抗崩溃；`collect_loop` 也提供 |
+| 接口文档 | OpenAPI 3.0 | 见 `docs/openapi.yaml`（本次实现部分已在 `api-contract.md` 标注） |
+| 鉴权 | 统一身份认证（SSO） | **不允许独立账号体系**（《项目规范》3.1），待接入 |
 | 依赖锁定 | pip + requirements.txt | 必须锁定版本含子依赖（《项目规范》5.4） |
 
 ---
 
-## 三、目录规划
+## 三、目录结构（实际）
 
 ```text
 backend/
-├─ README.md                    # 本文件
+├─ manage.py                    # 命令入口
 ├─ requirements.txt             # 依赖（版本已锁定）
 ├─ config/
-│  └─ settings.example.yaml     # ★ 配置示例，真实配置不入库
-├─ docs/
-│  ├─ api-contract.md           # ★ 接口契约（前后端唯一约定，先读这个）
-│  ├─ openapi.yaml              # OpenAPI 3.0 描述文件（供 Swagger UI 生成）
-│  └─ data-dictionary.md        # 数据字典（待补）
-├─ src/                         # Django 项目（待创建）
-│  ├─ manage.py
-│  ├─ config/                   # settings / urls / wsgi
-│  ├─ apps/
-│  │  ├─ energy/                # 能源计量（电/水/汽）
-│  │  ├─ production/            # 产线与产量
-│  │  ├─ collect/               # 采集任务与网关
-│  │  ├─ alarm/                 # 告警规则与记录
-│  │  ├─ system/                # 用户 / 角色 / 菜单 / 参数 / 字典
-│  │  └─ report/                # 报表生成
-│  └─ common/                   # 通用：分页、响应包装、审计、异常
-└─ tests/
+│  ├─ settings.example.yaml     # ★ 配置示例（含现场设备登记表），真实配置不入库
+│  └─ settings.local.yaml       # ⚠ 本地真实配置（已 gitignore）
+├─ eep/                         # Django 工程
+│  ├─ conf.py                   # 配置加载（环境变量 > local > example）
+│  ├─ settings.py               # MySQL / 时区 / CORS / 日志
+│  ├─ urls.py · wsgi.py
+├─ apps/energy/                 # 能源采集（核心）
+│  ├─ models.py                 # Gateway / Line / Meter / Reading / HourlyUsage / CollectLog
+│  ├─ collectors/               # 采集器：base（重试/计时）· modbus_rtu · http_api
+│  ├─ services/                 # collect（编排）· aggregate（小时差值）· snapshot（组装接口）· registry（登记表同步）
+│  ├─ management/commands/      # collect · collect_loop · aggregate · seed_registry · purge_readings
+│  ├─ api.py · urls.py          # 只读接口
+│  ├─ tests.py                  # 12 个单元测试（差值口径 + 字序 + JSON 取值）
+│  └─ migrations/
+└─ docs/
+   ├─ 采集说明.md                # ★ 现场取数方式、口径、部署、踩坑
+   ├─ api-contract.md           # ★ 接口契约（字段级）
+   └─ openapi.yaml              # OpenAPI 3.0 描述文件
 ```
 
 ---
 
-## 四、快速开始（待实现后补充）
+## 四、快速开始（已实测）
 
 ```bash
 cd backend
 
-# 1. 建虚拟环境
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-
-# 2. 装依赖（国内镜像）
+# 1. 装依赖（国内镜像）
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 3. 配置（复制示例并填真实值，真实配置不入库）
+# 2. 建库（字符集必须 utf8mb4）
+mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS eep_energy \
+  DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+
+# 3. 配置（复制示例并填数据库口令与平台 token；真实配置不入库）
 cp config/settings.example.yaml config/settings.local.yaml
 
-# 4. 迁移与启动
-cd src
+# 4. 建表 + 同步设备登记表
 python manage.py migrate
+python manage.py seed_registry
+
+# 5. 采一轮（14 个点位，约 1.4 秒）
+python manage.py collect
+
+# 6. 算小时差值并起服务
+python manage.py aggregate --recent 2
 python manage.py runserver 0.0.0.0:8000
 ```
 
-启动后 Swagger 文档地址：`http://127.0.0.1:8000/api/docs/`
+自检：
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/api/energy/collect-summary
+python manage.py test apps.energy      # 12 个单元测试
+```
 
 ---
 
@@ -168,9 +193,10 @@ export const dataConfig = {
 
 | 文档 | 内容 |
 | :--- | :--- |
-| `docs/api-contract.md` | ★ 接口契约（字段级说明） |
+| `docs/采集说明.md` | ★ **采集侧施工图**：现场取数方式、小时差值口径、部署运行、踩坑记录 |
+| `docs/api-contract.md` | ★ 接口契约（字段级说明，含实现状态） |
 | `docs/openapi.yaml` | OpenAPI 3.0 描述文件 |
 | `../docs/01-项目介绍与环境配置.md` | 项目定位、环境、数据口径约定 |
-| `../docs/02-开发记录及Bug总结.md` | 待接入功能清单、Bug 台账 |
+| `../docs/02-开发记录及Bug总结.md` | 待接入功能清单、Bug 台账（后端 bug 记在 B-3xx 段） |
 | `../docs/04-版本部署-Linux版.md` | 后端部署（gunicorn + systemd / Docker） |
 | `../docs/reference/项目规范.md` | 总部代码仓库管理规范 |

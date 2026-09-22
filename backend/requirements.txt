@@ -14,37 +14,35 @@
 
 # ── Web 框架 ────────────────────────────────────────────────
 Django==5.1.4
-djangorestframework==3.15.2
 django-cors-headers==4.6.0          # CORS 白名单（规范要求必须配置）
+# djangorestframework==3.15.2       # 后台管理类接口用它；能源采集接口是只读 JSON，未引入
+# drf-spectacular==0.28.0           # OpenAPI 生成；待后台接口落地时启用
+# drf-spectacular-sidecar==2024.12.1
 
-# ── 接口文档（B/S 项目必备交付物）────────────────────────────
-drf-spectacular==0.28.0             # OpenAPI 3.0 生成，配合 docs/openapi.yaml
-drf-spectacular-sidecar==2024.12.1  # Swagger UI 静态资源（离线环境可用）
-
-# ── 数据库 ──────────────────────────────────────────────────
-psycopg[binary]==3.2.3              # PostgreSQL（推荐）
-# mysqlclient==2.2.6                # 若现场用 MySQL，改用这一行并去掉上一行
+# ── 数据库（现场用 MySQL 8.0）────────────────────────────────
+PyMySQL==1.1.1                      # 纯 Python 驱动，Windows 上免编译 mysqlclient
+# 说明：settings 里已 `pymysql.install_as_MySQLdb()`，Django 直接当 MySQLdb 用
+# psycopg[binary]==3.2.3            # 若改回 PostgreSQL，启用这行并调整 settings
 
 # ── 配置与校验 ──────────────────────────────────────────────
-pydantic==2.10.4                    # 配置加载与校验
-pydantic-settings==2.7.0            # 环境变量 > 配置文件 > 默认值
-PyYAML==6.0.2                       # 读取 settings.yaml
+PyYAML==6.0.2                       # 读取 settings.yaml（采集参数与设备登记表）
 
 # ── 采集：工业协议 ──────────────────────────────────────────
-pymodbus==3.7.4                     # Modbus TCP / RTU（智能电表、网关）
-pyserial==3.5                       # 串口（Modbus RTU 物理层）
-# asyncua==1.1.5                    # OPC UA（空压站等，按需启用）
+pymodbus==3.7.4                     # Modbus；串口服务器必须用 FramerType.RTU
+# ⚠ 不要传 retries=0：pymodbus 3.7 在该值下不发请求，表现为「所有点位无响应」
+# pyserial==3.5                     # 直连串口（RS485 直插工控机）时才需要，当前走串口服务器
 
 # ── 定时任务与重试 ──────────────────────────────────────────
-APScheduler==3.11.0                 # 整点聚合、报表生成、告警判定
-tenacity==9.0.0                     # 外部调用重试（规范要求必须重试）
+# 当前用系统计划任务（schtasks / cron）驱动 `manage.py collect`，未引入调度库
+# APScheduler==3.11.0
+# tenacity==9.0.0                   # 采集器内已实现轻量重试，暂未引入
 
-# ── 报表导出 ────────────────────────────────────────────────
-openpyxl==3.1.5                     # xlsx
-reportlab==4.2.5                    # pdf
+# ── 报表导出（待报表功能落地）────────────────────────────────
+# openpyxl==3.1.5
+# reportlab==4.2.5
 
-# ── 鉴权 ────────────────────────────────────────────────────
-PyJWT==2.10.1                       # 本地 Token（正式环境接 SSO 后仅用于会话）
+# ── 鉴权（待 SSO 接入）──────────────────────────────────────
+# PyJWT==2.10.1
 # python3-saml==1.16.0              # 若 SSO 走 SAML 协议，按 IdP 要求启用
 # authlib==1.3.2                    # 若 SSO 走 OIDC / OAuth2，按 IdP 要求启用
 

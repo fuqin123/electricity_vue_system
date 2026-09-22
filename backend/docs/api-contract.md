@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.1.0 ｜ 最后更新：2026-09-22
+> 版本：v1.2.0 ｜ 最后更新：2026-09-22
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -8,6 +8,33 @@
 >
 > ⚠ 修改契约时必须**同时更新三处**，否则会出现隐性错配：
 > ① 本文件 ② `frontend/packages/shared/src/types.ts` ③ `docs/openapi.yaml`
+
+---
+
+## 〇、v1.2.0 实现状态（先看这个）
+
+| 接口 | 状态 | 说明 |
+| :--- | :--- | :--- |
+| `GET /healthz` | ✅ 已实现 | 健康探测 |
+| `GET /api/energy/overview` | ✅ 已实现 | 大屏总览（`EnergySnapshot` 同构） |
+| `GET /api/energy/line/{code}` | ✅ 已实现 | 单线详情（`LineData` 同构） |
+| `GET /api/energy/hourly` | ✅ 已实现 | 小时用量明细（支持 `date` / `line` / `meter` / `kind`） |
+| `GET /api/energy/meters` | ✅ 已实现 | 计量点台账 + 最近读数 + 今日用量 |
+| `GET /api/energy/collect-logs` | ✅ 已实现 | 采集日志 |
+| `GET /api/energy/collect-summary` | ✅ 已实现 | 24 小时采集汇总（巡检卡片用，非前端契约字段） |
+| `GET /api/energy/production` | ⬜ **501 留空** | 产量采集尚未改造；调用返回 501 + 待办清单 |
+| `/api/admin/*`（系统管理、告警、日志、报表等 14 个） | ⬜ 未实现 | 见下方各章节，后续版本按本契约实现 |
+
+**v1.2.0 的两个重要口径变化（前端切 `mode: 'api'` 前必读）**
+
+1. **产量相关字段一律为 0 / null**：`output`、`unitKwh`、`plan`、`rate` 都是 0 / null，
+   后端不采集产量，也不拿电量反推产量。所以切到 api 模式后，
+   凡涉及产量与单位电耗的图表会是空的 —— 这是**预期行为**，不是接口故障。
+2. **水 / 汽的 `today`、`yesterday` 可能为 `null`**（未知 ≠ 0）。
+   切换时需把 `types.ts` 中 `UtilityMetric.today / yesterday` 与
+   `LineData.today.kwh` 等字段类型从 `number` 放宽为 `number | null`，
+   否则大屏上会把「还没采到」显示成「用了 0」。
+   同理 `HourPoint.kwh` 已经是 `number | null`，无需改动。
 
 ---
 

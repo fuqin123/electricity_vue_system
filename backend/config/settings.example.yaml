@@ -6,153 +6,176 @@
 #   然后填写真实值。settings.local.yaml 已在 .gitignore 中，不会入库。
 #
 # 配置优先级（《项目规范》5.3）：环境变量 > 配置文件 > 默认值
-#   即同名的环境变量会覆盖此处的值，便于容器化部署。
+#   常用环境变量：EEP_DB_PASSWORD / EEP_DB_HOST / EEP_SECRET_KEY / EEP_DEBUG
 #
-# ⚠ 严禁把生产密钥、数据库口令提交进代码库。
+# ⚠ 严禁把生产口令、平台 token 提交进代码库。
+#   下面的 gateways / meters 就是「现场设备登记表」——
+#   改完执行 `python manage.py seed_registry` 同步进数据库（幂等，可重复跑）。
 # ══════════════════════════════════════════════════════════════
 
 app:
   name: 能源产效管理系统
   code: PLANT01
-  # 运行环境：development | staging | production
   env: development
-  # 生产环境必须关闭
-  debug: true
-  # 允许访问的 Host（生产环境填实际域名/IP，禁止用 *）
+  debug: false
   allowed_hosts:
     - 127.0.0.1
     - localhost
-    - 10.20.31.100
 
-# ── 数据库 ───────────────────────────────────────────────────
-# 口令请用环境变量覆盖：EEP_DB_PASSWORD
+# ── 数据库（MySQL）───────────────────────────────────────────
 database:
-  engine: postgresql          # postgresql | mysql
+  engine: mysql
   host: 127.0.0.1
-  port: 5432
-  name: eep_db
-  user: eep
-  password: CHANGE_ME         # ← 用环境变量覆盖，不要在此写真实口令
-  # 连接池
-  conn_max_age: 600
-  conn_health_checks: true
+  port: 3306
+  name: eep_energy
+  user: root
+  password: CHANGE_ME         # ← 用环境变量 EEP_DB_PASSWORD 覆盖，不要在此写真实口令
+  conn_max_age: 60
 
-# ── 鉴权 ─────────────────────────────────────────────────────
-# ⚠ 按《项目规范》3.1：登录必须走统一身份认证（SSO），不允许独立账号体系。
-#   下方的 JWT 配置仅用于 SSO 接入前的过渡期与本地联调。
-auth:
-  # 会话 Token 签名密钥，生产环境必须替换为随机长串并用环境变量注入
-  secret_key: CHANGE_ME_PLEASE_USE_ENV
-  access_token_ttl_minutes: 480
-  refresh_token_ttl_days: 7
-  # 连续失败锁定
-  max_login_failures: 3
-  lock_minutes: 5
-  # 统一身份认证（SSO）—— 接入后把 enabled 改为 true
-  sso:
-    enabled: false
-    protocol: oidc            # oidc | saml
-    issuer: ''
-    client_id: ''
-    client_secret: ''         # ← 用环境变量覆盖
-    redirect_uri: ''
-
-# ── 跨域白名单（规范要求必须配置，禁止用 *）──────────────────
+# ── 跨域（大屏 / 后台分属不同端口）───────────────────────────
 cors:
-  # 前端部署地址：大屏 /screen/、后台 /admin/
   allowed_origins:
-    - http://10.20.31.100
     - http://127.0.0.1:5173   # 大屏开发服务器
     - http://127.0.0.1:5174   # 后台开发服务器
-  allow_credentials: true
+  allow_credentials: false
+  # 内网联调期可临时置 true（放开全部来源），生产必须 false
+  allow_all: false
 
 # ── 数据采集 ─────────────────────────────────────────────────
 collect:
-  # 原始采样周期（秒）。整点聚合前的轮询频率
-  interval_seconds: 60
-  # 单次读写超时（毫秒）
-  timeout_ms: 5000
-  # 失败重试次数与退避（规范要求外部调用必须重试）
-  retry_times: 3
-  retry_backoff_seconds: 2
-  # 每轮采集最多并发点位，避免把网关打满
-  max_concurrency: 8
-
-  # 电表异常值过滤 —— 会直接影响大屏数字可信度，务必配置
+  # 超时预算：单点最坏 = timeout_ms ×（1 + retry_times）。
+  # 按 1500ms × 2 = 3s/点算，13 路电表全掉线也只要 39s，仍小于 60s 采样周期。
+  timeout_ms: 1500            # 单次读写超时（现场实测正常读 ~70—110ms）
+  retry_times: 1              # 失败重试次数（规范要求外部调用必须重试）
+  retry_backoff_seconds: 0.3
+  interval_seconds: 60        # 采样周期：60s 足够，小时差值只关心整点附近的读数
+  # 端点读数距整点超过该分钟数 → 判为「采集中断过」，差值标 partial
+  boundary_tolerance_minutes: 20
+  # 原始读数保留天数（`manage.py purge_readings` 清理）
+  readings_retention_days: 180
   filter:
-    # 电表是累计值，入库前做差分。单小时电量超过「额定产能对应能耗 × 该倍数」判为异常
-    kwh_spike_multiple: 2.0
-    # 判定为异常时：null（置空，前端标为电表缺失）/ zero（置 0，不推荐）
-    on_abnormal: null
-    # 累计值回退（换表 / 归零）超过该比例时按换表处理
+    # 累计值回退超过该比例 → 说明里记为「疑似换表」
     reset_threshold_ratio: 0.5
 
-  # 整点聚合任务的执行偏移（秒）。错开整点避免与采样抢资源
-  aggregate_offset_seconds: 30
-
-# ── 告警 ─────────────────────────────────────────────────────
-alarm:
-  # 通知渠道（规范要求失败必须有告警）
-  notify_channels:
-    - mail
-    - wecom
-  # 是否启用告警判定任务
-  enabled: true
-  # 同类告警合并窗口（分钟），避免刷屏
-  dedup_window_minutes: 30
-  # 值班接收人（企业微信群 / 邮箱）
-  receivers:
-    critical: []
-    major: []
-  mail:
-    host: ''
-    port: 465
-    use_ssl: true
-    user: ''
-    password: ''              # ← 用环境变量覆盖
-    from_addr: eep@plant01.local
-  wecom:
-    webhook: ''               # ← 用环境变量覆盖
-
-# ── 报表 ─────────────────────────────────────────────────────
-report:
-  output_dir: /opt/eep-data/reports
-  # 定时生成（cron 表达式，服务器本地时区）
-  schedules:
-    daily: '0 5 * * *'        # 每日 05:00 生成前一日日报
-    weekly: '0 6 * * 1'       # 每周一 06:00
-    monthly: '0 7 1 * *'      # 每月 1 日 07:00
-
 # ── 日志 ─────────────────────────────────────────────────────
-# 规范要求：本地日志至少保留 30 天，且按大小滚动
 logging:
-  level: INFO                 # DEBUG | INFO | WARNING | ERROR
-  dir: /var/log/eep
-  max_bytes: 52428800         # 单文件 50MB 滚动
-  backup_count: 30            # 保留 30 份
-  # 禁止用 print 调试，统一走 logging
-  console: true
+  level: INFO
+  dir: logs
+  file_enabled: true
+  max_bytes: 52428800
+  backup_count: 30
 
-# ── 视频网关（go2rtc）────────────────────────────────────────
-# 说明：视频链路默认由浏览器直连网关，不经过后端。此处仅登记管理信息，
-#       供后台「视频监控」页做展示与自检；如改为后端转发再启用 proxy。
-video:
-  provider: go2rtc
-  gateway_base: http://10.113.1.61:1984
-  api_port: 1984
-  webrtc_port: 8555
-  # 是否由后端反向代理视频流（默认关闭，避免后端成为视频瓶颈）
-  proxy: false
+# ══════════════════════════════════════════════════════════════
+# 现场设备登记表（采集侧唯一真值来源）
+# ══════════════════════════════════════════════════════════════
 
-# ── 业务阈值（运行时以数据库中的「系统参数」为准）────────────
-# 此处仅为首次初始化的默认值；上线后由能源管理员在后台维护，
-# 避免出现「配置文件与页面两套口径」。
-# ⚠ 上线前必须用真实历史数据回填。
+# ── 产线 ─────────────────────────────────────────────────────
+# rated（额定产能 瓶/小时）与 product（品项）属于产量侧数据，
+# 产量接口本次留空，这里先置 0，待产量改造时一并回填。
+lines:
+  - { code: A1, name: 一线, sort: 1, rated: 0 }
+  - { code: A2, name: 二线, sort: 2, rated: 0 }
+  - { code: A3, name: 三线, sort: 3, rated: 0 }
+  - { code: A4, name: 四线, sort: 4, rated: 0 }
+  - { code: A5, name: 五线, sort: 5, rated: 0 }
+  - { code: A6, name: 六线, sort: 6, rated: 0 }
+
+# ── 网关 ─────────────────────────────────────────────────────
+# kind:
+#   modbus_rtu_tcp —— 485 串口服务器。**必须用 RTU 组帧**（从站号+功能码+数据+CRC16），
+#                    不是 Modbus TCP 帧；现场参考实现见 E:\http_test\serial_servier.py
+#   http_api       —— 第三方数据平台的 JSON 接口
+gateways:
+  - code: GW-PDB-1
+    name: 一期配电房串口服务器1口
+    kind: modbus_rtu_tcp
+    host: 10.112.66.41
+    port: 8891
+  - code: GW-PDB-3
+    name: 一期配电房串口服务器3口
+    kind: modbus_rtu_tcp
+    host: 10.112.66.41
+    port: 8893
+  - code: GW-PDB-4
+    name: 一期配电房串口服务器4口
+    kind: modbus_rtu_tcp
+    host: 10.112.66.41
+    port: 8894
+  - code: GW-TASHI
+    name: 一期配电房塔石
+    kind: modbus_rtu_tcp
+    host: 10.112.66.133
+    port: 8890
+  - code: GW-API-DJ
+    name: 顶津能源平台（HTTP API）
+    kind: http_api
+    base_url: http://47.111.74.100:8980
+    timeout_ms: 8000
+
+# ── 计量点 ───────────────────────────────────────────────────
+# 电表（串口服务器）：功能码 03、起始寄存器 1000、2 个寄存器、32 位、倍率 0.1 → kWh
+#   现场 13 块表已全部实测可读。`max_hourly` 是异常尖峰阈值，先给一个宽松值，
+#   试运行一周后按实际用量重新标定（换表还会被「差值<0」rules 兜住，不依赖它）。
+meters:
+  # ── 一线 ──
+  - { code: E-A1-01, name: 一线 生产线电表, kind: elec, scope: line, role: line, line: A1, gateway: GW-PDB-4, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A1-02, name: 一线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A1, gateway: GW-PDB-4, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  # ── 二线 ──
+  - { code: E-A2-01, name: 二线 生产线电表, kind: elec, scope: line, role: line, line: A2, gateway: GW-PDB-3, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A2-02, name: 二线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A2, gateway: GW-PDB-3, slave: 5,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  # ── 三线（两块生产线表 + 一块吹瓶机表）──
+  - { code: E-A3-01, name: 三线 生产线1电表, kind: elec, scope: line, role: line, line: A3, gateway: GW-PDB-1, slave: 13, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-02, name: 三线 生产线2电表, kind: elec, scope: line, role: line, line: A3, gateway: GW-PDB-1, slave: 15, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-03, name: 三线 吹瓶机电表,  kind: elec, scope: line, role: aux,  line: A3, gateway: GW-PDB-1, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  # ── 四线 ──
+  - { code: E-A4-01, name: 四线 生产线电表, kind: elec, scope: line, role: line, line: A4, gateway: GW-TASHI, slave: 11, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  # ── 五线（生产线 + 吹瓶机 + 冰水机）──
+  - { code: E-A5-01, name: 五线 生产线电表, kind: elec, scope: line, role: line, line: A5, gateway: GW-PDB-1, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-02, name: 五线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A5, gateway: GW-PDB-1, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-03, name: 五线 冰水机电表, kind: elec, scope: line, role: aux,  line: A5, gateway: GW-TASHI, slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  # ── 六线 ──
+  - { code: E-A6-01, name: 六线 生产线电表, kind: elec, scope: line, role: line, line: A6, gateway: GW-TASHI, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A6-02, name: 六线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A6, gateway: GW-TASHI, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+
+  # ── 车间级总表（只有总表，不拆到线别，也就没有均摊问题）──
+  - code: S-WS-01
+    name: 一期蒸汽表1#
+    kind: steam
+    scope: workshop
+    role: total
+    gateway: GW-API-DJ
+    url_path: /js/a/at/yewushishi/atYewushuju/Data_dingjin
+    params: { cid: 135, token: CHANGE_ME }      # ← 用 settings.local.yaml 填真值
+    value_path: data.0.device_data.var1          # 累计蒸汽量
+    time_path: data.0.device_data.collect_time   # 平台采集时间
+    scale: 1
+    unit: t
+    max_hourly: 100
+    remark: var2/var3/var4 为瞬时参数（流量/温度/压力），已随原始响应留档
+
+  # ⚠ 车间进水总表：现场尚未提供接口地址与令牌，先登记不采集。
+  #   拿到后把 url_path / params / value_path 补齐、enabled 改 true 即可，无需改代码。
+  - code: W-WS-01
+    name: 车间进水总表
+    kind: water
+    scope: workshop
+    role: total
+    gateway: GW-API-DJ
+    url_path: CHANGE_ME
+    params: { cid: 0, token: CHANGE_ME }
+    value_path: CHANGE_ME
+    time_path: CHANGE_ME
+    scale: 1
+    unit: t
+    max_hourly: 500
+    enabled: false
+    remark: 接入方式待现场确认（接口地址 / cid / token），暂不采集
+
+# ── 业务阈值默认值 ───────────────────────────────────────────
+# 上线后以数据库/后台的「系统参数」为准，这里只是首次初始化的默认值。
+# ⚠ 产量未接入前，与产量相关的强度参数（单位电耗、水/汽耗强度）无法标定，
+#   先留空；等产量改造完成、且有一周以上真实数据后再回归拟合。
 energy_defaults:
-  target_unit_kwh: 8.20           # 单位电耗考核目标 kWh/千瓶
-  alarm_unit_kwh_high: 9.60       # 单位电耗告警上限 kWh/千瓶
-  output_low_rate: 0.75           # 低产判定（占额定比）
-  base_load_kwh_per_hour: 20      # 单线基础负荷 kWh/h
-  variable_kwh_per_bottle: 0.0068 # 单线变动电耗 kWh/瓶
-  water_per_bottle_l: 2.8         # 车间水耗强度 L/瓶
-  steam_per_bottle_kg: 0.21       # 车间汽耗强度 kg/瓶
+  target_unit_kwh: 0            # 单位电耗考核目标 kWh/千瓶（待回填）
+  alarm_unit_kwh_high: 0        # 单位电耗告警上限（待回填）
+  output_low_rate: 0.75         # 低产判定（占额定比）
