@@ -159,18 +159,29 @@ export const thresholds = {
  * 视频监控配置
  *
  * 现场方案：go2rtc（已在 `E:\能源产效管理平台\go2rtc_win64` 验证通过）。
- * 大屏通过 go2rtc 内置播放页以 <iframe> 方式播放，或由前端直接拉 HLS / MJPEG。
+ * 大屏由前端直接拉 HLS / MJPEG，或用 <iframe> 载入 go2rtc 内置播放页。
  *
  * ⚠ 浏览器无法直接播放 rtsp://，必须由网关转协议。
- *   协议优先级默认 mse → webrtc → hls → mjpeg：
- *   mse 只用网关的 HTTP 端口、延迟 0.5—2s，是不开 WebRTC 端口时的最优解；
- *   mjpeg 作为最后兜底，任何浏览器都能显示。
+ *
+ * 协议优先级默认 **hls → mjpeg**，不是 mse，原因有两条（v1.1.1 调整，见 docs/02 的 B-202）：
+ *
+ *   ① **可校验**。mse / webrtc 是把 go2rtc 自带播放页塞进 <iframe>，父页面受同源策略限制
+ *      无法得知里面到底有没有画面 —— iframe 的 load 事件只能证明「网页加载成功」，
+ *      证明不了「有画面」。一旦出现「只有声音没有画面」，降级链会误判为成功并卡死在这一档。
+ *      hls（自己持有 <video>，可读 videoWidth）与 mjpeg（<img> 收到真实帧才触发 load）
+ *      都是可校验的，宁可慢一点也不要黑屏。
+ *   ② **大屏是缩放舞台**。大屏整体套了一层 transform: scale()，
+ *      Chromium 对「被缩放的祖先 + 圆角裁剪 + 跨域 iframe 内视频」的组合存在分层缺陷，
+ *      典型症状就是「声音正常、画面不显示」（同一条 URL 单独打开或放在后台页面里却正常）。
+ *
+ *   latency 取舍：hls 3—8s、mjpeg 1—2s，而 mse 只要 0.5—2s。
+ *   若确认现场大屏用 mse 也能出画面，在大屏上按 **V** 键即可切到 mse 链路（选择存 localStorage）。
  */
 export const videoConfig: VideoConfig = {
   enabled: true,
   showMeta: true,
   provider: 'go2rtc',
-  prefer: ['mse', 'webrtc', 'hls', 'mjpeg'],
+  prefer: ['hls', 'mjpeg'],
 
   go2rtc: {
     enabled: true,
@@ -218,6 +229,11 @@ export const videoConfig: VideoConfig = {
  *
  * mse / webrtc 走内置播放页（iframe），因为 MSE 的 fMP4 封装由 go2rtc 自带脚本处理，
  * 前端自己实现容易在编解码串上踩坑；hls / mjpeg 则由前端直接拉流。
+ *
+ * ⚠ mse / webrtc 的代价是「不可校验」：父页面看不到 iframe 内部有没有画面。
+ *   大屏默认链路不包含这两个协议，仅作为现场排查手段（大屏上按 V 键切换）。
+ *   mode 参数是**白名单**语义（go2rtc 的 video-stream.js 只认 mode 里列出的协议），
+ *   所以 mode=mse 就是「只走 MSE，不支持就彻底不播」，不会自动往后降级。
  */
 export function go2rtcUrl(protocol: VideoProtocol, stream: string): string {
   const base = videoConfig.go2rtc.base.replace(/\/+$/, '');

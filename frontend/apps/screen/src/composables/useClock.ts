@@ -26,24 +26,26 @@ export function useClock() {
   };
 }
 
-/** 轻提示 */
+/**
+ * 轻提示
+ *
+ * 状态放在模块作用域：此前每次调用 useToast() 都会新建一组 ref，
+ * 导致「A 组件调用 toast()、B 组件负责显示」的写法永远显示不出来
+ * （App.vue 持有的是自己那一组 ref）。改为共享单例，谁调用都能显示。
+ */
+const toastText = ref('');
+const toastOn = ref(false);
+let toastTimer: number | null = null;
+
+function toast(msg: string) {
+  toastText.value = msg;
+  toastOn.value = true;
+  if (toastTimer !== null) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toastOn.value = false;
+  }, 3200);
+}
+
 export function useToast() {
-  const toastText = ref('');
-  const on = ref(false);
-  let timer: number | null = null;
-
-  function toast(msg: string) {
-    toastText.value = msg;
-    on.value = true;
-    if (timer !== null) window.clearTimeout(timer);
-    timer = window.setTimeout(() => {
-      on.value = false;
-    }, 3200);
-  }
-
-  onBeforeUnmount(() => {
-    if (timer !== null) window.clearTimeout(timer);
-  });
-
-  return { toastText, toastOn: on, toast };
+  return { toastText, toastOn, toast };
 }

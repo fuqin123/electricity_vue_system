@@ -418,12 +418,16 @@ Authorization: Bearer <token>
 
 | 用途 | 地址 | 谁在用 |
 | :--- | :--- | :--- |
-| MSE 播放页（首选） | `{gateway}/stream.html?src={name}&mode=mse` | 大屏 iframe、后台预览 |
-| WebRTC 播放页 | `{gateway}/webrtc.html?src={name}` | 大屏 iframe（降级项） |
-| HLS | `{gateway}/api/stream.m3u8?src={name}` | 大屏 hls.js |
-| MJPEG | `{gateway}/api/stream.mjpeg?src={name}` | 大屏 `<img>` 兜底 |
+| HLS | `{gateway}/api/stream.m3u8?src={name}` | **大屏首选**（hls.js + 自有 `<video>`，可校验出画） |
+| MJPEG | `{gateway}/api/stream.mjpeg?src={name}` | **大屏兜底**（`<img>` 收到真实帧才算成功） |
+| MSE 播放页 | `{gateway}/stream.html?src={name}&mode=mse` | 后台预览；大屏按 V 切到 mse 链路时启用（画面不可校验） |
+| WebRTC 播放页 | `{gateway}/webrtc.html?src={name}` | 同上（画面不可校验） |
 | 抓图 | `{gateway}/api/frame.jpeg?src={name}` | 后台缩略图 |
 | 流列表 | `{gateway}/api/streams` | 后台「检测网关」自检 |
+
+> **注意**：视频相关接口**不属于**后端契约范围，前端不通过 Django 取流。
+> 大屏默认链路为 hls → mjpeg，原因是跨域 iframe 内的播放状态不可观测
+> （「只有声音没有画面」无法被前端发现），详见 `docs/02-开发记录及Bug总结.md` B-207。
 
 > 网关地址与通道映射在 `frontend/packages/shared/src/config.ts` 的 `videoConfig` 中配置。
 > 若希望通过后端转发（例如统一鉴权或网关不对外暴露），需要在后端增加

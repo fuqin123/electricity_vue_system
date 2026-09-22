@@ -110,7 +110,7 @@ onMounted(() => {
       show-icon
       class="mb-16"
       title="链路说明：浏览器不能直接播放 rtsp://"
-      description="视频源是 RTSP，必须由 go2rtc 转成浏览器认识的协议。前端按 mse → webrtc → hls → mjpeg 顺序自动降级：mse 只用网关 HTTP 端口且延迟 0.5—2s，是默认首选；mjpeg 作为最后兜底。改地址或通道请编辑 frontend/packages/shared/src/config.ts 的 videoConfig。"
+      description="视频源是 RTSP，必须由 go2rtc 转成浏览器认识的协议。本页预览走 MSE（低延迟，直接载入 go2rtc 内置播放页）；大屏默认走 HLS → MJPEG，因为大屏是 transform: scale() 缩放舞台，跨域 iframe 内的视频在缩放祖先下可能不显示，且 iframe 类协议无法校验「到底有没有画面」。大屏上按 V 键可循环切换链路用于现场排查。改地址或通道请编辑 frontend/packages/shared/src/config.ts 的 videoConfig。"
     />
 
     <!-- ── 网关配置与自检 ───────────────────────────────── -->
@@ -137,7 +137,7 @@ onMounted(() => {
         <el-descriptions-item label="WebRTC 端口">
           <span class="t-mono">{{ videoConfig.go2rtc.webrtcPort }}</span>
         </el-descriptions-item>
-        <el-descriptions-item label="协议优先级">
+        <el-descriptions-item label="大屏协议优先级">
           <span class="t-mono">{{ videoConfig.prefer.join(' → ') }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="已接入摄像头">
@@ -160,7 +160,7 @@ onMounted(() => {
     <div v-if="showPreview" class="card">
       <div class="card__head">
         <h3 class="card__title">实时预览</h3>
-        <span class="card__extra">与大屏使用同一播放链路（go2rtc 内置播放页）</span>
+        <span class="card__extra">此处走 go2rtc 内置播放页（MSE，低延迟）；大屏默认走 HLS</span>
       </div>
       <div class="preview-grid">
         <div v-for="r in previewRows" :key="r.lineId" class="preview-item">
@@ -252,6 +252,12 @@ onMounted(() => {
         <el-descriptions-item label="④ 摄像头并发">
           海康/大华默认并发路数常见 4—6 路。go2rtc 按需拉流，
           但同一流被多端同时观看仍会占用并发，建议大屏与后台不要长时间同时预览同一路
+        </el-descriptions-item>
+        <el-descriptions-item label="⑤ ffmpeg（抓图 / MJPEG 依赖）">
+          网关侧需安装 <span class="t-mono">ffmpeg</span> 并加入 <span class="t-mono">PATH</span>，
+          否则 <span class="t-mono">/api/frame.jpeg</span>（本页「抓图」）返回 500、
+          <span class="t-mono">/api/stream.mjpeg</span> 返回空响应。
+          <b>HLS 与 MSE 不依赖 ffmpeg</b>，所以画面本身不受影响
         </el-descriptions-item>
         <el-descriptions-item label="⑤ 新增产线摄像头">
           先在 <span class="t-mono">go2rtc.yaml</span> 的 <span class="t-mono">streams</span> 下加一行

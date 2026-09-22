@@ -289,7 +289,7 @@ function switchLine(id: string) {
     <main class="board" style="--l1: 264px; --c1: 118px; --c2: 486px; --c3: 276px; --r1: 310px; --r2: 280px">
       <!-- ══════ 左列 ══════ -->
       <div class="col">
-        <PanelBox title="产线视频监控" height="var(--l1)">
+        <PanelBox title="产线视频监控" height="var(--l1)" body-class="panel__body--col">
           <template #note><span class="chip chip--flat">通道 {{ camId }}</span></template>
           <VideoMonitor :line-id="line.id" />
         </PanelBox>

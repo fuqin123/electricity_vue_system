@@ -43,7 +43,8 @@ cd C:\go2rtc
 # 4. 浏览器验证（这三步能过，说明网关没问题）
 #    http://127.0.0.1:1984/                                  go2rtc 首页
 #    http://127.0.0.1:1984/api/streams                       流列表
-#    http://127.0.0.1:1984/stream.html?src=my_camera&mode=mse  能出画面
+#    http://127.0.0.1:1984/stream.html?src=my_camera         能出画面
+#      ↑ 不要加 &mode=mse：mode 是白名单，只写 mse 就失去自动降级能力
 
 # 5. 注册为 Windows 服务（开机自启 + 崩溃自动重启）
 powershell -ExecutionPolicy Bypass -File deploy\windows\nssm-install.ps1
@@ -92,7 +93,7 @@ sudo systemctl status go2rtc
     │  rtsp://admin:***@10.113.1.118:554/Streaming/Channels/102
     ▼
 go2rtc 网关（10.113.1.61:1984）
-    │  转成 mse / webrtc / hls / mjpeg
+    │  转成 hls / mjpeg / mse / webrtc
     ▼
 浏览器（大屏 / 后台）—— 直接连网关，不经 Django 后端
 ```
@@ -103,7 +104,7 @@ go2rtc 网关（10.113.1.61:1984）
 export const videoConfig = {
   enabled: true,
   provider: 'go2rtc',                                  // 'go2rtc' | 'custom' | 'off'
-  prefer: ['mse', 'webrtc', 'hls', 'mjpeg'],           // 降级顺序
+  prefer: ['hls', 'mjpeg'],                            // 降级顺序（两者都可校验出画）
   go2rtc: {
     base: 'http://10.113.1.61:1984',                   // ← 改这里
     apiPort: 1984,
@@ -124,20 +125,65 @@ export const videoConfig = {
 
 ---
 
-## 五、协议优先级为什么是 mse 排第一
+## 五、协议优先级为什么是 hls 排第一（v1.1.1 起）
 
-| 协议 | 延迟 | 需要的端口 | 前端实现方式 | 评价 |
-| :--- | :--- | :--- | :--- | :--- |
-| **mse** | 0.5—2s | 仅 1984 | iframe 载入内置播放页 | **默认首选**：不放开额外端口，fMP4 封装由网关脚本处理，最省事 |
-| webrtc | <0.5s | 1984 + 8555(UDP/TCP) | iframe 载入 `/webrtc.html` | 延迟最低，但受 NAT 影响，要先放开 8555 |
-| hls | 3—8s | 仅 1984 | hls.js 直接拉流 | 兼容性最好，切片导致延迟高，不适合盯生产节拍 |
-| mjpeg | 1—2s | 仅 1984 | `<img>` 直接拉流 | 帧率低（常 5—10fps）、带宽高，仅作最后兜底 |
+| 协议 | 延迟 | 需要的端口 | 前端实现方式 | 能否校验出画 | 评价 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **hls** | 约 1—3s（0.5s 切片） | 仅 1984 | hls.js 直接拉流 | ✅ `videoWidth > 0` | **大屏默认首选**：兼容性最好，且前端能自己判断有没有画面 |
+| **mjpeg** | 1—2s | 仅 1984 | `<img>` 直接拉流 | ✅ 收到真实帧才触发 `load` | **大屏兜底**：任何浏览器都能显示；但**依赖 ffmpeg**，现场当前不可用（见第五·补节） |
+| mse | 0.5—2s | 仅 1984 | iframe 载入内置播放页 | ❌ 跨域不可观测 | 延迟最低；后台「实时预览」用它。大屏按 V 键可切到它做对比 |
+| webrtc | <0.5s | 1984 + 8555(UDP/TCP) | iframe 载入 `/webrtc.html` | ❌ 跨域不可观测 | 延迟最低，但受 NAT 影响，要先放开 8555 |
+
+**为什么不默认用 mse（v1.1.1 的调整，见 `docs/02` 的 B-207 / ADR-008）：**
+
+mse / webrtc 的播放状态对父页面**完全不可观测**：它们由 go2rtc 内置播放页承载在
+跨域 iframe 里，父页面只能拿到 `iframe.onload` —— 那只能证明「网页加载成功」，
+不能证明「有画面」。一旦出现「只有声音没有画面」，降级链会误判成功并卡死在第一档，
+后面的 hls / mjpeg 永远轮不到 —— v1.1.1 排查时正是它挡住了真正的原因
+（那次的实际根因是**视频容器高度被算成 0**，见 B-209，与协议无关）。
+
+> 代价：延迟从 0.5—2s 变成约 1—3s（go2rtc 的 HLS 切片是 0.5s，并不慢）。
+> 若现场确认大屏切到 mse 也能出画面（单线页按 **V** 键循环切换链路），
+> 把 `prefer` 改成 `['mse', 'mjpeg']` 即可拿回低延迟。
 
 **mse / webrtc 走 iframe 而不是前端自己实现的原因：**
 MSE 需要把 WebSocket 收到的 fMP4 分片喂给 `SourceBuffer`，
 而 `MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001f,mp4a.40.2"')`
 里的 codec 串随摄像头的编码档位（baseline/main/high）而变，
 写死会在某些型号上直接黑屏。交给 go2rtc 自带脚本判断最稳。
+
+> ⚠ `stream.html?src=X&mode=mse` 的 `mode` 是**白名单**语义：go2rtc 的 `video-stream.js`
+> 只认 `mode` 里列出的协议，只写 `mse` 就等于「MSE 不可用则彻底不播」，不会自动往后降级。
+
+---
+
+## 五·补、ffmpeg 依赖（抓图 / MJPEG 必需）
+
+go2rtc 把 H.264 转 JPEG 需要调用 **ffmpeg**。**现场网关当前未安装 ffmpeg**，实测：
+
+```bash
+curl -s -o /dev/null -w "%{http_code} %{size_download}\n" "http://<网关IP>:1984/api/stream.mjpeg?src=my_camera"
+# 200 0        ← 空响应，等于拉不到画面
+curl -s "http://<网关IP>:1984/api/frame.jpeg?src=my_camera"
+# exec: "ffmpeg": executable file not found in %PATH%   （HTTP 500）
+```
+
+| 能力 | 是否依赖 ffmpeg | 现场状态 |
+| :--- | :--- | :--- |
+| HLS（大屏首选） | ❌ 不依赖 | ✅ 可用（实测主列表返回 `CODECS="avc1.4D0029"`） |
+| MSE / WebRTC（后台预览） | ❌ 不依赖 | ✅ 可用 |
+| MJPEG（大屏兜底） | ✅ 依赖 | ❌ 不可用，前端会报「网关需安装 ffmpeg」 |
+| 抓图 `/api/frame.jpeg` | ✅ 依赖 | ❌ 不可用（后台「抓图」按钮返回 500） |
+
+安装方式：下载 ffmpeg 的 Windows 构建包，解压后**把 `bin` 目录加入系统 `PATH`**
+（或直接放在 go2rtc.exe 同级目录），重新注册服务：
+
+```powershell
+# 验证
+ffmpeg -version
+# 重启网关服务（NSSM 方式部署时）
+powershell -ExecutionPolicy Bypass -File deploy\windows\nssm-install.ps1 -Action restart
+```
 
 ---
 
@@ -238,7 +284,7 @@ sudo systemctl restart go2rtc
          resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: true },   // ← 由 false 改 true
    ```
 
-3. **验证** —— 重新构建前端并部署，打开大屏单线详情选 A2，右上角应显示 `MSE`；
+3. **验证** —— 重新构建前端并部署，打开大屏单线详情选 A2，右上角应显示 `HLS`（或 `MJPEG`）；
    后台「视频监控」页点「检测网关」，A2 行的「配置校验」应变为「正常」。
 
 > 也可直接在后台「视频监控」页点「打开预览」先验证网关侧是否正常，

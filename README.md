@@ -85,7 +85,7 @@ electricity_vue_system/
 | 大屏 `frontend/apps/screen` | Vue / Vite / ECharts / Pinia / Vue Router(hash) / VueUse / SCSS | Vue 3.5 · Vite 6 · ECharts 5 |
 | 后台 `frontend/apps/admin` | Vue / Vite / **Element Plus** / ECharts / Pinia / Vue Router(history) / VueUse / SCSS | Element Plus 2.9 |
 | 共享层 `frontend/packages/shared` | TypeScript 类型 · 全局配置 · Mock 引擎 · API SDK · 设计令牌 | TypeScript 5.7 |
-| 视频 | **go2rtc** 转流网关（RTSP → MSE / WebRTC / HLS / MJPEG） | 现场已验证 |
+| 视频 | **go2rtc** 转流网关（RTSP → 浏览器可播协议；大屏走 HLS → MJPEG 可校验链路） | 现场已验证 |
 | 后端（预留） | Django + DRF + OpenAPI/Swagger + PostgreSQL | Python 3.10+ |
 | 工具链 | pnpm workspace · vue-tsc · Prettier · Sass | Node ≥ 20.19 · pnpm ≥ 9 |
 
@@ -146,8 +146,18 @@ pnpm format                 # Prettier 格式化
 本项目采用 go2rtc（现场已在 `E:\能源产效管理平台\go2rtc_win64` 验证通过）。
 
 ```
-摄像头(RTSP) → go2rtc 网关(:1984) → 浏览器（mse → webrtc → hls → mjpeg 自动降级）
+摄像头(RTSP) → go2rtc 网关(:1984) → 浏览器
+                                     大屏：hls → mjpeg 自动降级（两者都能校验出画）
+                                     后台预览：mse（内置播放页 iframe）
 ```
+
+> ⚠ 大屏**不用** iframe 类协议（mse / webrtc）作默认：跨域 iframe 内有没有画面
+> 前端无法判断，「只有声音没有画面」会被误判为成功并卡死降级链。
+> 详见 `docs/02-开发记录及Bug总结.md` 的 B-207 / ADR-008。
+> 大屏上按 **V** 键可循环切换链路做现场排查。
+>
+> 注：网关未安装 `ffmpeg` 时，MJPEG 与「抓图」不可用（HLS / MSE 不受影响），
+> 见 `deploy/go2rtc/README.md`。
 
 - 网关配置：`deploy/go2rtc/go2rtc.example.yaml`
 - 部署与排障：`deploy/go2rtc/README.md`
