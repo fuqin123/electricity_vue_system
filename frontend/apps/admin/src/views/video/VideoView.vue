@@ -173,6 +173,7 @@ onMounted(() => {
               :src="go2rtcUrl('mse', r.ch?.stream ?? '')"
               allow="autoplay; fullscreen; encrypted-media"
               referrerpolicy="no-referrer"
+              scrolling="no"
             />
           </div>
         </div>

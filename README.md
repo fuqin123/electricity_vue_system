@@ -147,13 +147,12 @@ pnpm format                 # Prettier 格式化
 
 ```
 摄像头(RTSP) → go2rtc 网关(:1984) → 浏览器
-                                     大屏：hls → mjpeg 自动降级（两者都能校验出画）
+                                     大屏：mse → hls → mjpeg 自动降级（mse 首选，hls 可自证兜底）
                                      后台预览：mse（内置播放页 iframe）
 ```
 
-> ⚠ 大屏**不用** iframe 类协议（mse / webrtc）作默认：跨域 iframe 内有没有画面
-> 前端无法判断，「只有声音没有画面」会被误判为成功并卡死降级链。
-> 详见 `docs/02-开发记录及Bug总结.md` 的 B-207 / ADR-008。
+> ⚠ iframe 类协议（mse / webrtc）由网关内置播放页承载，**跨域导致前端无法校验有没有画面**，
+> 所以链路里必须紧跟一个能自证的 hls 作兜底（详见 `docs/02` 的 B-207 / ADR-008）。
 > 大屏上按 **V** 键可循环切换链路做现场排查。
 >
 > 注：网关未安装 `ffmpeg` 时，MJPEG 与「抓图」不可用（HLS / MSE 不受影响），

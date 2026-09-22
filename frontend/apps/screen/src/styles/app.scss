@@ -375,10 +375,21 @@ html, body {
 /**
  * go2rtc 内置播放页（mse / webrtc）用的 iframe。
  *
- * ⚠ `transform: translateZ(0)` 不是凑数：整个 `.stage` 套了一层 `transform: scale()`，
- *   Chromium 对「被缩放的祖先 + 圆角裁剪 + 跨域 iframe 内的视频」存在分层缺陷，
- *   表现就是「声音正常、画面不显示」。强制 iframe 独立合成层可规避该问题。
- *   详见 docs/02-开发记录及Bug总结.md 的 B-202。
+ * ⚠ 两点都别删：
+ *
+ * ① `transform: translateZ(0)`：整个 `.stage` 套了一层 `transform: scale()`，
+ *    强制 iframe 独立合成层，规避「缩放祖先 + 圆角裁剪 + 跨域 iframe 内视频」
+ *    可能引发的分层问题（docs/02 B-207）。
+ *
+ * ② 滚动条由 iframe 上的 `scrolling="no"` 去掉（B-214）：
+ *    go2rtc 播放页在 362×177 这种窄容器里会溢出，**跨域 iframe 内部文档我们注入不了样式**，
+ *    只能用 `scrolling` 属性。实测（Chromium 153 / 容器 362×177）：
+ *      不加      → 内部可用宽 347（滚动条占 15px）—— 就是现场看到的滚动条
+ *      加 no     → 内部可用宽 362，滚动条消失，画面不做任何缩放或裁切 ✅ 采用
+ *    若将来换成忽略该属性的浏览器（一般也播不了 MSE），
+ *    可在 `.video__iframe` 上加 `width/height: calc(100% + 18px)`：
+ *    滚动条永远画在 iframe 自身右／下边缘，放大 18px 后会被父级 `overflow:hidden` 裁到容器外
+ *    （已实测可行，代价是画面被放大约 11%，右侧可能少 2—4px）。
  */
 .video__iframe {
   position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block;

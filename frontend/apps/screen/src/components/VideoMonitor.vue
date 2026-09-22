@@ -6,23 +6,22 @@
  *   必须由流媒体网关把 RTSP 转成浏览器认识的协议。本项目采用 **go2rtc**
  *   （现场已在 `E:\能源产效管理平台\go2rtc_win64` 验证通过）。
  *
- * ── 默认链路：hls → mjpeg（v1.1.1 起，见 docs/02 的 B-202）──────────────
- *   ① hls   —— 前端自己持有 <video> + hls.js 拉 `/api/stream.m3u8`，延迟 3—8s。
- *               **可校验**：只有音频轨道时 `video.videoWidth` 恒为 0，
- *               浏览器不支持该视频编码会被当场识别出来并降级，不会黑屏装死。
- *   ② mjpeg —— `<img>` 拉 `/api/stream.mjpeg`，延迟 1—2s。
- *               浏览器收到真实 JPEG 帧才会触发 load，**收到即证明有画面**，
- *               是任何浏览器都能显示的最后兜底（代价：网关要逐帧转 JPEG，码率高）。
+ * ── 默认链路：mse → hls → mjpeg（v1.1.1 现场实测后确定）──────────────
+ *   ① mse   —— iframe 载入 go2rtc 内置播放页 `/stream.html?src=X&mode=mse`，
+ *              延迟 0.5—2s，网关不转码。现场大屏实测画面正常，故作为默认首选。
+ *              ⚠ 代价：跨域 iframe 的播放状态**父页面无法校验**，
+ *                所以后面必须接一个能自证的协议。
+ *   ② hls   —— 前端自己持有 <video> + hls.js 拉 `/api/stream.m3u8`，延迟约 1—3s。
+ *              **可校验**：只有音频轨道时 `video.videoWidth` 恒为 0，
+ *              浏览器不支持该视频编码会被当场识别出来并继续降级，不会黑屏装死。
+ *   ③ mjpeg —— `<img>` 拉 `/api/stream.mjpeg`，收到真实 JPEG 帧才算成功，
+ *              是任何浏览器都能显示的最后兜底（依赖网关 ffmpeg，未装则快速失败并给出原因）。
  *
- * ── 为什么不用 mse / webrtc 作为默认 ─────────────────────────────────
- *   这两个协议是把 go2rtc 自带的播放页塞进 <iframe>，父页面受同源策略限制
- *   **看不到 iframe 内部到底有没有画面**：iframe 的 load 只能证明「网页加载成功」。
- *   于是「只有声音没有画面」会被误判为播放成功，降级链卡死在这一档。
- *   另外大屏整体套了一层 `transform: scale()`，Chromium 对
- *   「被缩放的祖先 + 圆角裁剪 + 跨域 iframe 内视频」的组合存在分层缺陷，
- *   典型症状正是「声音正常、画面不显示」，而同一个 URL 单独打开却正常。
- *   为兼顾低延迟，这两个协议保留为**现场排查项**：在大屏上按 **V** 键循环切换链路，
- *   选择会存进 localStorage，刷新后保持。
+ * ⚠ 历史教训（v1.1.1）：大屏曾出现「只有声音、没有画面」，
+ *   真正原因是**视频容器高度被算成 0**（B-209），与协议无关。
+ *   排查视频故障的第一步永远是**量 `.video` 的尺寸**。
+ *   另外：任何一条失败路径都必须经 fail() 留下原因（B-210/B-211），
+ *   媒体元素不能靠 `display:none` 隐藏来探测（B-212），监听要先于 load 注册（B-213）。
  *
  * 若网关是 MediaMTX / ZLMediaKit 等自建服务，把 `videoConfig.provider` 改为 `'custom'`
  * 并在 `customEndpoints` 填 flv / hls / webrtc 地址即可，本组件会自动走旧链路。
@@ -55,14 +54,16 @@ const PROTOCOL_TIMEOUT: Record<VideoProtocol, number> = {
 };
 
 /* ── 可切换链路（大屏按 V 键循环，存 localStorage）─────────────────
- * 排序原则：可校验的协议在前。mse / webrtc 只作为现场排查选项，
- * 它们一旦「有声无画」会误判为成功，不能作为默认。
+ * v1.1.1 现场实测后调整：**mse 排在第一位**（延迟最低、网关不转码，且现场大屏上
+ * 画面正常 —— 之前「有声无画」的根因是容器 0 高，见 B-209，与协议无关）。
+ * 后面接 hls：它是唯一能**自证有画面**的协议（`videoWidth > 0`），
+ * mse 万一不出画面时还能顶上来。mjpeg 垫底（依赖网关 ffmpeg）。
  */
 const CHAIN_KEY = 'eep.video.chain';
 const PRESETS: ReadonlyArray<{ key: string; label: string; list: readonly VideoProtocol[] }> = [
-  { key: 'hls', label: 'HLS → MJPEG（推荐）', list: ['hls', 'mjpeg'] },
-  { key: 'mse', label: 'MSE → MJPEG（低延迟·画面不可校验）', list: ['mse', 'mjpeg'] },
-  { key: 'webrtc', label: 'WebRTC → MJPEG（画面不可校验）', list: ['webrtc', 'mjpeg'] },
+  { key: 'mse', label: 'MSE → HLS → MJPEG（推荐）', list: ['mse', 'hls', 'mjpeg'] },
+  { key: 'hls', label: 'HLS → MJPEG（仅用可校验协议）', list: ['hls', 'mjpeg'] },
+  { key: 'webrtc', label: 'WebRTC → MJPEG', list: ['webrtc', 'mjpeg'] },
   { key: 'mjpeg', label: '仅 MJPEG（最稳）', list: ['mjpeg'] }
 ];
 
@@ -270,6 +271,10 @@ function playGo2rtc(protocol: VideoProtocol, stream: string): Promise<boolean> {
       ifr.className = 'video__iframe';
       ifr.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
       ifr.setAttribute('referrerpolicy', 'no-referrer');
+      // 去掉网关播放页在窄容器里出现的滚动条（B-214）。
+      // 实测 Chromium 仍支持 scrolling="no"：不加时内部可用宽 347（滚动条占 15px），
+      // 加了以后 362 全可用，且画面不做任何缩放或裁切。
+      ifr.setAttribute('scrolling', 'no');
       ifr.onload = () => succeed(false);
       ifr.onerror = () => fail('播放页加载失败');
       ifr.src = url;
@@ -421,6 +426,7 @@ async function playCustom(index: number) {
     const ifr = document.createElement('iframe');
     ifr.className = 'video__iframe';
     ifr.setAttribute('allow', 'autoplay; fullscreen');
+    ifr.setAttribute('scrolling', 'no');
     ifr.onload = () => done(true);
     ifr.onerror = () => done(false);
     ifr.src = item.url;
@@ -504,10 +510,13 @@ onBeforeUnmount(() => {
       <span
         v-if="activeProtocol"
         class="video__proto"
-        :class="{ 'is-unverified': unverified }"
-        :title="unverified ? '该协议由网关内置播放页承载，前端无法校验画面是否真的出来了' : '已校验：确实收到了画面帧'"
+        :title="
+          unverified
+            ? '该协议由网关内置播放页（跨域 iframe）承载，前端无法校验画面是否真的出来了'
+            : '已校验：确实收到了画面帧'
+        "
       >
-        {{ String(activeProtocol).toUpperCase() }}{{ unverified ? ' ?' : '' }}
+        {{ String(activeProtocol).toUpperCase() }}
       </span>
     </div>
 
@@ -544,9 +553,10 @@ onBeforeUnmount(() => {
   letter-spacing: 0.5px;
 }
 
-/* 「未校验」用琥珀色区分：画面可能没出来，别把它当成播放成功 */
-.video__proto.is-unverified {
-  background: rgba(255, 176, 32, 0.28);
-  color: #ffd58a;
-}
+/*
+ * 角标只显示协议名，不再给「不可校验」的协议加琥珀色问号：
+ * 现场实测 MSE 在缩放舞台下画面正常（B-209 的根因是容器 0 高，与协议无关），
+ * 默认链路就是 MSE，工作正常时再挂个警告色反而像故障。
+ * 「前端无法校验画面」这层信息放在 title 提示里（见模板）。
+ */
 </style>

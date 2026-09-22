@@ -426,7 +426,7 @@ Authorization: Bearer <token>
 | 流列表 | `{gateway}/api/streams` | 后台「检测网关」自检 |
 
 > **注意**：视频相关接口**不属于**后端契约范围，前端不通过 Django 取流。
-> 大屏默认链路为 hls → mjpeg，原因是跨域 iframe 内的播放状态不可观测
+> 大屏默认链路为 mse → hls → mjpeg（hls 用于兜底，因为跨域 iframe 内的播放状态不可观测
 > （「只有声音没有画面」无法被前端发现），详见 `docs/02-开发记录及Bug总结.md` B-207。
 
 > 网关地址与通道映射在 `frontend/packages/shared/src/config.ts` 的 `videoConfig` 中配置。
