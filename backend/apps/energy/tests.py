@@ -160,6 +160,21 @@ class AggregationTests(TestCase):
         self.assertEqual(res["usage"], Decimal("42.000"))
         self.assertEqual((res["end_at"] - res["start_at"]).total_seconds(), 3600)
 
+    def test_端点未按期采到判partial(self):
+        """★ 相位判定：两个端点都偏离采样时刻时，即便区间约等于 1 小时，也不能算「干净」。
+
+        真实形态（09-22 的历史数据）：读数落在 14:49:37 与 15:50:23，
+        区间 60.8 分钟，看着完全正常，但两个点各自偏了约 11 分钟，
+        这一小时的窗口整体平移了 10 分钟。数值不算错，但不该标成 ok。
+        """
+        meter = self.make_meter()
+        self.read(meter, datetime(2026, 9, 22, 14, 49, 37), "100")
+        self.read(meter, datetime(2026, 9, 22, 15, 50, 23), "130")
+
+        res = compute_hour(meter, DAY, 15)
+        self.assertEqual(res["quality"], HourlyUsage.Q_PARTIAL)
+        self.assertIn("未按期采到", res["note"])
+
     def test_写入小时表可重复执行(self):
         """聚合是幂等的：跑两遍结果一致，不会产生重复行。"""
         meter = self.make_meter()

@@ -389,10 +389,13 @@ class PeriodSummary(models.Model):
     start_date = models.DateField("起始日期")
     end_date = models.DateField("结束日期")
 
-    output = models.DecimalField("产量(瓶)", max_digits=20, decimal_places=1, default=0)
-    kwh = models.DecimalField("用电量(kWh)", max_digits=20, decimal_places=3, default=0)
-    water_t = models.DecimalField("用水量(t)", max_digits=16, decimal_places=3, default=0)
-    steam_t = models.DecimalField("用汽量(t)", max_digits=16, decimal_places=3, default=0)
+    # ⚠ 这四个字段**必须可空**：该周期一条可信数据都没有时，它是「未知」而不是 0。
+    #   写成 NOT NULL + default 0，就等于把「没采到」硬说成「用了 0」——
+    #   大屏与后台都会显示 0，而 0 在这个语境里是「确实没用电」，语义完全相反。
+    output = models.DecimalField("产量(瓶)", max_digits=20, decimal_places=1, null=True, blank=True)
+    kwh = models.DecimalField("用电量(kWh)", max_digits=20, decimal_places=3, null=True, blank=True)
+    water_t = models.DecimalField("用水量(t)", max_digits=16, decimal_places=3, null=True, blank=True)
+    steam_t = models.DecimalField("用汽量(t)", max_digits=16, decimal_places=3, null=True, blank=True)
 
     plan_output = models.DecimalField("计划产量(瓶)", max_digits=20, decimal_places=1, default=0)
     unit_kwh = models.DecimalField(

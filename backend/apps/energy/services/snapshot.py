@@ -366,7 +366,8 @@ def _period_series(
             out.append(
                 {
                     "label": _labels_for(dim, d),
-                    "output": int(row.output) if real else NULL,
+                    # row.output 为 NULL = 该周期没有可信产量 → 留空
+                    "output": int(row.output) if (real and row.output is not None) else (0 if real else NULL),
                     "kwh": round_kwh(row.kwh),
                     "unitKwh": round_any(row.unit_kwh, 2) if row.unit_kwh is not None else NULL,
                 }
@@ -547,7 +548,7 @@ def _period_total(line: Line, dim: str, now: datetime) -> Decimal | None:
     key = S.make_key(dim, now.date())
     row = _summary_rows(dim, PeriodSummary.SCOPE_LINE, line, [key]).get(key)
     if row is not None:
-        return row.kwh
+        return row.kwh  # 可能为 None（该周期无可信数据），由调用方按「未知」处理
     if dim == PeriodSummary.DIM_MONTH:
         return _month_kwh_raw(line, now)
     return _year_kwh_raw(line, now)
@@ -557,7 +558,7 @@ def _period_output(line: Line, dim: str, now: datetime) -> Decimal:
     key = S.make_key(dim, now.date())
     row = _summary_rows(dim, PeriodSummary.SCOPE_LINE, line, [key]).get(key)
     if row is not None:
-        return row.output
+        return row.output if row.output is not None else Decimal(0)
     return production_sum(line, *S.period_bounds(dim, key))
 
 
@@ -712,7 +713,11 @@ def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
     key = S.make_key(dim, now.date())
     row = _summary_rows(dim, PeriodSummary.SCOPE_WORKSHOP, None, [key]).get(key)
     if row is not None:
-        return {"output": int(row.output) if real else NULL, "kwh": row.kwh}
+        # output 为 NULL 表示该周期没有可信产量；real=False（产量未接入）时统一留空
+        return {
+            "output": int(row.output) if (real and row.output is not None) else (0 if real else NULL),
+            "kwh": row.kwh,
+        }
     start, end = S.period_bounds(dim, key)
     agg = HourlyUsage.objects.filter(
         meter__kind=Meter.KIND_ELEC, date__gte=start, date__lte=end, quality__in=HourlyUsage.TRUSTED

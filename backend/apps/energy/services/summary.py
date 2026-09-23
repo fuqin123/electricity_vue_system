@@ -153,13 +153,19 @@ def summarize_period(
     quality = _quality_from(e_covered, expected)
 
     # 水 / 汽：只有车间总表，不拆分到线别
-    water = steam = Decimal(0)
+    water: Decimal | None = None
+    steam: Decimal | None = None
     if scope == PeriodSummary.SCOPE_WORKSHOP:
         w_meters = list(Meter.objects.filter(kind=Meter.KIND_WATER, enabled=True))
         s_meters = list(Meter.objects.filter(kind=Meter.KIND_STEAM, enabled=True))
-        water = _energy_part(w_meters, start, end)[0] or Decimal(0)
-        steam = _energy_part(s_meters, start, end)[0] or Decimal(0)
+        water = _energy_part(w_meters, start, end)[0]
+        steam = _energy_part(s_meters, start, end)[0]
 
+    # ⚠ 没有任何可信数据时写 NULL，不写 0。
+    #   「空合计兜底成 0」是这个项目里反复出现的一类错误（B-502 / B-505 / B-508）：
+    #   0 在界面上是「确实没用」，与「没采到」完全相反。
+    has_energy = kwh is not None
+    has_output = output > 0
     return {
         "scope": scope,
         "line": line,
@@ -167,10 +173,10 @@ def summarize_period(
         "period_key": key,
         "start_date": start,
         "end_date": end,
-        "output": output.quantize(Decimal("0.1")),
-        "kwh": (kwh or Decimal(0)).quantize(Q3),
-        "water_t": Decimal(water).quantize(Q3),
-        "steam_t": Decimal(steam).quantize(Q3),
+        "output": output.quantize(Decimal("0.1")) if has_output else None,
+        "kwh": kwh.quantize(Q3) if has_energy else None,
+        "water_t": Decimal(water).quantize(Q3) if water is not None else None,
+        "steam_t": Decimal(steam).quantize(Q3) if steam is not None else None,
         "plan_output": _plan_output(lines, start, end, now).quantize(Decimal("0.1")),
         "unit_kwh": _unit_kwh(kwh, output),
         "covered_hours": e_covered,

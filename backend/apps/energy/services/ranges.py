@@ -181,14 +181,20 @@ def _utility_series(
     if dim == PeriodSummary.DIM_DAY:
         rows = _summary_series(PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_WORKSHOP, None, [k for k, _ in keys])
         field = "water_t" if kind == Meter.KIND_WATER else "steam_t"
-        return [float(getattr(rows[k], field)) if k in rows else None for k, _ in keys]
+        out: list[float | None] = []
+        for k, _lab in keys:
+            row = rows.get(k)
+            val = getattr(row, field) if row is not None else None
+            out.append(float(val) if val is not None else None)
+        return out
 
     out: list[float | None] = []
     for key, _label in keys:
         s, e = S.period_bounds(dim, key)
         row = _summary_series(dim, PeriodSummary.SCOPE_WORKSHOP, None, [key]).get(key)
         if row is not None:
-            out.append(float(row.water_t if kind == Meter.KIND_WATER else row.steam_t))
+            val = row.water_t if kind == Meter.KIND_WATER else row.steam_t
+            out.append(float(val) if val is not None else None)
             continue
         agg = HourlyUsage.objects.filter(
             meter__in=meters, date__gte=s, date__lte=min(e, now.date()), quality__in=HourlyUsage.TRUSTED
@@ -275,7 +281,8 @@ def usage_range(
             vals: list[float | None] = []
             for k in klist:
                 if k in rows:
-                    vals.append(float(rows[k].kwh))
+                    # 汇总行存在但 kwh 为 NULL = 该周期没有任何可信数据 → 传 None（不是 0）
+                    vals.append(float(rows[k].kwh) if rows[k].kwh is not None else None)
                     continue
                 s, e = S.period_bounds(dim, k)
                 vals.append(_round(_range_total_kwh(_workshop_meters(), s, min(e, now.date()))))
@@ -287,7 +294,7 @@ def usage_range(
             vals = []
             for k in klist:
                 if k in rows:
-                    vals.append(float(rows[k].kwh))
+                    vals.append(float(rows[k].kwh) if rows[k].kwh is not None else None)
                     continue
                 s, e = S.period_bounds(dim, k)
                 vals.append(_round(_range_total_kwh(_line_meters(ln), s, min(e, now.date()))))

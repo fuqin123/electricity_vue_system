@@ -24,7 +24,7 @@
 | 缺读数 | usage = null，quality = missing | **绝不补 0**：补 0 在图上就是「产量暴跌」 |
 | 差值 < 0 | usage = null，quality = reset | 换表 / 表归零会算出负数，任何负数都不能进聚合 |
 | 差值 > max_hourly | 保留数值，quality = spike，**不计入聚合** | 断讯后补传、换表瞬间会出现尖峰 |
-| 端点离整点 > 容差 | quality = partial，数值保留参考 | 采集中断过，这个「小时」实际跨了更长时间 |
+| 端点离整点 > 容差 | **判缺数（usage = null）** | 采集中断过，这个「小时」实际跨了更长时间 |
 | 只有 quality = ok | 才允许进入产线 / 车间合计 | 口径干净 |
 """
 
@@ -110,6 +110,19 @@ def boundary_reading(meter: Meter, boundary: datetime) -> Reading | None:
 #: 区间长度与 1 小时的允许偏差，超过就标 partial（读数虽有，但这一小时不干净）
 SPAN_TOLERANCE = timedelta(minutes=5)
 
+#: 端点相对**采样时刻**的允许偏差。
+#: `ok` 的含义是「这一小时的端点按期采到了」，而不只是「有个数能减出约 1 小时」。
+#:
+#: 为什么需要它（v1.2.2 补的一个口子）：
+#:   只用「最近 + ±20 分钟容差 + 区间长约 1 小时」三条，仍会放过一种情况 ——
+#:   两个端点都偏离采样时刻同样的方向、同样的幅度。
+#:   例如某天的读数落在 14:49:37 与 15:50:23，区间 60.8 分钟，看起来一切正常，
+#:   但这两个点其实各自偏了 11 分钟，这一小时的「窗口」整体平移了 10 分钟。
+#:   数值不是错的（没有重复计、也没有陈旧值），但它不该被标成「干净」。
+#:   这里按「相对采样时刻的偏差」判定，与 `collect.hourly_offset_seconds` 无关 ——
+#:   偏移改成 600 秒也不会让所有小时都变 partial。
+PHASE_TOLERANCE = timedelta(minutes=10)
+
 
 def compute_hour(meter: Meter, day: date_cls, hour: int) -> dict:
     """算一个计量点在某小时的用量（不落库，纯计算，便于测试与复查）。"""
@@ -168,6 +181,18 @@ def compute_hour(meter: Meter, day: date_cls, hour: int) -> dict:
             "quality": HourlyUsage.Q_PARTIAL,
             "note": f"区间长度 {span / 60:.0f} 分钟（起 {start.at:%H:%M:%S} → 止 {end.at:%H:%M:%S}），"
                     f"偏离 1 小时，差值仅供参考",
+        }
+
+    # 相位判定：两个端点是否都按期采到了（见 PHASE_TOLERANCE 的说明）
+    start_lag = abs((start.at - slots.slot_ready_at(hour_start)).total_seconds())
+    end_lag = abs((end.at - slots.slot_ready_at(end_limit)).total_seconds())
+    if max(start_lag, end_lag) > PHASE_TOLERANCE.total_seconds():
+        return {
+            **base,
+            "usage": delta,
+            "quality": HourlyUsage.Q_PARTIAL,
+            "note": f"端点未按期采到（起点偏 {start_lag / 60:.0f} 分、终点偏 {end_lag / 60:.0f} 分），"
+                    f"本小时窗口有平移，差值仅供参考",
         }
 
     return {**base, "usage": delta, "quality": HourlyUsage.Q_OK, "note": ""}
