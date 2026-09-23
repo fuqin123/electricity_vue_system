@@ -129,6 +129,54 @@ html, body {
 .tabs--line button.is-active { background: linear-gradient(90deg, var(--cyan), var(--primary)); }
 
 /* ══════════════════════════════════════════════════════════════
+   日期切换（查看历史数据）
+   ══════════════════════════════════════════════════════════════
+   历史模式下整块变成琥珀色并写明「历史数据」——
+   大屏挂在车间墙上，看的人常常只扫一眼数字，
+   若历史数据与实时数据长得一样，很容易把几天前的用电量当成当前读数。
+   ──────────────────────────────────────────────────────────── */
+.date-switch {
+  display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  padding: 3px 6px; border-radius: var(--r-pill);
+  background: rgba(255,255,255,.05);
+  border: 1px solid transparent;
+  transition: .18s;
+}
+.date-switch.is-history {
+  background: rgba(255,176,32,.14);
+  border-color: rgba(255,176,32,.46);
+}
+.date-switch__step {
+  width: 20px; height: 20px; flex: 0 0 20px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; cursor: pointer; border-radius: 50%;
+  background: rgba(124,140,255,.14); color: var(--t2);
+  font-size: 13px; line-height: 1; padding: 0; transition: .16s;
+}
+.date-switch__step:hover:not(:disabled) { background: rgba(124,140,255,.3); color: #fff; }
+.date-switch__step:disabled { opacity: .3; cursor: not-allowed; }
+.date-switch__field { display: inline-flex; }
+/* 原生日期输入在深色主题下要显式声明配色，否则在 Windows 上是白底黑字 */
+.date-switch__field input {
+  width: 116px; height: 20px; padding: 0 4px;
+  border: 0; outline: none; background: transparent;
+  color: var(--t2); font-family: var(--font-num); font-size: 11px;
+  color-scheme: dark; cursor: pointer;
+}
+.date-switch.is-history .date-switch__field input { color: #ffd58a; }
+.date-switch__badge {
+  display: inline-flex; align-items: center;
+  font-size: 10px; letter-spacing: .5px; white-space: nowrap;
+}
+.date-switch__badge--live { color: var(--green); padding: 0 6px; }
+.date-switch__badge button {
+  border: 0; cursor: pointer; padding: 2px 9px; border-radius: var(--r-xs);
+  background: rgba(255,176,32,.3); color: #ffe6b8;
+  font-family: var(--font-cn); font-size: 10px; transition: .16s;
+}
+.date-switch__badge button:hover { background: rgba(255,176,32,.48); color: #fff; }
+
+/* ══════════════════════════════════════════════════════════════
    三列栅格
    ══════════════════════════════════════════════════════════════ */
 .board {
@@ -210,6 +258,22 @@ html, body {
 }
 .gauge__center b { font-family: var(--font-num); font-size: 26px; font-weight: 600; color: #fff; line-height: 1.1; }
 .gauge__center span { font-size: 10px; color: var(--t4); }
+
+/**
+ * 单位电耗占位（产量数据源未接入时替代仪表）
+ * 尺寸与 .gauge 对齐，避免面板高度跳动。
+ */
+.nodata-ring {
+  width: 150px; height: 150px; flex: 0 0 150px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  border-radius: 50%;
+  border: 1px dashed rgba(255, 255, 255, .16);
+  background: radial-gradient(circle at 50% 45%, rgba(255, 176, 32, .1), transparent 70%);
+  text-align: center; padding: 0 14px;
+}
+.nodata-ring b { font-family: var(--font-num); font-size: 26px; font-weight: 600; color: var(--amber); line-height: 1.1; }
+.nodata-ring span { font-size: 11px; color: var(--t3); }
+.nodata-ring em { font-size: 9px; font-style: normal; color: var(--t5); line-height: 1.5; }
 
 /* ══════════════════════════════════════════════════════════════
    KV 列表 / 数据行
@@ -298,7 +362,18 @@ html, body {
 /* ══════════════════════════════════════════════════════════════
    图表容器
    ══════════════════════════════════════════════════════════════ */
-.chart { flex: 0 0 auto; width: 100%; min-height: 0; }
+/**
+ * 图表容器
+ *
+ * ⚠ `min-height` 是**护栏，别删**：
+ *   `.chart` 的高度来自两处之一 —— `flex: 1 1 auto`（在 flex 列父级里撑开）
+ *   或显式高度。若所在 `.panel__body` 漏了 `--col`（成了块级），
+ *   `flex` 属性失效且没有高度 → 容器塌成 0 高，canvas 也变 0 高，
+ *   而 ECharts **不会报错**，页面只表现成「这块图是空的」。
+ *   v1.1.1 的视频面板、v1.2.1 的四处图表栽的都是这个（B-402）。
+ *   min-height 保证万一再漏传 body-class，图会「矮」而不是「消失」，一眼能看出来。
+ */
+.chart { flex: 0 0 auto; width: 100%; min-height: 96px; }
 .chart--grow { flex: 1 1 auto; }
 .chart__fallback {
   display: flex; align-items: center; justify-content: center; height: 100%;
@@ -461,6 +536,30 @@ table.dt tbody tr:hover td { background: rgba(88,101,242,.16); }
   opacity: 0; pointer-events: none; transition: .24s;
 }
 .toast.is-on { opacity: 1; transform: translate(-50%, 0); }
+
+/**
+ * 降级提示条（后端接口不可达时出现）
+ * 演示数据与真实数据在界面上长得一样，必须有一条视觉上压得住但不遮挡内容的横幅。
+ */
+.degrade {
+  position: fixed; left: 50%; top: 0; transform: translateX(-50%);
+  z-index: 150;
+  display: flex; align-items: center; gap: 10px;
+  max-width: 76%;
+  padding: 7px 18px;
+  border-radius: 0 0 8px 8px;
+  background: rgba(255, 176, 32, .14);
+  border: 1px solid rgba(255, 176, 32, .5);
+  border-top: 0;
+  backdrop-filter: blur(6px);
+  color: #ffd58a; font-size: 12px; line-height: 1.4;
+}
+.degrade b {
+  flex: 0 0 auto;
+  padding: 1px 8px; border-radius: var(--r-pill);
+  background: rgba(255, 176, 32, .28); color: #ffe6b8; font-weight: 500;
+}
+.degrade span { color: var(--t2); }
 
 /* 首屏加载态 */
 .boot {

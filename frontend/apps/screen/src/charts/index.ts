@@ -111,17 +111,18 @@ export function overviewTrendOption(ws: WorkshopData, dim: TrendDim): echarts.EC
     eq = '千kWh';
   } else if (dim === '日') {
     labels = ws.daily30.map((x) => x.label);
-    out = ws.daily30.map((x) => +(x.output / 10000).toFixed(2));
+    // 产量未接入（null）时保留 null：柱子留空显示「--」，不能当 0 画
+    out = ws.daily30.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(2)));
     kwh = ws.daily30.map((x) => +(x.kwh / 10000).toFixed(3));
   } else if (dim === '年') {
     labels = ws.yearly5.map((x) => x.label);
-    out = ws.yearly5.map((x) => +(x.output / 100000000).toFixed(3));
+    out = ws.yearly5.map((x) => (x.output === null ? null : +(x.output / 100000000).toFixed(3)));
     kwh = ws.yearly5.map((x) => +(x.kwh / 100000000).toFixed(4));
     uq = '亿瓶';
     eq = '亿kWh';
   } else {
     labels = ws.monthly12.map((x) => x.label);
-    out = ws.monthly12.map((x) => +(x.output / 10000).toFixed(1));
+    out = ws.monthly12.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(1)));
     kwh = ws.monthly12.map((x) => +(x.kwh / 10000).toFixed(2));
   }
 
@@ -185,10 +186,11 @@ export function overviewTrendOption(ws: WorkshopData, dim: TrendDim): echarts.EC
    大屏一 · 六条产线产量与单位电耗对比
    ══════════════════════════════════════════════════════════ */
 export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOption {
-  const ls = [...ws.lines].sort((a, b) => a.today.output - b.today.output);
+  // 产量未接入（output=null）时按 0 排序即可 —— 条形长度本身就是 0，标签会显示 --
+  const ls = [...ws.lines].sort((a, b) => (a.today.output ?? 0) - (b.today.output ?? 0));
   const cats = ls.map((l) => `${l.id} 线`);
   const data = ls.map((l) => ({
-    value: +(l.today.output / 10000).toFixed(2),
+    value: l.today.output === null ? null : +(l.today.output / 10000).toFixed(2),
     unitKwh: l.today.unitKwh,
     rate: l.today.rate,
     plan: +(l.today.plan / 10000).toFixed(2),
@@ -204,7 +206,7 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
         const d = (p as { data: (typeof data)[number] }).data;
         return (
           `<b style="color:#fff">${(p as { name: string }).name}</b><br>` +
-          `今日产量：<b style="font-family:monospace">${d.value}</b> 万瓶<br>` +
+          `今日产量：<b style="font-family:monospace">${d.value ?? '--'}</b> 万瓶<br>` +
           `计划产量：<b style="font-family:monospace">${d.plan}</b> 万瓶<br>` +
           `达成率：<b style="font-family:monospace">${d.rate}%</b><br>` +
           `单位电耗：<b style="font-family:monospace">${d.unitKwh === null ? '--' : d.unitKwh.toFixed(2)}</b> kWh/千瓶`
@@ -240,7 +242,7 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
             const d = (p as { data: (typeof data)[number] }).data;
             const u = d.unitKwh === null ? '--' : d.unitKwh.toFixed(2);
             const over = d.unitKwh !== null && d.unitKwh > thresholds.unitKwhHigh;
-            return `{a|${d.value} 万瓶}{b|  ·  }{${over ? 'e' : 'c'}|${u}}{d| kWh/千瓶}`;
+            return `{a|${d.value ?? '--'} 万瓶}{b|  ·  }{${over ? 'e' : 'c'}|${u}}{d| kWh/千瓶}`;
           },
           rich: {
             a: { color: '#e8ecff', fontSize: 12, fontFamily: FONT_NUM },
@@ -274,7 +276,8 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number): echart
         }
       };
     }
-    return { value: +((x.output ?? 0) / 1000).toFixed(1) };
+    // 产量未接入（null）时柱子留空（null），不能画成 0 高度的实心柱
+    return { value: x.output === null ? null : +(x.output / 1000).toFixed(1) };
   });
   const kwh = hours.map((x) => (x.kwh === null ? null : +(x.kwh / 1000).toFixed(2)));
 
@@ -395,26 +398,77 @@ export function utilitySparkOption(util: { water: UtilityMetric; steam: UtilityM
 }
 
 /* ══════════════════════════════════════════════════════════
-   大屏二 · 单线产量与单位电耗趋势（近 30 日，双轴）
+   大屏二 · 单线趋势（年 / 月 / 日 / 时，与总览同口径可切换）
    ══════════════════════════════════════════════════════════ */
-export function lineTrendOption(line: LineData): echarts.EChartsOption {
-  const cats = line.daily30.map((x) => x.label);
-  const out = line.daily30.map((x) => +(x.output / 10000).toFixed(2));
-  const uq = line.daily30.map((x) => x.unitKwh ?? null);
-  const target = energyModel.targetUnitKwh;
 
-  /* 单位电耗轴范围：围绕实际值收紧，避免趋势被压平 */
-  const uqValid = uq.filter((v): v is number => v !== null && v !== undefined);
-  let uMin = 0;
-  let uMax = 20;
-  if (uqValid.length) {
-    uMin = Math.max(0, Math.floor(Math.min(...uqValid) * 10 - 4) / 10);
-    uMax = Math.ceil(Math.max(...uqValid) * 10 + 6) / 10;
-    if (uMax - uMin < 2) {
-      uMin = Math.max(0, uMin - 1);
-      uMax += 1;
-    }
+/** 单位电耗轴范围：围绕实际值收紧，避免趋势被压平 */
+function unitKwhRange(uq: (number | null)[]): { min: number; max: number } {
+  const valid = uq.filter((v): v is number => v !== null && v !== undefined);
+  if (!valid.length) return { min: 0, max: 20 };
+  let min = Math.max(0, Math.floor(Math.min(...valid) * 10 - 4) / 10);
+  let max = Math.ceil(Math.max(...valid) * 10 + 6) / 10;
+  if (max - min < 2) {
+    min = Math.max(0, min - 1);
+    max += 1;
   }
+  return { min, max };
+}
+
+/**
+ * 单线产量与用能趋势（可切换年 / 月 / 日 / 时）
+ *
+ * 两条曲线是**自适应**的，取决于单位电耗是否算得出来：
+ *   · 产量已接入（unitKwh 有值）→ 产量 + 单位电耗，带目标线，用于能效考核
+ *   · 产量未接入（unitKwh 全为 null）→ 产量 + 用电量，否则右边那条会是空线
+ * 这样在产量接口接入前后，图表都始终有两条有意义的曲线。
+ */
+export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsOption {
+  let labels: string[] = [];
+  let out: (number | null)[] = [];
+  let kwh: (number | null)[] = [];
+  let uq: (number | null)[] = [];
+  /** 产量与用电量的显示单位：单线量级比车间小得多，每个维度用各自的合适单位 */
+  let outUnit = '千瓶';
+  let kwhUnit = 'kWh';
+
+  if (dim === '时') {
+    labels = line.hours.map((x) => `${pad2(x.hour)}:00`);
+    out = line.hours.map((x) => (x.output === null ? null : +(x.output / 1000).toFixed(1)));
+    kwh = line.hours.map((x) => (x.kwh === null ? null : +x.kwh.toFixed(1)));
+    uq = line.hours.map((x) => x.unitKwh);
+    outUnit = '千瓶';
+    kwhUnit = 'kWh';
+  } else if (dim === '日') {
+    labels = line.daily30.map((x) => x.label);
+    // 产量未接入（null）时保留 null：柱子留空，不能当 0 画
+    out = line.daily30.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(2)));
+    kwh = line.daily30.map((x) => +x.kwh.toFixed(0));
+    uq = line.daily30.map((x) => x.unitKwh ?? null);
+    outUnit = '万瓶';
+    kwhUnit = 'kWh';
+  } else if (dim === '月') {
+    labels = line.monthly12.map((x) => x.label);
+    out = line.monthly12.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(1)));
+    kwh = line.monthly12.map((x) => +(x.kwh / 10000).toFixed(2));
+    uq = line.monthly12.map((x) => x.unitKwh ?? null);
+    outUnit = '万瓶';
+    kwhUnit = '万kWh';
+  } else {
+    labels = line.yearly5.map((x) => x.label);
+    out = line.yearly5.map((x) => (x.output === null ? null : +(x.output / 100000000).toFixed(3)));
+    kwh = line.yearly5.map((x) => +(x.kwh / 10000).toFixed(1));
+    uq = line.yearly5.map((x) => x.unitKwh ?? null);
+    outUnit = '亿瓶';
+    kwhUnit = '万kWh';
+  }
+  const hasUnitKwh = uq.some((v) => v !== null && v !== undefined);
+  const target = energyModel.targetUnitKwh;
+  const range = unitKwhRange(uq);
+
+  /** 第二条曲线的名称 / 单位 / 数据（自适应） */
+  const secondName = hasUnitKwh ? '单位电耗' : '用电量';
+  const secondUnit = hasUnitKwh ? 'kWh/千瓶' : kwhUnit;
+  const secondData = hasUnitKwh ? uq : kwh;
 
   return {
     animationDuration: 600,
@@ -425,60 +479,72 @@ export function lineTrendOption(line: LineData): echarts.EChartsOption {
         let s = `<b style="color:#c9d0f5">${arr[0].axisValue}</b><br>`;
         arr.forEach((p) => {
           if (p.value === null || p.value === undefined) return;
-          const u = p.seriesName.includes('产量') ? '万瓶' : 'kWh/千瓶';
+          const u = p.seriesName.includes('产量') ? outUnit : secondUnit;
           s += `${p.marker}${p.seriesName}：<b style="font-family:monospace">${p.value}</b> ${u}<br>`;
         });
         return s;
       }
     },
     grid: gridBox({ top: 28, left: 4, right: 6, bottom: 2 }),
-    xAxis: catAxis(cats, { interval: 4 }),
-    yAxis: [valAxis('', { min: 0 }), { ...valAxis('', { min: uMin, max: uMax }), splitLine: { show: false } }],
+    xAxis: catAxis(labels, { interval: labels.length > 24 ? 2 : 4 }),
+    yAxis: [
+      valAxis('', { min: 0 }),
+      {
+        ...valAxis('', hasUnitKwh ? { min: range.min, max: range.max } : { min: 0 }),
+        splitLine: { show: false }
+      }
+    ],
     series: [
       {
-        name: '日产量',
-        type: 'line',
+        name: '产量',
+        type: hasUnitKwh ? 'line' : 'bar',
         data: out,
         yAxisIndex: 0,
+        barMaxWidth: 26,
         smooth: 0.35,
         symbol: 'circle',
         symbolSize: 5,
         showSymbol: false,
         lineStyle: { width: 2.4, color: P.cyan, shadowColor: hexA(P.cyan, 0.55), shadowBlur: 10 },
-        itemStyle: { color: P.cyan, borderColor: '#0a0d3a', borderWidth: 1.5 },
-        areaStyle: {
-          color: grad(0, 0, 0, 1, [
-            [0, hexA(P.cyan, 0.34)],
-            [0.55, hexA(P.primary, 0.12)],
-            [1, hexA(P.primary, 0)]
-          ])
-        },
-        markLine: {
-          silent: true,
-          symbol: 'none',
-          lineStyle: { color: 'rgba(255,255,255,.18)', type: [3, 5] },
-          data: [{ type: 'average', name: '均值' }],
-          label: { color: P.t5, fontSize: 9, formatter: '均值 {c}' }
-        }
+        itemStyle: hasUnitKwh
+          ? { color: P.cyan, borderColor: '#0a0d3a', borderWidth: 1.5 }
+          : {
+              borderRadius: [3, 3, 0, 0],
+              color: grad(0, 1, 0, 0, [
+                [0, hexA(P.primary, 0.45)],
+                [1, P.cyan]
+              ])
+            },
+        areaStyle: hasUnitKwh
+          ? {
+              color: grad(0, 0, 0, 1, [
+                [0, hexA(P.cyan, 0.34)],
+                [0.55, hexA(P.primary, 0.12)],
+                [1, hexA(P.primary, 0)]
+              ])
+            }
+          : undefined
       },
       {
-        name: '单位电耗',
+        name: secondName,
         type: 'line',
-        data: uq,
+        data: secondData,
         yAxisIndex: 1,
         smooth: 0.35,
         symbol: 'circle',
         symbolSize: 4,
         showSymbol: false,
-        lineStyle: { width: 1.8, color: P.amber, type: [6, 4] },
+        lineStyle: { width: 1.8, color: P.amber, type: hasUnitKwh ? [6, 4] : 'solid' },
         itemStyle: { color: P.amber },
-        markLine: {
-          silent: true,
-          symbol: 'none',
-          lineStyle: { color: hexA(P.green, 0.55), type: [4, 4], width: 1.4 },
-          data: [{ yAxis: target, name: '目标' }],
-          label: { color: P.green, fontSize: 9, position: 'insideEndTop', formatter: `目标 ${target}` }
-        }
+        markLine: hasUnitKwh
+          ? {
+              silent: true,
+              symbol: 'none',
+              lineStyle: { color: hexA(P.green, 0.55), type: [4, 4], width: 1.4 },
+              data: [{ yAxis: target, name: '目标' }],
+              label: { color: P.green, fontSize: 9, position: 'insideEndTop', formatter: `目标 ${target}` }
+            }
+          : undefined
       }
     ]
   };

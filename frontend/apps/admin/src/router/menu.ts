@@ -37,6 +37,7 @@ export const menuTree: MenuNode[] = [
     title: '能源计量',
     icon: 'Lightning',
     children: [
+      { path: '/energy/usage', title: '用量查询', icon: 'Search' },
       { path: '/energy/electric', title: '电计量', icon: 'DataLine' },
       { path: '/energy/water', title: '水计量', icon: 'DataAnalysis' },
       { path: '/energy/steam', title: '汽计量', icon: 'DataAnalysis' },

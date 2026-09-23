@@ -109,7 +109,7 @@ const trendOption = computed(() =>
       <StatCard label="当前瞬时流量" :value="(util?.rateNow ?? 0).toFixed(2)" unit="t/h" color="#2a814b" :loading="loading" foot="蒸汽总表实时值（已温压补偿）" />
       <StatCard
         label="折算汽耗强度"
-        :value="ws && ws.today.output > 0 ? ((util?.today ?? 0) * 1000 / ws.today.output).toFixed(2) : '--'"
+        :value="ws && ws.today.output !== null && ws.today.output > 0 ? ((util?.today ?? 0) * 1000 / ws.today.output).toFixed(2) : '--'"
         unit="kg/千瓶"
         color="#1664ff"
         :loading="loading"

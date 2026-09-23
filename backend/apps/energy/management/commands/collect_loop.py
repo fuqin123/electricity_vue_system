@@ -1,7 +1,16 @@
 """常驻采集循环（适合手工跑或小规模部署；生产环境用计划任务更省事）。
 
-    python manage.py collect_loop                   每 60 秒采一轮，整点后 30 秒算差值
-    python manage.py collect_loop --interval 30     自定义周期
+    python manage.py collect_loop                    按配置节奏跑（默认每小时一次）
+    python manage.py collect_loop --interval 30      强制覆盖为每 30 秒一轮
+
+调度规则（v1.2.2 起跟随 `collect.cadence`）：
+  · hourly（默认）—— 睡到「整点 + collect.hourly_offset_seconds」采一次，
+    然后立刻做差算出**刚结束的那个小时**；
+  · minute        —— 每 interval 秒采一轮，整点后补算上一小时。
+
+⚠ 常驻进程会在机器重启 / 进程被杀时中断，那时整点的采样就丢了。
+   生产环境**更推荐**用计划任务每 5 分钟跑一次 `collect --aggregate --if-due`：
+   它是幂等的，错过一次下一个 5 分钟自动补上。见 backend/docs/采集说明.md。
 
 Ctrl+C 优雅退出。日志同时写控制台与 logs/eep-backend.log。
 """
@@ -15,8 +24,11 @@ from datetime import datetime, timedelta
 
 from django.core.management.base import BaseCommand
 
+from apps.energy.models import PeriodSummary
 from apps.energy.services.aggregate import aggregate_hour
 from apps.energy.services.collect import collect_round
+from apps.energy.services import slots
+from apps.energy.services import summary as S
 from eep import conf
 
 logger = logging.getLogger(__name__)
@@ -46,10 +58,17 @@ class Command(BaseCommand):
             pass
 
         self.stdout.write(
-            self.style.SUCCESS(f"开始采集：周期 {interval}s，整点后 {offset}s 计算小时差值。Ctrl+C 退出。")
+            self.style.SUCCESS(f"开始采集：节奏 {slots.describe()}。Ctrl+C 退出。")
         )
 
+        hourly = slots.cadence() == slots.CADENCE_HOURLY and options["interval"] is None
+
         while self._running:
+            # hourly 节奏：先睡到「整点 + 偏移」，这样每个小时的差值区间严格等于 1 小时。
+            # 若按固定 interval 睡，采样时刻会随轮次耗时逐轮漂移，小时值会稳定偏一点。
+            if hourly:
+                self._wait_until(slots.next_run_at())
+
             started = time.monotonic()
             try:
                 summary = collect_round()
@@ -58,31 +77,46 @@ class Command(BaseCommand):
                     f"[{datetime.now():%H:%M:%S}] 采集 {summary['ok']}/{summary['total']} 成功"
                     + (f"，失败 {summary['fail']}" if summary["fail"] else "")
                 )
-                self._maybe_aggregate(offset)
+                self._aggregate_after_collect()
             except Exception as exc:  # noqa: BLE001 —— 采集循环不能因为一次异常退出
                 logger.exception("采集轮次异常")
                 self.stdout.write(self.style.ERROR(f"采集异常：{exc}"))
 
-            elapsed = time.monotonic() - started
-            sleep_for = max(1.0, interval - elapsed)
-            waited = 0.0
-            # 分片睡眠，保证收到退出信号能及时响应
-            while waited < sleep_for and self._running:
-                step = min(1.0, sleep_for - waited)
-                time.sleep(step)
-                waited += step
+            if not hourly:
+                elapsed = time.monotonic() - started
+                self._wait_until(datetime.now() + timedelta(seconds=max(1.0, interval - elapsed)))
 
         self.stdout.write("已停止采集。")
 
-    def _maybe_aggregate(self, offset: int) -> None:
-        """每个整点过 offset 秒后，重算上一小时；同一小时只算一次。"""
+    def _wait_until(self, moment: datetime) -> None:
+        """睡到指定时刻（分片睡眠，保证收到退出信号能及时响应）。"""
+        while self._running:
+            remain = (moment - datetime.now()).total_seconds()
+            if remain <= 0:
+                return
+            time.sleep(min(1.0, remain))
+
+    def _aggregate_after_collect(self) -> None:
+        """采完立刻做差，算出「刚结束的那个小时」。
+
+        为什么是「刚结束的那个小时」：hourly 节奏下，本次在 HH:01 采到的读数是
+        「HH:00 这个边界」的值，也就是 **HH−1 点这一小时**的终点。
+        所以此刻能算出来的就是 HH−1 点。
+        同时把再往前一小时也重算一遍 —— 上一轮若迟到或失败，顺手修掉，成本极低。
+
+        做完差值顺手刷周期总计：大屏与后台的日/月/年 KPI 都读它，
+        不刷的话界面上的日月年数字会一直停在上一次刷新。
+        """
         now = datetime.now()
-        if now.minute != 0 or now.second < offset:
-            return
-        prev = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        prev = slots.hour_start(now) - timedelta(hours=1)
         key = f"{prev:%Y-%m-%d %H}"
-        if key == self._last_aggregated:
-            return
+
         written = aggregate_hour(prev.date(), prev.hour)
-        self._last_aggregated = key
-        self.stdout.write(f"   └─ 已计算 {key} 的小时差值（{written} 条）")
+        earlier = prev - timedelta(hours=1)
+        written += aggregate_hour(earlier.date(), earlier.hour)
+        self.stdout.write(f"   └─ 小时差值：{key} 共 {written} 条")
+
+        rows = S.summarize_days(prev.date(), now)
+        rows += S.summarize_periods(PeriodSummary.DIM_MONTH, S.recent_months(2, now), now)
+        rows += S.summarize_periods(PeriodSummary.DIM_YEAR, S.recent_years(1, now), now)
+        self.stdout.write(f"   └─ 已刷新周期总计（{len(rows)} 条）")

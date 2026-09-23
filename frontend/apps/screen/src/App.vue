@@ -46,6 +46,16 @@ onBeforeUnmount(() => {
     <RouterView />
   </StageFrame>
 
+  <!--
+    降级提示：后端接口不可达时会退回演示数据。
+    这条必须显示 —— 演示数据与真实采集数据在界面上长得一模一样，
+    不提示的话现场会拿它当真实产量/用电做判断（比白屏危险得多）。
+  -->
+  <div v-if="store.notice" class="degrade">
+    <b>演示数据</b>
+    <span>{{ store.notice }}</span>
+  </div>
+
   <!-- 首屏加载态：数据未就绪时不渲染空面板 -->
   <div v-if="!store.ready" class="boot">
     <span>ENERGY &amp; OUTPUT DATA CENTER</span>

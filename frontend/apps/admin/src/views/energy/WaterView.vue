@@ -111,7 +111,7 @@ const trendOption = computed(() =>
       <StatCard label="当前瞬时流量" :value="(util?.rateNow ?? 0).toFixed(2)" unit="t/h" color="#2a814b" :loading="loading" foot="进水管路电磁流量计实时值" />
       <StatCard
         label="折算水耗强度"
-        :value="ws && ws.today.output > 0 ? ((util?.today ?? 0) / ws.today.output * 1000).toFixed(2) : '--'"
+        :value="ws && ws.today.output !== null && ws.today.output > 0 ? ((util?.today ?? 0) / ws.today.output * 1000).toFixed(2) : '--'"
         unit="L/千瓶"
         color="#bd7e00"
         :loading="loading"

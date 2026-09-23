@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.2.0 ｜ 最后更新：2026-09-22
+> 版本：v1.2.1 ｜ 最后更新：2026-09-22
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -11,30 +11,42 @@
 
 ---
 
-## 〇、v1.2.0 实现状态（先看这个）
+## 〇、v1.2.2 实现状态（先看这个）
+
+> v1.2.2 新增：`GET /api/energy/range`（时间段查询，见 2.4）；
+> `/api/energy/hourly` 支持 `from`/`to` 区间与分页；
+> 采集节奏改为**每小时一次**（`collect.cadence = hourly`），差值区间严格 1 小时。
+
+## 〇·补、v1.2.1 实现状态
 
 | 接口 | 状态 | 说明 |
 | :--- | :--- | :--- |
 | `GET /healthz` | ✅ 已实现 | 健康探测 |
 | `GET /api/energy/overview` | ✅ 已实现 | 大屏总览（`EnergySnapshot` 同构） |
-| `GET /api/energy/line/{code}` | ✅ 已实现 | 单线详情（`LineData` 同构） |
+| `GET /api/energy/line/{code}` | ✅ 已实现 | 单线详情（`LineData` 同构，含 daily30 / monthly12 / yearly5 供年/月/日/时切换） |
 | `GET /api/energy/hourly` | ✅ 已实现 | 小时用量明细（支持 `date` / `line` / `meter` / `kind`） |
 | `GET /api/energy/meters` | ✅ 已实现 | 计量点台账 + 最近读数 + 今日用量 |
 | `GET /api/energy/collect-logs` | ✅ 已实现 | 采集日志 |
 | `GET /api/energy/collect-summary` | ✅ 已实现 | 24 小时采集汇总（巡检卡片用，非前端契约字段） |
-| `GET /api/energy/production` | ⬜ **501 留空** | 产量采集尚未改造；调用返回 501 + 待办清单 |
-| `/api/admin/*`（系统管理、告警、日志、报表等 14 个） | ⬜ 未实现 | 见下方各章节，后续版本按本契约实现 |
+| `GET /api/energy/period-summary` | ✅ 已实现 | 日 / 月 / 年总计（读 `eep_period_summary`，后台同源） |
+| `GET /api/energy/production` | ✅ 已实现 | 产量采集尚未改造：**如实返回 null + available=false**（不是 501，不是 0） |
+| `GET/POST/PUT/DELETE /api/admin/gateways*` `meters*` | ✅ v1.2.1 已实现 | 网关 / 计量点后台增删改；`POST …/{id}/test` 连接测试与试采（返回**真实读数**） |
+| `GET /api/admin/overview` `lines` `quality` `collect-logs` | ✅ v1.2.1 已实现 | 后台看板 / 产线主数据 / 数据质量 / 采集日志 |
+| `/api/admin/*` 其余（系统管理、告警、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`） |
 
-**v1.2.0 的两个重要口径变化（前端切 `mode: 'api'` 前必读）**
+> ⚠ v1.2.1 修复：admin 组接口曾误挂在 `/api/energy/admin/*` 下导致前端 404（B-404），
+> 现已按本契约挂到 **`/api/admin/*`**；旧地址 `/api/energy/admin/*` 兼容保留但不再推荐。
 
-1. **产量相关字段一律为 0 / null**：`output`、`unitKwh`、`plan`、`rate` 都是 0 / null，
-   后端不采集产量，也不拿电量反推产量。所以切到 api 模式后，
-   凡涉及产量与单位电耗的图表会是空的 —— 这是**预期行为**，不是接口故障。
+**产量口径（v1.2.1 起为 null，前端切 `mode: 'api'` 前必读）**
+
+1. **产量相关字段一律为 null / 0**：产量数值（`output`、`today.output`、`monthly12[].output` 等）
+   在数据源未接入期间一律为 **null**（界面显示 `--`），`unitKwh` 为 null，`plan` / `rate` 为 0。
+   后端不采集产量，也不拿电量反推产量。null 表示「还没接数据」，0 会表示「确实没产出」—— 两者不能混。
+   真实产量经 `ingest_production` 写入后，接口自动恢复数值口径（`source != demo` 即视为真实）。
 2. **水 / 汽的 `today`、`yesterday` 可能为 `null`**（未知 ≠ 0）。
-   切换时需把 `types.ts` 中 `UtilityMetric.today / yesterday` 与
-   `LineData.today.kwh` 等字段类型从 `number` 放宽为 `number | null`，
-   否则大屏上会把「还没采到」显示成「用了 0」。
-   同理 `HourPoint.kwh` 已经是 `number | null`，无需改动。
+   `types.ts` 中 `UtilityMetric.today / yesterday` 与 `LineData.today.kwh` 等字段类型
+   已放宽为 `number | null`，前端按 `--` 显示，不把「还没采到」显示成「用了 0」。
+   同理 `HourPoint.kwh` 已经是 `number | null`。
 
 ---
 
@@ -239,6 +251,46 @@ Authorization: Bearer <token>
 ```jsonc
 { "now": "2026-09-22T09:58:48+08:00", "line": { /* 同 overview 中 lines[i] 的结构 */ } }
 ```
+
+### 2.4 `GET /api/energy/range` ★ 按时间段查询用量（v1.2.2 新增）
+
+大屏与后台**共用这一个接口**，保证两边数字同源。
+
+| 参数 | 取值 | 说明 |
+| :--- | :--- | :--- |
+| `from` / `to` | `YYYY-MM-DD` | 日期区间，缺省为今天；最长 366 天 |
+| `granularity` | `hour` / `day` / `month` | 默认 `day` |
+| `scope` | `workshop` / `line` / `all` | 默认 `all`（车间合计 + 各线一次返回） |
+| `line` | 如 `A1` | `scope=line` 时必填 |
+
+```json
+{
+  "from": "2026-09-17", "to": "2026-09-23",
+  "granularity": "day", "scope": "all",
+  "labels": ["09-17", "09-18", "..."],
+  "series": [
+    { "key": "workshop", "name": "车间合计", "unit": "kWh", "values": [null, 434.9, null] },
+    { "key": "A1", "name": "一线", "unit": "kWh", "values": [null, null, null] }
+  ],
+  "quality": ["missing", "ok", "missing"],
+  "utility": { "water": [null], "steam": [0.69] },
+  "totals": { "kwh": 434.9, "output": 0, "waterT": null, "steamT": 0.69 },
+  "productionAvailable": false
+}
+```
+
+**读法上要注意的：**
+
+- `values` 里的 `null` = **该时段缺数**（并非 0）。某小时里只要有一块电表算不出可信差值，
+  该小时合计就是 `null` —— 与小时接口同一条铁律，不返回偏小的值。
+- `quality` 与 `labels` 一一对应：`ok` / `partial`（部分不可信）/ `missing`（缺数）。
+  界面必须把 `missing` 段明确标出来，不能当 0 画。
+- `productionAvailable = false` 时 `totals.output` 恒为 0：**产量侧尚未接入**，
+  界面必须显示「产量未接入」，否则「区间产量 0」会被读成「这段时间没生产」。
+
+数据来源按粒度分：
+`hour` 读 `eep_hourly_usage`（小时差值真值表）；
+`day` / `month` 读 `eep_period_summary`（与后台日汇总、大屏日月年 KPI 同源）。
 
 ### 2.3 `GET /api/energy/hourly`
 

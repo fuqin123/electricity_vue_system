@@ -29,10 +29,14 @@ onMounted(load);
 
 const kpi = computed(() => data.value?.kpi);
 
-/** 单位电耗达成情况（越低越好） */
+/**
+ * 单位电耗达成情况（越低越好）
+ * ⚠ 产量未接入时 unitKwh 为 null —— 此时返回 'flat'，界面会显示 `--`，
+ *   **不能**把 null 当 0 去比：0 kWh/千瓶 会被读成「能效完美」。
+ */
 const unitTrend = computed<'up' | 'down' | 'flat'>(() => {
   const d = data.value;
-  if (!d) return 'flat';
+  if (!d || d.kpi.unitKwh === null) return 'flat';
   const diff = d.kpi.unitKwh - energyModel.targetUnitKwh;
   if (Math.abs(diff) < 0.05) return 'flat';
   return diff > 0 ? 'up' : 'down';
@@ -73,13 +77,15 @@ function reloadAll() {
 
     <!-- 指标卡 -->
     <div class="stat-grid">
+      <!-- 产量未接入：todayOutput 为 null → 显示 --（不能用 0 兜底，
+           0 会被读成「确实没产出」，与「还没接数据」是两回事） -->
       <StatCard
         label="今日产量"
-        :value="big(kpi?.todayOutput ?? 0, '').v"
-        :unit="big(kpi?.todayOutput ?? 0, '瓶').u"
+        :value="big(kpi?.todayOutput, '').v"
+        :unit="big(kpi?.todayOutput, '瓶').u"
         color="#1664ff"
         :loading="loading"
-        :foot="`昨日同期 ${big(data?.kpi.todayOutput ? data.kpi.todayOutput * 0.96 : 0, '').v} 万瓶`"
+        :foot="kpi?.todayOutput == null ? '产量数据源未接入，统一显示 --' : '实时累计，随采集刷新'"
       />
       <StatCard
         label="今日用电"
@@ -89,16 +95,21 @@ function reloadAll() {
         :loading="loading"
         :foot="`折合 ${int(kpi?.todayKwh ?? 0)} kWh`"
       />
+      <!-- 产量未接入时单位电耗算不出来（分母为 0），显示 `--` 而不是 0 -->
       <StatCard
         label="综合单位电耗"
-        :value="(kpi?.unitKwh ?? 0).toFixed(2)"
+        :value="kpi?.unitKwh === null || kpi?.unitKwh === undefined ? '--' : kpi.unitKwh.toFixed(2)"
         unit="kWh/千瓶"
         :color="unitTrend === 'up' ? '#d7312a' : '#2a814b'"
         :trend="unitTrend"
         :loading="loading"
-        :foot="`考核目标 ${energyModel.targetUnitKwh.toFixed(2)} · ${
-          (kpi?.unitKwh ?? 0) > energyModel.targetUnitKwh ? '未达标' : '达标'
-        }`"
+        :foot="
+          kpi?.unitKwh === null || kpi?.unitKwh === undefined
+            ? '产量未接入，暂时算不出'
+            : `考核目标 ${energyModel.targetUnitKwh.toFixed(2)} · ${
+                kpi.unitKwh > energyModel.targetUnitKwh ? '未达标' : '达标'
+              }`
+        "
       />
       <StatCard
         label="未处理告警"

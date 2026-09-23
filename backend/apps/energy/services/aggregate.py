@@ -9,6 +9,9 @@
     usage(H) = end(H) − end(H−1)
     end(H)   = 「时间 ≤ H:00:00 + 1h」的最后一条有效读数（即距 15:00 最近的一次采样）
 
+端点取法（v1.2.2 起）：**距整点最近的、且在 ±20 分钟容差内的那条读数**。
+容差是必须的 —— 没有它，本小时没采到样时会拿隔天的读数来相减并得到 0（见 B-503）。
+
 用「上小时末读数」当起点而不是「本小时第一条读数」，好处是：
   · 相邻两小时首尾相接，不会漏计也不会重复计；
   · 采集中断一段时间后恢复，第一个人恢复出来的小时仍是正确的区间，不会把中断期间的
@@ -37,6 +40,7 @@ from django.db import transaction
 from eep import conf
 
 from ..models import HourlyUsage, Meter, Reading
+from . import slots
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +59,7 @@ def hour_window(day: date_cls, hour: int) -> tuple[datetime, datetime]:
 
 
 def _last_reading_before(meter: Meter, upper: datetime) -> Reading | None:
-    """取「采样时间 ≤ upper」的最后一条有效读数。"""
+    """取「采样时间 ≤ upper」的最后一条有效读数（仅作兜底参考，差值计算不用它）。"""
     return (
         Reading.objects.filter(meter=meter, ok=True, value__isnull=False, at__lte=upper)
         .order_by("-at")
@@ -63,24 +67,70 @@ def _last_reading_before(meter: Meter, upper: datetime) -> Reading | None:
     )
 
 
+def boundary_reading(meter: Meter, boundary: datetime) -> Reading | None:
+    """取「整点 boundary」的读数 = **距该整点最近的一条有效读数**（容差 ±20 分钟）。
+
+    三条规则各自换来的东西（都是踩过坑才定下来的，别改）：
+
+    ① **用「最近」而不是「该整点之前的最后一条」。**
+       同一个采样槽可能因为失败重试出现多条读数（`collect --if-due` 就是
+       每 5 分钟重试直到本小时采完）。取最近的一条时，槽内第一条永远胜出；
+       若取「之后最后一条」，一次 10:30 的补采会把 09:01→10:30 这 89 分钟
+       当成「09 点这一小时」：09 点多算、10 点少算，两条区间又都会因为
+       偏离 1 小时被判 partial 而不计入合计 —— 现场只看到「这几小时没数据」。
+
+    ② **必须有容差下限（这是 v1.2.2 修掉的最严重的一个问题）。**
+       老实现只写了 `at <= boundary` 这一个上界，于是当本小时**根本没采到样**时，
+       它会一路往前找到几小时前、甚至隔天的读数来相减。
+       两条陈旧读数相减通常正好得 0，而且不触发任何异常分支、只被标成 partial ——
+       界面上一看就是「这一小时一点电都没用」。
+       数字量级正常、没有报错、没有告警，这是最难发现也最危险的一类错。
+       现在超出容差直接判**缺数（usage=None）**，界面显示 `--`：
+       宁可让人看见「这里没数」，也不要给一个来源不明的数。
+
+    ③ 容差同时覆盖两种采样节奏：
+       密采样时最近的是整点前最后一条（差几十秒）；
+       整点采样时最近的是采样槽内第一条（差几分钟）。两者都在容差内。
+    """
+    lo = boundary - BOUNDARY_TOLERANCE
+    hi = boundary + BOUNDARY_TOLERANCE
+    rows = Reading.objects.filter(
+        meter=meter, ok=True, value__isnull=False, at__gte=lo, at__lte=hi
+    ).only("id", "at", "value")
+
+    best: Reading | None = None
+    best_gap = None
+    for r in rows:
+        gap = abs((r.at - boundary).total_seconds())
+        if best_gap is None or gap < best_gap:
+            best, best_gap = r, gap
+    return best
+
+
+#: 区间长度与 1 小时的允许偏差，超过就标 partial（读数虽有，但这一小时不干净）
+SPAN_TOLERANCE = timedelta(minutes=5)
+
+
 def compute_hour(meter: Meter, day: date_cls, hour: int) -> dict:
     """算一个计量点在某小时的用量（不落库，纯计算，便于测试与复查）。"""
     hour_start, end_limit = hour_window(day, hour)
 
-    end = _last_reading_before(meter, end_limit)
+    # 起点 = 本小时整点的边界读数；终点 = 下个整点的边界读数
+    start = boundary_reading(meter, hour_start)
+    end = boundary_reading(meter, end_limit)
+
     if end is None:
         return {
             "usage": None,
             "quality": HourlyUsage.Q_MISSING,
-            "note": f"{end_limit:%H:%M} 前无有效读数",
+            "note": f"{end_limit:%H:%M} 的采样槽内无有效读数",
         }
 
-    start = _last_reading_before(meter, hour_start)
     if start is None:
         return {
             "usage": None,
             "quality": HourlyUsage.Q_MISSING,
-            "note": f"{hour_start:%H:%M} 前无有效读数（无法确定起点）",
+            "note": f"{hour_start:%H:%M} 的采样槽内无有效读数（无法确定起点）",
             "end_at": end.at,
             "end_value": end.value,
         }
@@ -107,16 +157,17 @@ def compute_hour(meter: Meter, day: date_cls, hour: int) -> dict:
             "note": f"差值 {delta} 超过上限 {meter.max_hourly}，判为异常尖峰，不计入合计",
         }
 
-    # 端点偏离整点：采集中断过，这个「小时」实际覆盖了更久
-    end_drift = abs(end_limit - end.at)
-    start_drift = abs(hour_start - start.at)
-    if end_drift > BOUNDARY_TOLERANCE or start_drift > BOUNDARY_TOLERANCE:
+    # 区间长度必须接近 1 小时：端点各自允许 ±20 分钟偏差，
+    # 两者叠加最坏可到 ±40 分钟。偏差在 5 分钟以内认为这一小时是干净的；
+    # 再大说明端点被挪过位置（例如补采落在很晚的位置），标 partial 但仍然给数。
+    span = (end.at - start.at).total_seconds()
+    if abs(span - 3600) > SPAN_TOLERANCE.total_seconds():
         return {
             **base,
             "usage": delta,
             "quality": HourlyUsage.Q_PARTIAL,
-            "note": f"端点偏离整点（起点差 {int(start_drift.total_seconds() // 60)} 分、"
-                    f"终点差 {int(end_drift.total_seconds() // 60)} 分），差值仅供参考",
+            "note": f"区间长度 {span / 60:.0f} 分钟（起 {start.at:%H:%M:%S} → 止 {end.at:%H:%M:%S}），"
+                    f"偏离 1 小时，差值仅供参考",
         }
 
     return {**base, "usage": delta, "quality": HourlyUsage.Q_OK, "note": ""}
@@ -169,43 +220,67 @@ def aggregate_day(day: date_cls, hours: range | None = None, meters=None) -> int
 
 
 def current_hour_usage(meter: Meter, now: datetime | None = None) -> dict | None:
-    """进行中的小时：用「最新读数 − 参考起点」给一个参考值。
+    """进行中的小时：给一个**参考值**。只用于展示，**不写库**。
 
-    参考起点的取法（顺序很重要）：
-      1. 本小时开始前最后一次读数 —— 正常情况，此时 progress = 本小时已过时间占比；
-      2. 本小时内第一次读数 —— 刚部署 / 采集中断后的头一个小时没有「上小时末读数」，
-         就用本小时的第一条读数当基线，此时 progress = 该基线覆盖到现在的占比。
-         不这么兜底的话，系统刚上线的那一小时什么都看不到，现场会以为采集没通。
+    ⚠ v1.2.2 修正：必须「本小时内有两条以上读数」才算得出参考值。
 
-    只用于展示（前端画虚线的那个柱），**不写库** —— 小时还没结束，
-    反复写会让历史值来回跳。
+    老实现是「上小时末读数 → 本小时最新读数」，在密集采样下没问题；
+    但采集改成**每小时一次**之后，本小时的第一条读数就是整点边界读数 ——
+    它已经代表上一个小时结束了，减出来的其实是**上一个小时的完整用量**。
+    如果照旧把它当成「本小时已用量」显示，界面上的数会整整错一个小时，
+    而且因为量级正常，几乎没人能一眼看出来。
+
+    采样不足两条时返回 usage=None，界面显示「待整点采集」——
+    这比给一个错一小时的数要诚实得多。
     """
     now = now or datetime.now()
     hour_start = datetime.combine(now.date(), time(now.hour))
 
-    latest = (
-        Reading.objects.filter(meter=meter, ok=True, value__isnull=False, at__gte=hour_start)
-        .order_by("-at")
-        .first()
+    in_hour = list(
+        Reading.objects.filter(meter=meter, ok=True, value__isnull=False, at__gte=hour_start).order_by("at")
     )
-    if latest is None:
+    if len(in_hour) < 2:
+        # 0 条：整点后还没采到样；1 条：只有边界基线，还不够做差
         return None
 
-    start = _last_reading_before(meter, hour_start)
-    if start is not None:
-        progress = (now - hour_start).total_seconds() / 3600
-    else:
-        # 兜底：用本小时第一条读数作基线
-        start = (
-            Reading.objects.filter(meter=meter, ok=True, value__isnull=False, at__gte=hour_start)
-            .order_by("at")
-            .first()
-        )
-        if start is None or start.id == latest.id:
-            return None
-        progress = (now - start.at).total_seconds() / 3600
-
-    delta = (latest.value - start.value).quantize(Q3)
+    first, latest = in_hour[0], in_hour[-1]
+    progress = (latest.at - first.at).total_seconds() / 3600
+    delta = (latest.value - first.value).quantize(Q3)
     if delta < 0:  # 换表 / 归零
-        return {"usage": None, "progress": progress, "reset": True}
+        return {"usage": None, "progress": max(0.0, min(progress, 1.0)), "reset": True}
     return {"usage": delta, "progress": max(0.0, min(progress, 1.0)), "reset": False}
+
+
+def explain_hour(meter: Meter, day: date_cls, hour: int) -> dict:
+    """把一个小时的差值算给现场看：起点读数、终点读数、时间、差值、判定质量。
+
+    为什么需要它：现场核对「数字对不对」时，光看 hourly_usage 里的一个数没法判断，
+    必须能看到用的是哪两条读数、它们各自在什么时刻
+    （`manage.py aggregate --verify` 就是打印这些）。
+    """
+    hour_start, end_limit = hour_window(day, hour)
+    start = boundary_reading(meter, hour_start)
+    end = boundary_reading(meter, end_limit)
+    res = compute_hour(meter, day, hour)
+
+    def fmt(reading):
+        if reading is None:
+            return "—"
+        return f"{reading.at:%m-%d %H:%M:%S}={reading.value}"
+
+    span = "—"
+    if start is not None and end is not None:
+        span = f"{(end.at - start.at).total_seconds() / 60:.1f} 分钟"
+
+    return {
+        "meter": meter.code,
+        "name": meter.name,
+        "date": day.isoformat(),
+        "hour": hour,
+        "start": fmt(start),
+        "end": fmt(end),
+        "spanMinutes": span,
+        "usage": res.get("usage"),
+        "quality": res["quality"],
+        "note": res.get("note", ""),
+    }

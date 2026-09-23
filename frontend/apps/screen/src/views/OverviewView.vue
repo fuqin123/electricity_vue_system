@@ -2,13 +2,19 @@
 /**
  * OverviewView —— 大屏一：车间总览
  * 左列：综合单位电耗仪表 + 六线实时数据 + 车间水/汽
- * 中列：年/月/日/时 KPI + 产量与用电趋势 + 六线对比
+ * 中列：年/月/日/时 KPI + 产量与用电趋势（可切换维度）+ 六线对比
  * 右列：今日分时 + 能源用量汇总 + 告警
+ *
+ * ⚠ 产量数据源尚未接入（`dataConfig.productionEnabled = false`）：
+ *   产量一律为 0、单位电耗为 `--`、达成率为 `--`。
+ *   **不能**把单位电耗为 null 时兜底成 0 再画仪表 —— 0 kWh/千瓶 会被读成
+ *   「能效完美」，正好与「还没接数据」相反。此处直接换成占位。
  */
 import { computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import {
   big,
+  dataConfig,
   int,
   plantConfig,
   PLAN_RATE,
@@ -32,9 +38,13 @@ import KpiCards from '@/components/KpiCards.vue';
 import EnergySummary from '@/components/EnergySummary.vue';
 import AlertList from '@/components/AlertList.vue';
 import SvgIcon from '@/components/SvgIcon.vue';
+import DateSwitch from '@/components/DateSwitch.vue';
 
 const store = useEnergyStore();
-const { dim } = storeToRefs(store);
+const { dim, selectedDate, isHistory } = storeToRefs(store);
+
+/** 产量数据源是否已接入（见 config.ts 的 dataConfig） */
+const prodOn = dataConfig.productionEnabled;
 
 const ws = computed<WorkshopData | null>(() => store.workshop);
 
@@ -61,14 +71,18 @@ const kpiCards = computed<KpiCard[]>(() => {
   const h = w.hours[curH];
   const prevYear = w.yearly5.length > 1 ? w.yearly5[w.yearly5.length - 2] : null;
   const hPlan = Math.round(w.lines.reduce((a, l) => a + l.rated, 0) * PLAN_RATE * PROFILE[curH]);
-  const hRef = h?.partial ? (h.projected ?? 0) : (h?.output ?? 0);
+  /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
+  const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
+  const hRef = hOut ?? 0;
   const hDelta = hRef ? ((hRef - hPlan) / hPlan) * 100 : null;
-  const rate = w.today.plan > 0 ? (w.today.output / w.today.plan) * 100 : null;
+  const rate = w.today.plan > 0 && w.today.output !== null ? (w.today.output / w.today.plan) * 100 : null;
   const yq = big(w.year.output, '瓶');
   const yk = big(w.year.kwh, 'kWh');
   const mq = big(w.month.output, '瓶');
   const mk = big(w.month.kwh, 'kWh');
   const hk = big(h?.kwh ?? 0, 'kWh');
+  /** 产量未接入时，达成率无意义 —— 显示 `--`，不要显示 0% */
+  const rateText = prodOn && rate !== null ? `${rate.toFixed(1)}%` : '--';
 
   return [
     {
@@ -76,7 +90,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#00b0f4',
       label: '本年累计产量',
       value: yq,
-      delta: prevYear ? rise(w.year.output, prevYear.output) : null,
+      delta: prodOn && prevYear ? rise(w.year.output, prevYear.output) : null,
       sub: `用电 ${yk.v}${yk.u}`
     },
     {
@@ -91,15 +105,15 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#a78bfa',
       label: '今日累计产量',
       value: big(w.today.output, '瓶'),
-      delta: rise(w.today.output, w.yesterday.output),
-      sub: `完成率 ${rate === null ? '--' : rate.toFixed(1) + '%'}`
+      delta: prodOn ? rise(w.today.output, w.yesterday.output) : null,
+      sub: `完成率 ${rateText} · 用电 ${big(w.today.kwh, 'kWh').v}${big(w.today.kwh, 'kWh').u}`
     },
     {
       tag: '时',
       color: '#f06fcb',
-      label: h?.partial ? '当前小时（预计）' : '当前小时产量',
-      value: { v: int(h?.partial ? (h.projected ?? 0) : (h?.output ?? 0)), u: '瓶' },
-      delta: hDelta,
+      label: h?.partial ? '当前小时（进行中）' : '当前小时产量',
+      value: { v: int(hOut), u: '瓶' },
+      delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
     }
   ];
@@ -122,6 +136,12 @@ const todayNote = computed(() => {
   const w = ws.value;
   if (!w) return '--';
   const done = w.hours.filter((x) => !x.future);
+  /* 产量未接入时改报用电，避免显示「峰值 0.0 · 均值 0.0 千瓶」这种无信息量的数 */
+  if (!prodOn) {
+    const kpeak = done.reduce((a, x) => Math.max(a, x.kwh ?? 0), 0);
+    const kavg = done.length ? done.reduce((a, x) => a + (x.kwh ?? 0), 0) / done.length : 0;
+    return `用电峰值 ${kpeak.toFixed(0)} · 均值 ${kavg.toFixed(1)} kWh`;
+  }
   const peak = done.reduce((a, x) => Math.max(a, x.output ?? 0), 0);
   const avg = done.length ? done.reduce((a, x) => a + (x.output ?? 0), 0) / done.length : 0;
   return `峰值 ${(peak / 1000).toFixed(1)} · 均值 ${(avg / 1000).toFixed(1)} 千瓶`;
@@ -139,11 +159,19 @@ const todayNote = computed(() => {
         </div>
       </template>
       <template #status>
+        <DateSwitch :model-value="selectedDate" @update:model-value="store.setDate" />
         <button class="link-admin" type="button" @click="store.refresh()">
           <span style="width: 12px; height: 12px; display: inline-flex"><SvgIcon name="refresh" /></span>
           立即刷新
         </button>
-        <span class="chip chip--ok"><i />数据采集中</span>
+        <span v-if="!prodOn" class="chip chip--warn" :title="dataConfig.productionNote">
+          <i />产量未接入
+        </span>
+        <!-- 历史模式下不能再写「采集中」，否则看的人会以为这是实时读数 -->
+        <span v-if="isHistory" class="chip chip--warn" title="历史数据不会再变化，已暂停自动刷新">
+          <i />历史数据 · 已暂停刷新
+        </span>
+        <span v-else class="chip chip--ok"><i />用电数据采集中</span>
       </template>
     </TopBar>
 
@@ -157,10 +185,24 @@ const todayNote = computed(() => {
       <div class="col">
         <PanelBox title="今日综合单位电耗" height="var(--l1)">
           <template #note>
-            <span class="panel__note">车间合计 · 目标 {{ gauge.target.toFixed(2) }}</span>
+            <span class="panel__note">
+              车间合计 · {{ prodOn ? `目标 ${gauge.target.toFixed(2)}` : '产量未接入，暂不计算' }}
+            </span>
           </template>
           <div class="panel__body panel__body--row gap-lg">
-            <GaugeRing :actual="gauge.actual" :target="gauge.target" :yesterday="gauge.yesterday" />
+            <GaugeRing
+              v-if="prodOn"
+              :actual="gauge.actual"
+              :target="gauge.target"
+              :yesterday="gauge.yesterday"
+            />
+            <!-- 产量未接入：单位电耗 = 电量 / 产量，分母为 0 算不出来。
+                 这里必须给占位，**不能**兜底成 0 —— 0 kWh/千瓶 会被读成「能效完美」。 -->
+            <div v-else class="nodata-ring">
+              <b>--</b>
+              <span>产量未接入</span>
+              <em>单位电耗 = 用电量 ÷ 产量<br />产量数据源待改造</em>
+            </div>
             <ul class="kv">
               <li>
                 <span>今日产量</span>
@@ -180,7 +222,10 @@ const todayNote = computed(() => {
               </li>
               <li>
                 <span>较昨日</span>
-                <b><DeltaText :value="rise(ws.today.unitKwh, ws.yesterday.unitKwh)" lower-is-better /></b>
+                <b>
+                  <DeltaText v-if="prodOn" :value="rise(ws.today.unitKwh, ws.yesterday.unitKwh)" lower-is-better />
+                  <span v-else class="c-muted t-num">--</span>
+                </b>
               </li>
             </ul>
           </div>
@@ -235,6 +280,7 @@ const todayNote = computed(() => {
           title="六条产线产量与单位电耗对比"
           note="条长＝今日产量 · 右侧为单位电耗"
           height="var(--c3)"
+          body-class="panel__body--col"
         >
           <ChartBox :option="compareOption" grow />
         </PanelBox>
@@ -242,7 +288,7 @@ const todayNote = computed(() => {
 
       <!-- ══════ 右列 ══════ -->
       <div class="col">
-        <PanelBox title="今日分时产量与电耗" height="var(--r1)">
+        <PanelBox title="今日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
           <template #note><span class="panel__note">{{ todayNote }}</span></template>
           <ChartBox :option="todayOption" grow />
         </PanelBox>

@@ -2,15 +2,21 @@
 /**
  * LineView —— 大屏二：单线实时数据详情
  * 左列：产线视频监控 + 本线小时明细 + 数据上报质量
- * 中列：年/月/日/时 KPI + 30 日趋势 + 7×24 热力图
+ * 中列：年/月/日/时 KPI + 可切换维度的趋势 + 7×24 热力图
  * 右列：今日分时 + 单位电耗对标 + 本线告警
+ *
+ * ⚠ 产量数据源尚未接入（`dataConfig.productionEnabled = false`）：
+ *   产量类数值一律为 0、单位电耗为 `--`、达成率为 `--`，
+ *   状态退化为按用电负荷判定。界面必须保留「产量未接入」标注，
+ *   否则「产量 0 / 达成率 0%」会被误读成产线停产或严重欠产。
  */
 import { computed, watch } from 'vue';
+import { storeToRefs } from 'pinia';
 import { useRoute, useRouter } from 'vue-router';
 import {
   big,
+  dataConfig,
   int,
-  linesConfig,
   pad2,
   PLAN_RATE,
   PROFILE,
@@ -19,6 +25,7 @@ import {
   type AlertItem,
   type HourPoint,
   type LineData,
+  type TrendDim,
   type WorkshopData
 } from '@eep/shared';
 import { lineHeatmapOption, lineTrendOption, todayChartOption } from '@/charts';
@@ -34,11 +41,14 @@ import BenchmarkBars from '@/components/BenchmarkBars.vue';
 import AlertList from '@/components/AlertList.vue';
 import VideoMonitor from '@/components/VideoMonitor.vue';
 import SvgIcon from '@/components/SvgIcon.vue';
+import DateSwitch from '@/components/DateSwitch.vue';
 import { videoConfig } from '@eep/shared';
 
 const route = useRoute();
 const router = useRouter();
 const store = useEnergyStore();
+/** 趋势维度与总览共用同一份状态，来回切屏不会丢 */
+const { dim, selectedDate, isHistory } = storeToRefs(store);
 
 const lineId = computed(() => String(route.params.lineId ?? 'A1').toUpperCase());
 
@@ -51,16 +61,62 @@ watch(
 const ws = computed<WorkshopData | null>(() => store.workshop);
 const line = computed<LineData | null>(() => store.currentLine);
 
+/* ── 趋势维度（与总览同口径）───────────────────────────── */
+const DIMS: TrendDim[] = ['年', '月', '日', '时'];
+const DIM_NOTE: Record<TrendDim, string> = {
+  年: '近 5 年 · 本线',
+  月: '近 12 个月 · 本线（当月为进行中）',
+  日: '近 30 日 · 本线（今日为进行中）',
+  时: '今日 24 小时 · 本线'
+};
+
+/** 单位电耗是否算得出来 —— 决定趋势第二条曲线是「单位电耗」还是「用电量」 */
+const hasUnitKwh = computed(() => line.value?.hours.some((h) => h.unitKwh !== null) ?? false);
+
+/** 各维度的显示单位（单线量级比车间小，单位与总览不同） */
+const TREND_UNITS: Record<TrendDim, { out: string; kwh: string }> = {
+  年: { out: '亿瓶', kwh: '万kWh' },
+  月: { out: '万瓶', kwh: '万kWh' },
+  日: { out: '万瓶', kwh: 'kWh' },
+  时: { out: '千瓶', kwh: 'kWh' }
+};
+const trendLegend = computed(() => {
+  const u = TREND_UNITS[dim.value];
+  return {
+    out: `产量（${u.out}）`,
+    second: hasUnitKwh.value ? '单位电耗（kWh/千瓶）' : `用电量（${u.kwh}）`
+  };
+});
+
+/** 产量数据源是否已接入（来自全局配置，不用逐处判断字段是否为 0） */
+const prodOn = dataConfig.productionEnabled;
+
 /* ── 顶部信息 ─────────────────────────────────────────── */
+/**
+ * ⚠ 需求 v1.2.1-4：产线名称 / 额定产能 / 品项一律取**接口数据**（数据库），
+ *   不再读前端静态 linesConfig —— 大屏与后台（生产管理页）必须同源一致。
+ */
 const profileText = computed(() => {
   const l = line.value;
   if (!l) return '--';
-  const cfg = linesConfig.find((c) => c.id === l.id);
-  return `额定产能 ${int(l.rated)} 瓶/时 · ${cfg?.product ?? ''} · 数据源：产线电表 + 产量计数器（水汽为车间总表，不可拆分至线别）`;
+  return `额定产能 ${int(l.rated)} 瓶/时 · ${l.product || '--'} · 数据源：产线电表（水汽为车间总表，不可拆分至线别）`;
 });
 
+/**
+ * 顶部状态
+ * ⚠ 产量未接入时，状态是按**用电负荷**判出来的（后端与 mock 同口径），
+ *   所以这里必须换一套文案 —— 沿用「低产运行 / 停线」会被当成产能结论。
+ */
 const statusChip = computed(() => {
   const s = line.value?.status ?? 'running';
+  if (!prodOn) {
+    const loadMap = {
+      running: { cls: 'chip--ok', text: '运行中（按用电）', color: '#35ed7e' },
+      slow: { cls: 'chip--warn', text: '低负荷（按用电）', color: '#ffb020' },
+      stopped: { cls: 'chip--err', text: '本小时无用电', color: '#ec48bd' }
+    } as const;
+    return loadMap[s];
+  }
   const map = {
     running: { cls: 'chip--ok', text: '运行中', color: '#35ed7e' },
     slow: { cls: 'chip--warn', text: '低产运行', color: '#ffb020' },
@@ -77,7 +133,9 @@ const kpiCards = computed<KpiCard[]>(() => {
   const curH = w.currentHour;
   const h = l.hours[curH];
   const hPlan = Math.round(l.rated * PLAN_RATE * PROFILE[curH]);
-  const hRef = h?.partial ? (h.projected ?? 0) : (h?.output ?? 0);
+  /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
+  const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
+  const hRef = hOut ?? 0;
   const hDelta = hRef ? ((hRef - hPlan) / hPlan) * 100 : null;
   const yq = big(l.year.output, '瓶');
   const yk = big(l.year.kwh, 'kWh');
@@ -86,6 +144,8 @@ const kpiCards = computed<KpiCard[]>(() => {
   const dk = big(l.today.kwh, 'kWh');
   const hk = big(h?.kwh ?? 0, 'kWh');
   const overTarget = l.today.unitKwh !== null && l.today.unitKwh > 8.2;
+  /** 产量未接入时，达成率没有意义 —— 显示 `--`，不要显示 0% */
+  const rateText = prodOn ? `${l.today.rate.toFixed(1)}%` : '--';
 
   return [
     {
@@ -107,15 +167,15 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#a78bfa',
       label: '今日累计产量',
       value: big(l.today.output, '瓶'),
-      delta: rise(l.today.output, l.yesterday.output),
-      sub: `完成率 ${l.today.rate.toFixed(1)}% · 用电 ${dk.v}${dk.u}`
+      delta: prodOn ? rise(l.today.output, l.yesterday.output) : null,
+      sub: `完成率 ${rateText} · 用电 ${dk.v}${dk.u}`
     },
     {
       tag: '时',
       color: '#f06fcb',
-      label: h?.partial ? '当前小时（预计）' : '当前小时产量',
-      value: { v: int(h?.partial ? (h.projected ?? 0) : (h?.output ?? 0)), u: '瓶' },
-      delta: hDelta,
+      label: h?.partial ? '当前小时（进行中）' : '当前小时产量',
+      value: { v: int(hOut), u: '瓶' },
+      delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
     }
   ];
@@ -140,6 +200,11 @@ const lineAlerts = computed<AlertItem[]>(() => {
   const list: AlertItem[] = [];
   const curH = w.currentHour;
 
+  /* 产量未接入：先给一条说明，下面的产量类判定全部跳过 */
+  if (!prodOn) {
+    list.push({ level: 'info', text: dataConfig.productionNote, time: '--:--:--' });
+  }
+
   /* 单位电耗超阈值：只报当日最差的一个「已完成整点」
      ⚠ 用 for...of 而非 forEach：TS 不追踪闭包内的赋值，
        写成 forEach 时 worst 会被窄化成 null，后续取属性报 never。 */
@@ -150,15 +215,16 @@ const lineAlerts = computed<AlertItem[]>(() => {
     }
   }
   if (worst) {
-    const w = worst;
+    const w2 = worst;
     list.push({
       level: 'err',
-      text: `单位电耗 ${(w.unitKwh ?? 0).toFixed(2)}，超阈值 ${thresholds.unitKwhHigh.toFixed(2)}`,
-      time: `${pad2(w.hour)}:00:00`
+      text: `单位电耗 ${(w2.unitKwh ?? 0).toFixed(2)}，超阈值 ${thresholds.unitKwhHigh.toFixed(2)}`,
+      time: `${pad2(w2.hour)}:00:00`
     });
   }
 
-  /* 停线：连续时段合并为一条，并带上原因 */
+  /* 计划停机（CIP / 换型 / 检修）：连续时段合并为一条，并带上原因。
+     这是计划窗口，不是故障，产量未接入时降为 info。 */
   const runs: [number, number][] = [];
   let start = -1;
   l.hours.forEach((s, i) => {
@@ -173,38 +239,40 @@ const lineAlerts = computed<AlertItem[]>(() => {
   runs.forEach((r) => {
     const span = r[1] - r[0] + 1;
     list.push({
-      level: span >= 3 ? 'warn' : 'info',
+      level: prodOn ? (span >= 3 ? 'warn' : 'info') : 'info',
       text:
-        (span > 1 ? `${pad2(r[0])}—${pad2(r[1])} 时连续 ${span} 小时停机` : `${pad2(r[0])} 时停机`) +
+        (span > 1 ? `${pad2(r[0])}—${pad2(r[1])} 时计划停机 ${span} 小时` : `${pad2(r[0])} 时计划停机`) +
         (l.note ? `（${l.note}）` : ''),
       time: `${pad2(r[1])}:00:00`
     });
   });
 
-  /* 电表缺失 */
-  l.hours.forEach((s) => {
-    if (!s.future && (s.output ?? 0) > 0 && (s.kwh === null || s.kwh === 0)) {
-      list.push({ level: 'err', text: '产量已上报但电表无数据', time: `${pad2(s.hour)}:00:00` });
-    }
-  });
-
-  /* 本小时低产：用整点预期值判定，且至少已过 1/4 小时才判 */
-  const cur = l.hours[curH];
-  if (
-    cur &&
-    !cur.future &&
-    cur.partial &&
-    (cur.progress ?? 0) >= 0.25 &&
-    (cur.projected ?? 0) > 0 &&
-    (cur.projected ?? 0) < l.rated * thresholds.outputLowRate
-  ) {
-    list.unshift({
-      level: 'warn',
-      text: `本小时预计产量 ${((cur.projected ?? 0) / 1000).toFixed(1)} 千瓶，低于额定 ${Math.round(
-        thresholds.outputLowRate * 100
-      )}%`,
-      time: `${pad2(curH)}:00:00`
+  if (prodOn) {
+    /* 电表缺失（有产量无电量） */
+    l.hours.forEach((s) => {
+      if (!s.future && (s.output ?? 0) > 0 && (s.kwh === null || s.kwh === 0)) {
+        list.push({ level: 'err', text: '产量已上报但电表无数据', time: `${pad2(s.hour)}:00:00` });
+      }
     });
+
+    /* 本小时低产：用整点预期值判定，且至少已过 1/4 小时才判 */
+    const cur = l.hours[curH];
+    if (
+      cur &&
+      !cur.future &&
+      cur.partial &&
+      (cur.progress ?? 0) >= 0.25 &&
+      (cur.projected ?? 0) > 0 &&
+      (cur.projected ?? 0) < l.rated * thresholds.outputLowRate
+    ) {
+      list.unshift({
+        level: 'warn',
+        text: `本小时预计产量 ${((cur.projected ?? 0) / 1000).toFixed(1)} 千瓶，低于额定 ${Math.round(
+          thresholds.outputLowRate * 100
+        )}%`,
+        time: `${pad2(curH)}:00:00`
+      });
+    }
   }
 
   /* 视频：按 provider 判定是否已具备可播条件 */
@@ -227,7 +295,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
 });
 
 /* ── 图表 option ──────────────────────────────────────── */
-const trendOption = computed(() => (line.value ? lineTrendOption(line.value) : null));
+const trendOption = computed(() => (line.value ? lineTrendOption(line.value, dim.value) : null));
 const heatmapOption = computed(() => (line.value ? lineHeatmapOption(line.value) : null));
 const todayOption = computed(() => (line.value ? todayChartOption(line.value.hours, line.value.rated) : null));
 
@@ -235,6 +303,12 @@ const todayNote = computed(() => {
   const l = line.value;
   if (!l) return '--';
   const done = l.hours.filter((x) => !x.future);
+  /* 产量未接入时改报用电，避免显示「峰值 0.0 · 均值 0.0 千瓶」这种无信息量的数 */
+  if (!prodOn) {
+    const kpeak = done.reduce((a, x) => Math.max(a, x.kwh ?? 0), 0);
+    const kavg = done.length ? done.reduce((a, x) => a + (x.kwh ?? 0), 0) / done.length : 0;
+    return `用电峰值 ${kpeak.toFixed(0)} · 均值 ${kavg.toFixed(1)} kWh`;
+  }
   const peak = done.reduce((a, x) => Math.max(a, x.output ?? 0), 0);
   const avg = done.length ? done.reduce((a, x) => a + (x.output ?? 0), 0) / done.length : 0;
   return `峰值 ${(peak / 1000).toFixed(1)} · 均值 ${(avg / 1000).toFixed(1)} 千瓶`;
@@ -266,6 +340,10 @@ function switchLine(id: string) {
         </div>
       </template>
       <template #status>
+        <DateSwitch :model-value="selectedDate" @update:model-value="store.setDate" />
+        <span v-if="isHistory" class="chip chip--warn" title="历史数据不会再变化，已暂停自动刷新">
+          <i />历史数据 · 已暂停刷新
+        </span>
         <span class="chip" :class="statusChip.cls" :style="{ color: statusChip.color }">
           <i />{{ statusChip.text }}
         </span>
@@ -274,8 +352,9 @@ function switchLine(id: string) {
 
     <div class="subbar">
       <div class="tabs tabs--line">
+        <!-- v1.2.1-4：产线 tab 用接口数据（与后台一致），不读静态 linesConfig -->
         <button
-          v-for="c in linesConfig"
+          v-for="c in ws.lines"
           :key="c.id"
           :class="{ 'is-active': c.id === line.id }"
           @click="switchLine(c.id)"
@@ -283,6 +362,9 @@ function switchLine(id: string) {
           {{ c.name }}
         </button>
       </div>
+      <span v-if="!prodOn" class="chip chip--flat" :title="dataConfig.productionNote">
+        <i />产量未接入
+      </span>
       <span class="panel__note">{{ profileText }}</span>
     </div>
 
@@ -310,25 +392,36 @@ function switchLine(id: string) {
         <KpiCards :cards="kpiCards" style="height: var(--c1)" />
 
         <PanelBox
-          title="本线产量与单位电耗趋势"
-          hint="近 30 日"
+          :title="hasUnitKwh ? '本线产量与单位电耗趋势' : '本线产量与用电趋势'"
+          :hint="DIM_NOTE[dim]"
           height="var(--c2)"
           tall
           body-class="panel__body--col"
         >
           <template #note>
-            <div class="legend legend--inline">
-              <span class="legend__i legend__i--area" /><span>日产量（万瓶）</span>
-              <span class="legend__i legend__i--line2" /><span>单位电耗（kWh/千瓶）</span>
+            <div class="tabs">
+              <button
+                v-for="d in DIMS"
+                :key="d"
+                :class="{ 'is-active': d === dim }"
+                @click="store.setDim(d)"
+              >
+                {{ d }}
+              </button>
             </div>
           </template>
+          <div class="legend">
+            <span class="legend__i legend__i--area" /><span>{{ trendLegend.out }}</span>
+            <span class="legend__i legend__i--line2" /><span>{{ trendLegend.second }}</span>
+          </div>
           <ChartBox :option="trendOption" grow />
         </PanelBox>
 
         <PanelBox
           title="近 7 日 × 24 小时产量热力图"
-          note="颜色越亮产量越高 · 空格为未上报"
+          :note="prodOn ? '颜色越亮产量越高 · 空格为未上报' : '产量数据源未接入，热力图暂无数据'"
           height="var(--c3)"
+          body-class="panel__body--col"
         >
           <ChartBox :option="heatmapOption" grow />
         </PanelBox>
@@ -336,7 +429,7 @@ function switchLine(id: string) {
 
       <!-- ══════ 右列 ══════ -->
       <div class="col">
-        <PanelBox title="今日分时产量与电耗" height="var(--r1)">
+        <PanelBox title="今日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
           <template #note><span class="panel__note">{{ todayNote }}</span></template>
           <ChartBox :option="todayOption" grow />
         </PanelBox>

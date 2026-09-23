@@ -8,7 +8,17 @@
  *  - 用汽 t        ：蒸汽总表（涡街/孔板流量计，带温压补偿），仅车间级
  */
 
-/** 产线运行状态 */
+/**
+ * 产线运行状态
+ *
+ * ⚠ `running` / `slow` / `stopped` 在**产量未接入**时的含义（v1.2.1 起）：
+ *   产量数据源尚未改造，无法用产量判定产能利用率，
+ *   因此这三个状态退化为**按用电负荷判定**：
+ *     running —— 本小时有用电（≥ 该线基础负荷的 60%）
+ *     slow    —— 本小时有用电但明显低于基础负荷（可能在停机/待机）
+ *     stopped —— 本小时无任何用电
+ *   前端会在产量未接入时同时标注「产量未接入」，避免把状态误读成产量结论。
+ */
 export type LineStatus = 'running' | 'slow' | 'stopped';
 
 /** 告警级别 */
@@ -37,16 +47,19 @@ export interface HourPoint {
   future?: boolean;
   /** 正在进行中的小时（只累计了部分分钟） */
   partial?: boolean;
-  /** 整点预期产量，仅 partial 时有值，用于状态判定与展示 */
-  projected?: number;
+  /** 整点预期产量，仅 partial 时有值，用于状态判定与展示；产量未接入时为 null */
+  projected?: number | null;
   /** 已过时间占比 0—1，仅 partial 时有值 */
   progress?: number;
 }
 
-/** 趋势点（日 / 月 / 年） */
+/** 趋势点（日 / 月 / 年）
+ *  ⚠ `output` 允许为 null：产量数据源未接入（演示占位）时一律为 null，
+ *    界面必须显示 `--`，不能把 null 当 0 —— 0 会被读成「确实没产出」。
+ */
 export interface TrendPoint {
   label: string;
-  output: number;
+  output: number | null;
   kwh: number;
   unitKwh?: number | null;
 }
@@ -63,7 +76,8 @@ export interface LineData {
   note: string;
   hours: HourPoint[];
   today: {
-    output: number;
+    /** 产量未接入时为 null（显示 --），不是 0 */
+    output: number | null;
     kwh: number;
     unitKwh: number | null;
     /** 截至当前小时的应产（日达成率分母） */
@@ -71,20 +85,32 @@ export interface LineData {
     /** 全天计划 */
     planFull: number;
     rate: number;
+    /**
+     * 今日用电的采集覆盖度（已覆盖小时 / 应有小时）。
+     * 进行中的周期不再因为「有 1 个小时缺数」就返回 null ——
+     * 但必须把覆盖度显示出来，否则刚上线时「今日累计」会被读成「今天几乎没用电」。
+     */
+    kwhCoveredHours?: number;
+    kwhExpectedHours?: number;
   };
   yesterday: {
-    output: number;
+    /** 产量未接入时为 null（显示 --），不是 0 */
+    output: number | null;
     kwh: number;
     unitKwh: number | null;
-    fullOutput: number;
+    fullOutput: number | null;
     fullKwh: number;
   };
   daily30: TrendPoint[];
+  /** 近 12 个月（与总览同口径，供线别页的「月」维度切换） */
+  monthly12: TrendPoint[];
+  /** 近 5 年（供线别页的「年」维度切换） */
+  yearly5: TrendPoint[];
   /** 近 7 日 × 24 小时产量，单位「百瓶」，未上报为 null */
   heat: (number | null)[][];
   heatDays: string[];
-  month: { output: number; kwh: number };
-  year: { output: number; kwh: number; full: number; fullKwh: number };
+  month: { output: number | null; kwh: number };
+  year: { output: number | null; kwh: number; full: number | null; fullKwh: number };
   dayOfYear: number;
 }
 
@@ -95,43 +121,55 @@ export interface AlertItem {
   time: string;
 }
 
-/** 水 / 汽 单项用量 */
+/** 水 / 汽 / 电量 单项用量
+ *  ⚠ `today` / `yesterday` 允许为 null：取不到数就是未知，**不是 0**。
+ *    后端在缺数时返回 null，前端必须显示 `--` 而不是 0。
+ */
 export interface UtilityMetric {
-  today: number;
-  yesterday: number;
+  today: number | null;
+  yesterday: number | null;
   /** 当前瞬时流量 t/h */
   rateNow: number;
   unit: string;
   /** 24 小时趋势，未到时段为 null */
   trend: (number | null)[];
+  /** 今日累计的采集覆盖度（已覆盖小时 / 应有小时） */
+  coveredHours?: number;
+  expectedHours?: number;
 }
 
 /** 车间级聚合数据 */
 export interface WorkshopData {
   lines: LineData[];
   today: {
-    output: number;
+    /** 产量未接入时为 null（显示 --），不是 0 */
+    output: number | null;
     kwh: number;
-    unitKwh: number;
+    /** 产量未接入时为 null（算不出来），不要用 0 兜底 —— 0 会被读成「能效完美」 */
+    unitKwh: number | null;
     plan: number;
-    waterT: number;
-    steamT: number;
+    waterT: number | null;
+    steamT: number | null;
+    /** 今日用电的采集覆盖度，含义同 LineData.today */
+    kwhCoveredHours?: number;
+    kwhExpectedHours?: number;
   };
   yesterday: {
-    output: number;
+    /** 产量未接入时为 null（显示 --），不是 0 */
+    output: number | null;
     kwh: number;
-    unitKwh: number;
-    waterT: number;
-    steamT: number;
+    unitKwh: number | null;
+    waterT: number | null;
+    steamT: number | null;
   };
-  month: { output: number; kwh: number };
-  year: { output: number; kwh: number };
+  month: { output: number | null; kwh: number };
+  year: { output: number | null; kwh: number };
   hours: HourPoint[];
   daily30: TrendPoint[];
   monthly12: TrendPoint[];
   yearly5: TrendPoint[];
   utility: { water: UtilityMetric; steam: UtilityMetric };
-  /** 单位电耗考核目标 kWh/千瓶 */
+  /** 单位电耗考核目标 kWh/千瓶（产量接入后才能标定） */
   targetUnitKwh: number;
   alerts: AlertItem[];
   currentHour: number;
@@ -141,6 +179,16 @@ export interface WorkshopData {
 export interface EnergySnapshot {
   now: Date;
   workshop: WorkshopData;
+  /**
+   * 数据来源：
+   *   'api'  —— 真实接口（现场采集数据）
+   *   'mock' —— 演示数据。**只在后端不可达时降级产生**，
+   *             此时 `notice` 一定有值，界面必须显示出来。
+   *             绝不能把演示数据当真实数据展示（现场会据此做生产判断）。
+   */
+  source?: 'api' | 'mock';
+  /** source = 'mock' 时的原因说明 */
+  notice?: string;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -217,31 +265,93 @@ export interface LineMaster {
   commissionedAt: string;
 }
 
-/** 计量点位 */
+/**
+ * 计量点位
+ *
+ * 字段分三段：
+ *   ① 列表展示（category / address / protocol / status …）—— 后端按网关类型拼好，页面直接用；
+ *   ② 可编辑配置（kind / slave / register / scale …）—— 后台表单回填与提交用；
+ *   ③ 最近状态（lastValue / lastOk / todayUsage）—— 便于现场核对。
+ * 与后端 `apps/energy/api.py` 的 `meter_json()` **一一对应**，改一边必须改另一边。
+ */
 export interface MeterPoint {
+  /* ① 列表展示 */
   id: number;
   code: string;
   name: string;
   category: '电' | '水' | '汽' | '气';
   lineCode: string;
-  protocol: 'Modbus TCP' | 'Modbus RTU' | 'OPC UA' | 'MQTT' | 'DL/T645';
+  protocol: string;
   address: string;
   unit: string;
   factor: number;
   status: 'online' | 'offline' | 'fault';
   lastAt: string;
+
+  /* ② 可编辑配置 */
+  kind: 'elec' | 'water' | 'steam';
+  scope: 'line' | 'workshop';
+  role: 'line' | 'aux' | 'total';
+  gatewayId: number;
+  gatewayCode: string;
+  /** Modbus 从站号（串口服务器类型必填） */
+  slave: number | null;
+  /** 寄存器起始地址（串口服务器类型必填） */
+  register: number | null;
+  registers: number;
+  funcCode: number;
+  wordOrder: 'big' | 'little';
+  /** HTTP API 类型的接口路径 */
+  urlPath: string;
+  /** HTTP API 类型的请求参数（如 { cid: 135 }） */
+  params: Record<string, unknown>;
+  /** 累计值在响应里的取值路径，如 data.0.device_data.var1 */
+  valuePath: string;
+  /** 采集时间在响应里的取值路径 */
+  timePath: string;
+  /** 小时用量上限，超过判为异常尖峰 */
+  maxHourly: number | null;
+  enabled: boolean;
+  /** 'config' 配置文件登记 / 'admin' 后台维护（后台改过的不会被 seed_registry 覆盖） */
+  source: 'config' | 'admin';
+  remark: string;
+  assetNo: string;
+  installDate: string;
+
+  /* ③ 最近状态 */
+  lastValue: number | null;
+  lastOk: boolean;
+  lastError: string;
+  /** 今日已累计用量（只算可信小时） */
+  todayUsage: number | null;
+  todayHours: number;
 }
 
-/** 采集任务 / 网关 */
+/**
+ * 采集网关
+ *
+ * 串口服务器（Modbus RTU over TCP）与第三方数据平台（HTTP API）共用一张表，
+ * 靠 `kind` 区分；`host/port` 给串口服务器用，`baseUrl` 给 HTTP 平台用。
+ */
 export interface Gateway {
   id: number;
+  code: string;
   name: string;
-  ip: string;
-  port: number;
+  kind: 'modbus_rtu_tcp' | 'http_api';
   protocol: string;
+  ip: string;
+  port: number | null;
+  baseUrl: string;
+  /** 一行地址摘要，日志与排障用 */
+  endpoint: string;
   pointCount: number;
   status: 'online' | 'offline';
   lastHeartbeat: string;
+  timeoutMs: number;
+  intervalSeconds: number;
+  enabled: boolean;
+  source: 'config' | 'admin';
+  remark: string;
 }
 
 /** 告警记录 */
@@ -348,9 +458,11 @@ export interface DataQualityRow {
 /** 后台首页看板指标 */
 export interface AdminOverview {
   kpi: {
-    todayOutput: number;
+    /** 产量未接入时为 null（显示 --），不是 0 */
+    todayOutput: number | null;
     todayKwh: number;
-    unitKwh: number;
+    /** 产量未接入时为 null（算不出来），不要用 0 兜底 */
+    unitKwh: number | null;
     activeAlarms: number;
     onlineGateways: number;
     totalGateways: number;
@@ -363,7 +475,7 @@ export interface AdminOverview {
   /** 近 12 个月 */
   monthly12: TrendPoint[];
   /** 各线单位电耗对标 */
-  lineUnitKwh: { lineCode: string; lineName: string; unitKwh: number; output: number }[];
+  lineUnitKwh: { lineCode: string; lineName: string; unitKwh: number | null; output: number | null }[];
   /** 最新告警 */
   latestAlarms: AlarmRecord[];
 }

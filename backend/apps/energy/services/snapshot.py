@@ -1,10 +1,16 @@
-"""把数据库里的小时用量组装成前端契约结构（`frontend/packages/shared/src/types.ts`）。
+"""把数据库里的小时用量 / 小时产量组装成前端契约结构
+（`frontend/packages/shared/src/types.ts`）。
 
 原则：
-  · **产量（output）一律为 null / 0** —— 产量采集尚未改造，本次接口先留空。
-    不拿电量去反推产量，也不填演示数据，避免大屏上出现看起来像真的假数字。
-  · 缺数就是缺数：某个小时任何一块表缺数据，该小时的产线合计就返回 null，
+  · **产量**优先读 `HourlyProduction`（产量侧接入后自动生效）。
+    当前产量侧未改造，表里只有 `source=demo` 的占位 → 接口一律返回 **null**
+    （v1.2.1 起占位统一为 null：0 会被读成「确实没产出」，与「还没接数据」是两回事），
+    并且**不把它当作真实产量**（不据此判定停机、不算单位电耗）。
+    绝不拿电量反推产量。
+  · **缺数就是缺数**：某个小时任何一块表缺数据，该小时的产线合计就返回 null，
     而不是「有几块算几块」的偏小值。宁可空一格，也不要一个偏低的数被当成真实用电。
+  · **日 / 月 / 年一律读 `eep_period_summary`**（与后台读同一张表）——
+    这是保证「大屏与后台数字完全一致」的关键。表里缺行时才退化为现场现算。
   · 电量展示口径沿用旧版约定：**小于 20 kWh 保留 1 位小数**，否则取整。
     刚过整点时电量本来就小，取整会让单位电耗在刷新之间跳动。
 """
@@ -14,20 +20,24 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import date as date_cls
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.db.models import Sum
 
 from eep import conf
 
-from ..models import HourlyUsage, Line, Meter
+from ..models import HourlyProduction, HourlyUsage, Line, Meter, PeriodSummary
 from .aggregate import current_hour_usage
+from . import summary as S
 
 logger = logging.getLogger(__name__)
 
 #: 与前端 HourPoint 对齐的「未采集 / 未来时段」占位
 NULL = None
+
+#: 演示占位不算真实产量（见 ingest_production 的说明）
+DEMO_SOURCES = (HourlyProduction.SOURCE_DEMO, HourlyProduction.SOURCE_NONE)
 
 
 def round_kwh(value: Decimal | None) -> float | None:
@@ -47,7 +57,7 @@ def round_any(value: Decimal | None, digits: int = 2) -> float | None:
 
 
 class HourCell:
-    """一个「小时 × 一组计量点」的聚合单元格。"""
+    """一个「小时 × 一组计量点」的电量聚合单元格。"""
 
     __slots__ = ("value", "quality", "future", "partial", "progress")
 
@@ -80,7 +90,9 @@ def hourly_cells(meters: list[Meter], day: date_cls, now: datetime | None = None
     cells: dict[int, HourCell] = {}
 
     if not meters:
-        return {h: HourCell(None, HourlyUsage.Q_MISSING, future=(h > now.hour and day == now.date())) for h in range(24)}
+        return {
+            h: HourCell(None, HourlyUsage.Q_MISSING, future=(h > now.hour and day == now.date())) for h in range(24)
+        }
 
     rows = HourlyUsage.objects.filter(meter__in=meters, date=day)
     grouped: dict[int, list[HourlyUsage]] = defaultdict(list)
@@ -89,10 +101,10 @@ def hourly_cells(meters: list[Meter], day: date_cls, now: datetime | None = None
 
     is_today = day == now.date()
     for hour in range(24):
-        if is_today and hour > now.hour:
+        if day > now.date():
             cells[hour] = HourCell(None, "future", future=True)
             continue
-        if day > now.date():
+        if is_today and hour > now.hour:
             cells[hour] = HourCell(None, "future", future=True)
             continue
 
@@ -119,6 +131,12 @@ def _finished_hour_cell(meters: list[Meter], rows: list[HourlyUsage]) -> HourCel
         return HourCell(None, bad[0].quality)
 
     usable = [r for r in rows if r.quality in HourlyUsage.TRUSTED]
+    if not usable:
+        # ⚠ 一块表都没给出可信值（全是 partial / spike）时，合计必须是 None。
+        #   sum(空) = 0 会让界面显示「这一小时 0 kWh」——
+        #   和「产量未接入给 0」是同一类错误：0 会被当成「确实没用电」。
+        #   宁可显示 `--`，也不要给一个看着正常的 0。
+        return HourCell(None, HourlyUsage.Q_PARTIAL, partial=True)
     total = sum((r.usage or Decimal(0) for r in usable), Decimal(0))
     partial = len(usable) != len(rows)  # 有 spike / partial 被排除在外
     return HourCell(total, HourlyUsage.Q_PARTIAL if partial else HourlyUsage.Q_OK, partial=partial)
@@ -149,17 +167,83 @@ def _current_hour_cell(meters: list[Meter], now: datetime) -> HourCell:
 
 
 # ══════════════════════════════════════════════════════════════
+#  产量（第二条腿）
+# ══════════════════════════════════════════════════════════════
+
+
+class ProdInfo:
+    """某线某天的产量信息。
+
+    `real` 为 False 表示**没有真实产量数据源**（表里只有演示占位或干脆没有），
+    此时接口一律给 0，并且不据此判定停机、不算单位电耗。
+    """
+
+    __slots__ = ("by_hour", "real", "source", "quality")
+
+    def __init__(self, by_hour: dict[int, Decimal | None], real: bool, source: str, quality: str):
+        self.by_hour = by_hour
+        self.real = real
+        self.source = source
+        self.quality = quality
+
+
+def production_info(line: Line, day: date_cls) -> ProdInfo:
+    rows = list(HourlyProduction.objects.filter(line=line, date=day))
+    if not rows:
+        return ProdInfo({}, False, HourlyProduction.SOURCE_NONE, HourlyProduction.Q_NODATA)
+
+    by_hour: dict[int, Decimal | None] = {}
+    has_real = False
+    src = HourlyProduction.SOURCE_NONE
+    q = HourlyProduction.Q_NODATA
+    for r in rows:
+        if r.quality not in HourlyProduction.TRUSTED:
+            continue
+        by_hour[r.hour] = r.output
+        if r.source not in DEMO_SOURCES:
+            has_real = True
+            src = r.source
+            q = r.quality
+    if not has_real and rows:
+        src = rows[0].source
+        q = rows[0].quality
+    return ProdInfo(by_hour, has_real, src, q)
+
+
+def production_sum(line: Line, start: date_cls, end: date_cls) -> Decimal:
+    """区间真实产量合计（演示占位不计入）。"""
+    total = (
+        HourlyProduction.objects.filter(
+            line=line, date__gte=start, date__lte=end, quality__in=HourlyProduction.TRUSTED
+        )
+        .exclude(source__in=DEMO_SOURCES)
+        .aggregate(t=Sum("output"))["t"]
+    )
+    return Decimal(total) if total is not None else Decimal(0)
+
+
+# ══════════════════════════════════════════════════════════════
 #  组装前端结构
 # ══════════════════════════════════════════════════════════════
 
 
-def _hour_point(hour: int, cell: HourCell) -> dict:
-    """→ HourPoint（output / unitKwh 固定为 null，产量侧未改造）。"""
+def _hour_point(hour: int, cell: HourCell, prod: Decimal | None = None, real_prod: bool = False) -> dict:
+    """→ HourPoint。
+
+    `real_prod=False`（产量未接入）时 output 给 **null**、unitKwh 给 null：
+    null 是「还没接数据 / 算不出来」，0 是「确实没产出」—— 两者不能混。
+    演示占位（source=demo / nodata）统一按 null 交付，等真实数据源接入后自动恢复数值。
+    """
+    output = (int(prod) if prod is not None else None) if real_prod else None
+    if real_prod and prod is not None and cell.value is not None and prod > 0:
+        unit = round(float(cell.value / prod * 1000), 2)
+    else:
+        unit = None
     return {
         "hour": hour,
-        "output": NULL,
+        "output": output,
         "kwh": round_kwh(cell.value),
-        "unitKwh": NULL,
+        "unitKwh": unit,
         "future": cell.future or None,
         "partial": cell.partial or None,
         "progress": round(cell.progress, 4) if cell.progress is not None else None,
@@ -183,28 +267,135 @@ def _utility_cells(kind: str, day: date_cls, now: datetime) -> dict[int, HourCel
     return hourly_cells(meters, day, now)
 
 
-def _sum_cells(cells: dict[int, HourCell], *, upto: int | None = None) -> Decimal | None:
-    """把若干小时的用量加起来；只要有一个该有数的格子缺数，就返回 None。"""
+def _sum_cells(cells: dict[int, HourCell], *, upto: int | None = None, running: bool = False):
+    """把若干小时的用量加起来 → `(合计, 已覆盖小时数, 应有小时数)`。
+
+    两种情况必须区别对待，否则要么瞒报、要么把界面搞成一片「--」：
+
+    · **已结束的周期**（`running=False`，如昨日、历史某天）：
+      只要有一个「该有数」的格子缺数，就返回 `None` —— 合计宁可空白，也不给偏小值。
+      （偏小的数看着正常，最危险：曾经因此把整条线的用电少算了。）
+
+    · **进行中的周期**（`running=True`，如今天、本小时所在的那一轮）：
+      给「已有数据的部分合计」，**同时如实报告覆盖度**。
+      现场出现过这个情况：系统当天才上线，0—14 点本来就没有数据，
+      若按严格口径，整个大屏的「今日用电」全变成 `--`，值班人员以为系统坏了；
+      若直接把 1 小时的数据当「今日累计」，又会看起来像「今天几乎没用电」。
+      两个都不对 —— 正确做法是给数 + 标注「已采集 N/M 小时」（对应 docs/02 的 B-403）。
+    """
     total = Decimal(0)
+    covered = 0
+    expected = 0
     for hour, cell in cells.items():
         if upto is not None and hour > upto:
             continue
+        if cell.future:
+            continue
+        expected += 1
         if cell.value is None:
-            if cell.future:
-                continue
-            return None
+            continue
         total += cell.value
-    return total
+        covered += 1
+    if running:
+        return (total if covered else None), covered, expected
+    if covered < expected:
+        return None, covered, expected
+    return total, covered, expected
 
 
-def _trend_days(meters_fn, days: int, now: datetime) -> list[dict]:
-    """近 N 天的日用量趋势（产量留空）。"""
-    out = []
-    for back in range(days - 1, -1, -1):
-        day = (now - timedelta(days=back)).date()
-        cells = meters_fn(day)
-        total = _sum_cells({h: c for h, c in cells.items() if not c.future}, upto=23 if day != now.date() else now.hour)
-        out.append({"label": day.strftime("%m-%d"), "output": 0, "kwh": round_kwh(total), "unitKwh": NULL})
+# ── 周期序列：一律优先读 eep_period_summary ──────────────────
+
+
+def _summary_rows(dim: str, scope: str, line: Line | None, keys: list[str]) -> dict[str, PeriodSummary]:
+    qs = PeriodSummary.objects.filter(dim=dim, scope=scope, period_key__in=keys)
+    qs = qs.filter(line=line) if line is not None else qs.filter(line__isnull=True)
+    return {r.period_key: r for r in qs}
+
+
+def _labels_for(dim: str, day: date_cls) -> str:
+    if dim == PeriodSummary.DIM_DAY:
+        return day.strftime("%m-%d")
+    if dim == PeriodSummary.DIM_MONTH:
+        return day.strftime("%Y-%m")
+    return day.strftime("%Y年")
+
+
+def _range_kwh(meters_qs, start: date_cls, end: date_cls) -> Decimal | None:
+    """按日期区间直接汇总电量。
+
+    未到的小时在 HourlyUsage 里**本来就没有行**，所以不需要再做时间截断，
+    口径比「按小时累加再截断」更准（跨月时不会漏掉前几天晚上的小时）。
+    """
+    agg = HourlyUsage.objects.filter(
+        meter__in=meters_qs, date__gte=start, date__lte=end, quality__in=HourlyUsage.TRUSTED
+    ).aggregate(t=Sum("usage"))
+    return agg["t"]
+
+
+def _period_series(
+    dim: str,
+    scope: str,
+    line: Line | None,
+    days: list[date_cls],
+    *,
+    prod_line: Line | None,
+    now: datetime,
+    real: bool = False,
+) -> list[dict]:
+    """生成周期趋势序列（近 N 日 / 近 12 月 / 近 5 年）。
+
+    优先进 `eep_period_summary`（后台读的也是它 → 两边一致）；
+    缺行时退化为现场现算，并在日志里留一条 warning（说明 summarize 没跑到）。
+
+    `real=False`（产量未接入）时 output 一律给 null ——
+    汇总表里的 0 只是「没有真实产量记录」的占位，不能当作「确实产出为 0」交付给界面。
+    """
+    keys = [S.make_key(dim, d) for d in days]
+    rows = _summary_rows(dim, scope, line, keys)
+    missing = [k for k in keys if k not in rows]
+    if missing:
+        logger.warning(
+            "period_summary 缺行（%s/%s/%s）：%s —— 已退化为现场现算，建议补跑 manage.py summarize",
+            dim, scope, line.code if line else "车间", ", ".join(missing[:5]),
+        )
+
+    out: list[dict] = []
+    for d, key in zip(days, keys):
+        row = rows.get(key)
+        if row is not None:
+            out.append(
+                {
+                    "label": _labels_for(dim, d),
+                    "output": int(row.output) if real else NULL,
+                    "kwh": round_kwh(row.kwh),
+                    "unitKwh": round_any(row.unit_kwh, 2) if row.unit_kwh is not None else NULL,
+                }
+            )
+            continue
+
+        # ── 退化路径：现算（表里缺行时才会走到，日志已 warning）──
+        if dim == PeriodSummary.DIM_DAY:
+            start = end = d
+        else:
+            start, end = S.period_bounds(dim, key)
+            if end > now.date():
+                end = now.date()
+        meters = (
+            [m for m in line.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
+            if line is not None
+            else list(Meter.objects.filter(kind=Meter.KIND_ELEC, enabled=True))
+        )
+        kwh = _range_kwh(meters, start, end)
+        prodv = production_sum(prod_line, start, end) if prod_line else Decimal(0)
+        unit = round(float(kwh / prodv * 1000), 2) if (kwh and prodv > 0) else NULL
+        out.append(
+            {
+                "label": _labels_for(dim, d),
+                "output": int(prodv) if real else NULL,
+                "kwh": round_kwh(kwh),
+                "unitKwh": unit,
+            }
+        )
     return out
 
 
@@ -215,15 +406,58 @@ def build_line(line: Line, now: datetime | None = None) -> dict:
 
     cells = _line_kwh_cells(line, today, now)
     y_cells = _line_kwh_cells(line, yesterday, now)
+    prod = production_info(line, today)
 
-    hours = [_hour_point(h, cells[h]) for h in range(24)]
-    today_kwh = _sum_cells(cells, upto=now.hour)
-    y_kwh = _sum_cells(y_cells, upto=23)
+    hours = [_hour_point(h, cells[h], prod.by_hour.get(h), prod.real) for h in range(24)]
+    # 今天进行中：给部分合计 + 覆盖度；昨天已结束：严格口径
+    today_kwh, cov, exp = _sum_cells(cells, upto=now.hour, running=True)
+    y_kwh, _, _ = _sum_cells(y_cells, upto=23)
 
-    # 状态：产量未接入，暂按「本小时电量是否明显大于 0」粗判，待产量改造后改为按产量判定
+    # ── 产量：只认真实数据源；演示占位与「无数据」都按未接入处理（null，不是 0）──
+    today_out = production_sum(line, today, today) if prod.real else None
+    y_out = production_sum(line, yesterday, yesterday) if prod.real else None
+
+    # ── 日 / 月 / 年：优先读汇总表 ──
+    day_rows = _summary_rows(PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_LINE, line, [S.make_key("day", today)])
+    today_row = day_rows.get(S.make_key("day", today))
+    if today_row is not None:
+        # 汇总表里今天是「进行中」的，直接用它的累计值
+        month_kwh = _period_total(line, PeriodSummary.DIM_MONTH, now)
+        year_kwh = _period_total(line, PeriodSummary.DIM_YEAR, now)
+        month_out = _period_output(line, PeriodSummary.DIM_MONTH, now) if prod.real else None
+        year_out = _period_output(line, PeriodSummary.DIM_YEAR, now) if prod.real else None
+    else:
+        month_kwh = _month_kwh(line, now)
+        year_kwh = _year_kwh(line, now)
+        month_out = None
+        year_out = None
+
+    # ── 状态判定 ──
+    # 有真实产量 → 按产量判定（产能利用率）；否则按用电负荷判定。
     current = cells.get(now.hour)
-    running = bool(current and current.value and current.value > 0)
-    status = "running" if running else "stopped"
+    load = current.value if current and current.value is not None else Decimal(0)
+    if prod.real:
+        ref = int(prod.by_hour.get(now.hour) or 0)
+        if ref <= 0:
+            status = "stopped"
+        elif line.rated and ref < line.rated * 0.75:
+            status = "slow"
+        else:
+            status = "running"
+    else:
+        base = float(conf.get("energy_defaults.base_load_kwh_per_hour", 20) or 20)
+        if load <= 0:
+            status = "stopped"
+        elif float(load) < base * 0.6:
+            status = "slow"
+        else:
+            status = "running"
+
+    # ── 周期趋势序列 ──
+    d30 = S.recent_days(30, now)
+    m12 = S.recent_months(12, now)
+    y5 = S.recent_years(5, now)
+    plan_now = _plan_for(line, today, now)
 
     return {
         "id": line.code,
@@ -231,53 +465,124 @@ def build_line(line: Line, now: datetime | None = None) -> dict:
         "rated": line.rated or 0,
         "product": line.product or "",
         "status": status,
-        "note": "" if line.rated else "额定产能待产量侧接口接入后回填",
+        "note": "" if prod.real else "产量数据源未接入",
         "hours": hours,
-        # ⚠ 产量相关字段一律留空（本次不采集产量，也不反推）
-        # 产量相关字段一律留空（本次不采集产量，也不反推）：
-        # output/plan/rate 为 0 表示「未接入」，unitKwh 为 null 表示「算不出来」。
-        # 电量拿不到时给 null 而不是 0 —— 0 会被读成「今天没用电」。
         "today": {
-            "output": 0,
+            "output": int(today_out) if today_out is not None else NULL,
             "kwh": round_kwh(today_kwh),
-            "unitKwh": NULL,
-            "plan": 0,
-            "planFull": 0,
-            "rate": 0,
+            "unitKwh": round(float(today_kwh / today_out * 1000), 2)
+            if (today_kwh and today_out is not None and today_out > 0)
+            else NULL,
+            "plan": int(plan_now),
+            "planFull": int(line.rated * 24 * 0.88) if line.rated else 0,
+            "rate": round(float(today_out / plan_now * 100), 2)
+            if (today_out is not None and plan_now > 0)
+            else 0,
+            # 今日用电的采集覆盖度 —— 界面必须显示，
+            # 否则「今日累计」会在刚上线/采集中断时看起来像「今天几乎没用电」
+            "kwhCoveredHours": cov,
+            "kwhExpectedHours": exp,
         },
         "yesterday": {
-            "output": 0,
+            "output": int(y_out) if y_out is not None else NULL,
             "kwh": round_kwh(y_kwh),
-            "unitKwh": NULL,
-            "fullOutput": 0,
+            "unitKwh": round(float(y_kwh / y_out * 1000), 2)
+            if (y_kwh and y_out is not None and y_out > 0)
+            else NULL,
+            "fullOutput": int(y_out) if y_out is not None else NULL,
+            "fullKwh": round_kwh(y_kwh) or 0,
+        },
+        "daily30": _period_series(
+            PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_LINE, line, d30, prod_line=line, now=now, real=prod.real
+        ),
+        "monthly12": _period_series(
+            PeriodSummary.DIM_MONTH, PeriodSummary.SCOPE_LINE, line, m12, prod_line=line, now=now, real=prod.real
+        ),
+        "yearly5": _period_series(
+            PeriodSummary.DIM_YEAR, PeriodSummary.SCOPE_LINE, line, y5, prod_line=line, now=now, real=prod.real
+        ),
+        # 产量热力图：未接入时整片 null（≠ 0），前端渲染成「未上报」空格
+        "heat": _heat(line, today, now, prod.real),
+        "heatDays": [(today - timedelta(days=6 - i)).strftime("%m-%d") for i in range(7)],
+        "month": {
+            "output": int(month_out) if month_out is not None else NULL,
+            "kwh": round_kwh(month_kwh),
+        },
+        "year": {
+            "output": int(year_out) if year_out is not None else NULL,
+            "kwh": round_kwh(year_kwh),
+            "full": 0,
             "fullKwh": 0,
         },
-        "daily30": _trend_days(lambda d: _line_kwh_cells(line, d, now), 30, now),
-        "heat": [[NULL for _ in range(24)] for _ in range(7)],  # 产量热力图：待产量接入
-        "heatDays": [(now - timedelta(days=6 - i)).strftime("%m-%d") for i in range(7)],
-        "month": {"output": 0, "kwh": _month_kwh(line, now)},
-        "year": {"output": 0, "kwh": _year_kwh(line, now), "full": 0, "fullKwh": 0},
         "dayOfYear": now.timetuple().tm_yday,
     }
 
 
+def _heat(line: Line, today: date_cls, now: datetime, real: bool) -> list[list[int | None]]:
+    """近 7 日 × 24 小时产量热力图，单位「百瓶」。未接入时整片 null。"""
+    if not real:
+        return [[NULL for _ in range(24)] for _ in range(7)]
+    rows = HourlyProduction.objects.filter(
+        line=line, date__gte=today - timedelta(days=6), date__lte=today, quality__in=HourlyProduction.TRUSTED
+    ).exclude(source__in=DEMO_SOURCES)
+    grid: list[list[int | None]] = [[NULL for _ in range(24)] for _ in range(7)]
+    for r in rows:
+        idx = 6 - (today - r.date).days
+        if 0 <= idx < 7 and r.output is not None:
+            grid[idx][r.hour] = int(r.output / 100)
+    return grid
+
+
+def _plan_for(line: Line, day: date_cls, now: datetime) -> Decimal:
+    """截至当前小时的应产（达成率分母，必须与统计窗口一致）。"""
+    if day != now.date():
+        hours = 24
+    else:
+        hours = now.hour + 1
+    return Decimal((line.rated or 0) * 0.88 * hours)
+
+
+def _period_total(line: Line, dim: str, now: datetime) -> Decimal | None:
+    """从汇总表取某周期的电量；缺行则退化为现算。"""
+    key = S.make_key(dim, now.date())
+    row = _summary_rows(dim, PeriodSummary.SCOPE_LINE, line, [key]).get(key)
+    if row is not None:
+        return row.kwh
+    if dim == PeriodSummary.DIM_MONTH:
+        return _month_kwh_raw(line, now)
+    return _year_kwh_raw(line, now)
+
+
+def _period_output(line: Line, dim: str, now: datetime) -> Decimal:
+    key = S.make_key(dim, now.date())
+    row = _summary_rows(dim, PeriodSummary.SCOPE_LINE, line, [key]).get(key)
+    if row is not None:
+        return row.output
+    return production_sum(line, *S.period_bounds(dim, key))
+
+
 def _month_kwh(line: Line, now: datetime) -> float | None:
+    return round_kwh(_month_kwh_raw(line, now))
+
+
+def _month_kwh_raw(line: Line, now: datetime) -> Decimal | None:
     meters = [m for m in line.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
     agg = HourlyUsage.objects.filter(
-        meter__in=meters,
-        date__year=now.year,
-        date__month=now.month,
-        quality__in=HourlyUsage.TRUSTED,
+        meter__in=meters, date__year=now.year, date__month=now.month, quality__in=HourlyUsage.TRUSTED
     ).aggregate(total=Sum("usage"))
-    return round_kwh(agg["total"])
+    return agg["total"]
 
 
 def _year_kwh(line: Line, now: datetime) -> float | None:
+    return round_kwh(_year_kwh_raw(line, now))
+
+
+def _year_kwh_raw(line: Line, now: datetime) -> Decimal | None:
     meters = [m for m in line.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
     agg = HourlyUsage.objects.filter(
         meter__in=meters, date__year=now.year, quality__in=HourlyUsage.TRUSTED
     ).aggregate(total=Sum("usage"))
-    return round_kwh(agg["total"])
+    return agg["total"]
 
 
 def _utility_metric(kind: str, now: datetime, unit: str) -> dict:
@@ -287,13 +592,10 @@ def _utility_metric(kind: str, now: datetime, unit: str) -> dict:
     cells = _utility_cells(kind, today, now)
     y_cells = _utility_cells(kind, yesterday, now)
 
-    trend = []
-    for h in range(24):
-        cell = cells[h]
-        trend.append(round_any(cell.value, 2) if cell.value is not None else NULL)
+    trend = [round_any(cells[h].value, 2) if cells[h].value is not None else NULL for h in range(24)]
 
-    today_total = _sum_cells(cells, upto=now.hour)
-    y_total = _sum_cells(y_cells, upto=23)
+    today_total, cov, exp = _sum_cells(cells, upto=now.hour, running=True)
+    y_total, _, _ = _sum_cells(y_cells, upto=23)
 
     # 瞬时流量：设备响应里的瞬时字段（var2/var3/var4）含义尚未与现场核对，
     # 先用「当前小时用量 ÷ 已覆盖时长」作为平均流量（t/h）的估算值。
@@ -303,30 +605,47 @@ def _utility_metric(kind: str, now: datetime, unit: str) -> dict:
         rate_now = round(float(current.value) / max(current.progress, 1e-6), 2)
 
     return {
-        # 取不到就是 null（未知 ≠ 0）。前端若切到 api 模式，
-        # 这几个字段的类型需从 number 放宽为 number | null。
+        # 取不到就是 null（未知 ≠ 0）
         "today": round_any(today_total, 2),
         "yesterday": round_any(y_total, 2),
         "rateNow": rate_now,
         "unit": unit,
         "trend": trend,
+        # 覆盖度：未采集的小时不补 0，但要让界面能说明「只统计了 N/M 小时」
+        "coveredHours": cov,
+        "expectedHours": exp,
     }
 
 
 def build_workshop(now: datetime | None = None) -> dict:
     now = now or datetime.now()
-    lines = [build_line(ln, now) for ln in Line.objects.filter(enabled=True)]
+    lines = list(Line.objects.filter(enabled=True))
+    line_dicts = [build_line(ln, now) for ln in lines]
 
     w_cells = _workshop_kwh_cells(now.date(), now)
     w_hours = [_hour_point(h, w_cells[h]) for h in range(24)]
-    w_today = _sum_cells(w_cells, upto=now.hour)
-    w_yesterday = _sum_cells(_workshop_kwh_cells(now.date() - timedelta(days=1), now), upto=23)
+    w_today, w_cov, w_exp = _sum_cells(w_cells, upto=now.hour, running=True)
+    w_yesterday, _, _ = _sum_cells(_workshop_kwh_cells(now.date() - timedelta(days=1), now), upto=23)
 
     water = _utility_metric(Meter.KIND_WATER, now, "t")
     steam = _utility_metric(Meter.KIND_STEAM, now, "t")
 
-    # 车间告警：本期只保留「采集异常」提示（告警引擎后续接入）
+    # 车间产量 = 各线真实产量之和（演示占位已在上游被排除）
+    # 是否有**真实**产量数据源（演示占位不算）—— 决定要不要挂「产量未接入」提示
+    real_any = any(production_info(ln, now.date()).real for ln in lines)
+    w_today_out = sum(int(ln["today"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
+    w_y_out = sum(int(ln["yesterday"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
+
+    # 车间告警：只保留「采集异常」提示（告警引擎后续接入）
     alerts = []
+    if not real_any:
+        alerts.append(
+            {
+                "level": "info",
+                "text": "产量数据源未接入（灌装机计数器 / 装箱机 PLC / MES 班次报工待改造），本期产量统一显示为 --",
+                "time": "--:--:--",
+            }
+        )
     for meter in Meter.objects.filter(enabled=True, last_ok=False).exclude(last_at=None)[:10]:
         alerts.append(
             {
@@ -336,29 +655,48 @@ def build_workshop(now: datetime | None = None) -> dict:
             }
         )
 
+    d30 = S.recent_days(30, now)
+    m12 = S.recent_months(12, now)
+    y5 = S.recent_years(5, now)
+    workshop_total = lambda dim: _workshop_period(dim, now, real_any)  # noqa: E731
+
+    month_row = workshop_total(PeriodSummary.DIM_MONTH)
+    year_row = workshop_total(PeriodSummary.DIM_YEAR)
+    w_plan = sum(int(ln["today"]["plan"]) for ln in line_dicts)  # type: ignore[index]
+
     return {
-        "lines": lines,
+        "lines": line_dicts,
         "today": {
-            "output": 0,
+            "output": w_today_out,
             "kwh": round_kwh(w_today),
-            "unitKwh": NULL,
-            "plan": 0,
+            "unitKwh": round(float(w_today / w_today_out * 1000), 2)
+            if (w_today and w_today_out is not None and w_today_out > 0)
+            else NULL,
+            "plan": w_plan,
             "waterT": water["today"],
             "steamT": steam["today"],
+            "kwhCoveredHours": w_cov,
+            "kwhExpectedHours": w_exp,
         },
         "yesterday": {
-            "output": 0,
+            "output": w_y_out,
             "kwh": round_kwh(w_yesterday),
             "unitKwh": NULL,
             "waterT": water["yesterday"],
             "steamT": steam["yesterday"],
         },
-        "month": {"output": 0, "kwh": _workshop_range_kwh(now.replace(day=1).date(), now.date())},
-        "year": {"output": 0, "kwh": _workshop_range_kwh(now.replace(month=1, day=1).date(), now.date())},
+        "month": {"output": month_row["output"], "kwh": round_kwh(month_row["kwh"])},
+        "year": {"output": year_row["output"], "kwh": round_kwh(year_row["kwh"])},
         "hours": w_hours,
-        "daily30": _trend_days(lambda d: _workshop_kwh_cells(d, now), 30, now),
-        "monthly12": _monthly_trend(now, 12),
-        "yearly5": [],
+        "daily30": _period_series(
+            PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_WORKSHOP, None, d30, prod_line=None, now=now, real=real_any
+        ),
+        "monthly12": _period_series(
+            PeriodSummary.DIM_MONTH, PeriodSummary.SCOPE_WORKSHOP, None, m12, prod_line=None, now=now, real=real_any
+        ),
+        "yearly5": _period_series(
+            PeriodSummary.DIM_YEAR, PeriodSummary.SCOPE_WORKSHOP, None, y5, prod_line=None, now=now, real=real_any
+        ),
         "utility": {"water": water, "steam": steam},
         "targetUnitKwh": float(conf.get("energy_defaults.target_unit_kwh", 0) or 0),
         "alerts": alerts,
@@ -366,27 +704,23 @@ def build_workshop(now: datetime | None = None) -> dict:
     }
 
 
-def _workshop_range_kwh(start: date_cls, end: date_cls) -> float | None:
+def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
+    """车间级某周期的汇总（产量 + 电量），优先读汇总表。
+
+    `real=False`（产量未接入）时 output 给 null —— 与线级口径一致。
+    """
+    key = S.make_key(dim, now.date())
+    row = _summary_rows(dim, PeriodSummary.SCOPE_WORKSHOP, None, [key]).get(key)
+    if row is not None:
+        return {"output": int(row.output) if real else NULL, "kwh": row.kwh}
+    start, end = S.period_bounds(dim, key)
     agg = HourlyUsage.objects.filter(
         meter__kind=Meter.KIND_ELEC, date__gte=start, date__lte=end, quality__in=HourlyUsage.TRUSTED
     ).aggregate(total=Sum("usage"))
-    return round_kwh(agg["total"])
-
-
-def _monthly_trend(now: datetime, months: int) -> list[dict]:
-    out = []
-    for back in range(months - 1, -1, -1):
-        # 从本月往前推 back 个月
-        year = now.year
-        month = now.month - back
-        while month <= 0:
-            month += 12
-            year -= 1
-        agg = HourlyUsage.objects.filter(
-            meter__kind=Meter.KIND_ELEC, date__year=year, date__month=month, quality__in=HourlyUsage.TRUSTED
-        ).aggregate(total=Sum("usage"))
-        out.append({"label": f"{year}-{month:02d}", "output": 0, "kwh": round_kwh(agg["total"]), "unitKwh": NULL})
-    return out
+    out = sum(
+        (production_sum(ln, start, end) for ln in Line.objects.filter(enabled=True)), Decimal(0)
+    )
+    return {"output": int(out) if real else NULL, "kwh": agg["total"] or Decimal(0)}
 
 
 def build_overview(now: datetime | None = None) -> dict:

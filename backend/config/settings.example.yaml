@@ -43,21 +43,30 @@ cors:
 
 # ── 数据采集 ─────────────────────────────────────────────────
 collect:
-  # 超时预算：单点最坏 = timeout_ms ×（1 + retry_times）。
-  # 按 1500ms × 2 = 3s/点算，13 路电表全掉线也只要 39s，仍小于 60s 采样周期。
-  timeout_ms: 1500            # 单次读写超时（现场实测正常读 ~70—110ms）
-  retry_times: 1              # 失败重试次数（规范要求外部调用必须重试）
+  # ── 采集节奏（v1.2.2 起可配，默认每小时一次）────────────────────
+  # hourly —— 每小时在「整点 + hourly_offset_seconds」采一次，然后做差得出上一小时用量。
+  #           两个端点偏移相同 → 区间严格 1 小时，不累积偏差。
+  #           代价：① 一次采样失败会连带毁掉两个小时的值；
+  #                 ② 当前小时在下一个整点采样前算不出值，界面显示「待整点采集」。
+  # minute —— 每 interval_seconds 秒采一次。好处是随时能给出本小时的参考值、
+  #           单点失败也有冗余；代价是端点间隔会随轮次耗时漂移，
+  #           小时值会稳定偏一点（月/年累计能看出来）。
+  # 两种节奏的差值口径完全一致，切换不需要改代码。
+  cadence: hourly
+  hourly_offset_seconds: 60
+
+  # 超时按「最坏情况要跑完一轮」倒推：单点超时 1500ms ×（1 + retry_times 1）= 3s，
+  # 14 个点位全掉线也只要 42s，远小于 1 小时的采样周期。
+  timeout_ms: 1500
+  retry_times: 1
   retry_backoff_seconds: 0.3
-  interval_seconds: 60        # 采样周期：60s 足够，小时差值只关心整点附近的读数
-  # 端点读数距整点超过该分钟数 → 判为「采集中断过」，差值标 partial
+  # minute 节奏下用；hourly 节奏下忽略
+  interval_seconds: 60
   boundary_tolerance_minutes: 20
-  # 原始读数保留天数（`manage.py purge_readings` 清理）
   readings_retention_days: 180
   filter:
-    # 累计值回退超过该比例 → 说明里记为「疑似换表」
     reset_threshold_ratio: 0.5
 
-# ── 日志 ─────────────────────────────────────────────────────
 logging:
   level: INFO
   dir: logs
@@ -72,13 +81,19 @@ logging:
 # ── 产线 ─────────────────────────────────────────────────────
 # rated（额定产能 瓶/小时）与 product（品项）属于产量侧数据，
 # 产量接口本次留空，这里先置 0，待产量改造时一并回填。
+# 产线主数据。
+# ⚠ rated（额定产能）与 product（品项）是**静态台账参数**，不是产量数据，
+#   产量未接入也要填 —— 没有它就算不出计划产量与达成率。
+#   取值与 frontend/packages/shared/src/config.ts 的 linesConfig 必须同值，
+#   否则大屏（读接口）与后台（读同一张表）会显示不一致。
+#   现场口径若有出入，改这里一处即可（或直接在后台「生产管理」改）。
 lines:
-  - { code: A1, name: 一线, sort: 1, rated: 0 }
-  - { code: A2, name: 二线, sort: 2, rated: 0 }
-  - { code: A3, name: 三线, sort: 3, rated: 0 }
-  - { code: A4, name: 四线, sort: 4, rated: 0 }
-  - { code: A5, name: 五线, sort: 5, rated: 0 }
-  - { code: A6, name: 六线, sort: 6, rated: 0 }
+  - { code: A1, name: 一线, sort: 1, rated: 30000, product: 冰红茶 500ml }
+  - { code: A2, name: 二线, sort: 2, rated: 30000, product: 绿茶 500ml }
+  - { code: A3, name: 三线, sort: 3, rated: 24000, product: 茉莉蜜茶 500ml }
+  - { code: A4, name: 四线, sort: 4, rated: 24000, product: 酸梅汤 500ml }
+  - { code: A5, name: 五线, sort: 5, rated: 18000, product: 纯净水 550ml }
+  - { code: A6, name: 六线, sort: 6, rated: 18000, product: 冰糖雪梨 500ml }
 
 # ── 网关 ─────────────────────────────────────────────────────
 # kind:
@@ -176,6 +191,8 @@ meters:
 # ⚠ 产量未接入前，与产量相关的强度参数（单位电耗、水/汽耗强度）无法标定，
 #   先留空；等产量改造完成、且有一周以上真实数据后再回归拟合。
 energy_defaults:
+  # 单线基础负荷 kWh/h —— 产量未接入期间用于判定「运行中 / 低负荷 / 无用电」
+  base_load_kwh_per_hour: 20
   target_unit_kwh: 0            # 单位电耗考核目标 kWh/千瓶（待回填）
   alarm_unit_kwh_high: 0        # 单位电耗告警上限（待回填）
   output_low_rate: 0.75         # 低产判定（占额定比）

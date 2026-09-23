@@ -104,15 +104,64 @@ export const plantConfig = {
 
 /** 数据源配置 */
 export const dataConfig = {
-  /** 'mock' 用内置模拟数据；'api' 走真实接口 */
-  mode: 'mock' as 'mock' | 'api',
+  /**
+   * 数据源总开关：
+   *   'api'  —— 走后端接口（**现场默认**，读 MySQL 里的真实采集数据）
+   *   'mock' —— 全用内置演示数据（离线演示 / 后端未就绪时用）
+   *
+   * ⚠ 置为 'api' 时后端必须在线，否则大屏会显示演示数据
+   *   （会带上明显的「后端接口不可达」提示，不会假装成真实数据）。
+   */
+  mode: 'api' as 'mock' | 'api',
+
+  /**
+   * 后端尚未实现的接口域 —— 这些即使 `mode = 'api'` 也继续走内置演示数据，
+   * 避免一改总开关就整片页面 404 白屏。
+   * 后端把这些接口实现后，从数组里删掉对应项即可，**不用改别处代码**。
+   *
+   * 已实现（不在本列表里）：energy.*、admin.overview / lines / gateways /
+   *                          meters / quality / collect-logs
+   */
+  mockOnly: [
+    'auth',
+    'admin.users',
+    'admin.roles',
+    'admin.menus',
+    'admin.params',
+    'admin.dicts',
+    'admin.alarms',
+    'admin.logs.operation',
+    'admin.logs.login',
+    'admin.reports'
+  ] as string[],
+
   api: {
     overview: '/api/energy/overview',
     line: '/api/energy/line/{lineId}',
-    hourly: '/api/energy/hourly'
+    hourly: '/api/energy/hourly',
+    meters: '/api/energy/meters',
+    collectSummary: '/api/energy/collect-summary'
   },
+
   /** 大屏自动刷新间隔 ms */
-  refreshMs: 30000
+  refreshMs: 30000,
+
+  /**
+   * 产量数据源是否已接入 —— **当前为 false**。
+   *
+   * 现场产量侧（灌装机计数器 / 装箱机 PLC / MES 班次报工）尚未改造，因此：
+   *   · 所有产量数值一律为 **null**（界面显示 `--`），单位电耗为 null，达成率为 0；
+   *   · 这个开关只影响**展示与告警**：为 false 时页面明确标注「产量未接入」，
+   *     且不生成任何与产量相关的告警（低产 / 无产量 / 达产率），
+   *     避免把「还没接数据」误读成「产线停产、达产率 0%」。
+   *
+   * 真实接口接入后置为 true 即可恢复产量口径判定，**不需要改渲染代码**。
+   */
+  productionEnabled: false,
+
+  /** 产量未接入时界面上统一引用的说明文案 */
+  productionNote:
+    '产量数据源未接入（灌装机计数器 / 装箱机 PLC / MES 班次报工待改造），本期产量统一显示为 --'
 };
 
 /** 六条产线定义 */
@@ -126,9 +175,18 @@ export const linesConfig: LineConfig[] = [
 ];
 
 /**
- * 能耗模型 —— 既用于生成模拟数据，也用于判断实测值是否离谱
- * 电 = 基础负荷（待机/辅机） + 产量 × 变动电耗
- * 该结构保证低产时段单位电耗自然升高，符合真实产线特征。
+ * 能耗模型
+ *
+ * 分两组口径，**不要混用**：
+ *
+ * ① 产量接入后的正式口径（`productionEnabled = true` 时生效）：
+ *      电 = 基础负荷（待机/辅机） + 产量 × 变动电耗
+ *      水 = 产量 × 单位水耗；汽 = 产量 × 单位汽耗
+ *    该结构保证低产时段单位电耗自然升高，符合真实产线特征。
+ *
+ * ② 产量未接入期间的过渡口径（当前生效）：
+ *    产量侧未改造，无法按产量折算，水/汽改用**按电量比例**给出过渡估算值，
+ *    仅用于占位与图表连贯性，**不可用于考核**。真实产量接入后回到 ①。
  */
 export const energyModel = {
   /** 单线基础负荷 kWh/h（待机 / 辅机 / 液压） */
@@ -139,7 +197,14 @@ export const energyModel = {
   waterPerBottleL: 2.8,
   /** 车间汽耗强度 kg/瓶（含杀菌、CIP） */
   steamPerBottleKg: 0.21,
-  /** 单位电耗考核目标 kWh/千瓶 */
+  /**
+   * ⚠ 过渡口径（产量未接入期间）：按电量估算水耗 L/kWh。
+   * 数值为现场量级的粗估，**未经真实历史数据标定**，仅供占位。
+   */
+  waterPerKwhL: 0.55,
+  /** ⚠ 过渡口径：按电量估算汽耗 kg/kWh，同样未经标定 */
+  steamPerKwhKg: 0.045,
+  /** 单位电耗考核目标 kWh/千瓶（产量接入后才能标定，当前仅留档） */
   targetUnitKwh: 8.2
 };
 

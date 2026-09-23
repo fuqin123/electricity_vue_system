@@ -29,9 +29,16 @@ def _dec(value, default="1") -> Decimal:
 
 
 @transaction.atomic
-def sync_registry() -> dict:
-    """按配置 upsert 产线 / 网关 / 计量点。返回变更计数。"""
-    stat = {"line": 0, "gateway": 0, "meter": 0}
+def sync_registry(*, force: bool = False) -> dict:
+    """按配置 upsert 产线 / 网关 / 计量点。返回变更计数。
+
+    ⚠ **配置来源优先级：后台维护 > 配置文件。**
+      后台（管理界面）改过的记录会打上 `source = admin`，本函数默认**跳过**它们 ——
+      否则现场在后台调好的从站号/倍率，会被下一次 `seed_registry` 悄悄改回配置里的旧值，
+      而且现场根本想不到是这个原因（这类「改了又自己变回去」最难查）。
+      确实要以配置文件为准时，显式加 `--force`。
+    """
+    stat = {"line": 0, "gateway": 0, "meter": 0, "skipped": 0}
 
     # ── 产线 ────────────────────────────────────────────────
     for item in conf.get("lines", []) or []:
@@ -50,6 +57,12 @@ def sync_registry() -> dict:
     # ── 网关 ────────────────────────────────────────────────
     gw_map: dict[str, Gateway] = {}
     for item in conf.get("gateways", []) or []:
+        existed = Gateway.objects.filter(code=item["code"]).first()
+        gw_map[item["code"]] = existed  # 先记下，供计量点引用（含被跳过的）
+        if existed is not None and existed.source == Gateway.SOURCE_ADMIN and not force:
+            stat["skipped"] += 1
+            logger.warning("网关 %s 由后台维护，跳过配置覆盖（需要覆盖请加 --force）", item["code"])
+            continue
         gw, _ = Gateway.objects.update_or_create(
             code=item["code"],
             defaults={
@@ -62,6 +75,7 @@ def sync_registry() -> dict:
                 "interval_seconds": int(item.get("interval_seconds", 60) or 60),
                 "enabled": bool(item.get("enabled", True)),
                 "remark": item.get("remark", ""),
+                "source": Gateway.SOURCE_CONFIG,
             },
         )
         gw_map[gw.code] = gw
@@ -86,6 +100,12 @@ def sync_registry() -> dict:
         if scope == Meter.SCOPE_WORKSHOP:
             line = None  # 车间总表不挂在任何产线
 
+        existed = Meter.objects.filter(code=item["code"]).first()
+        if existed is not None and existed.source == Meter.SOURCE_ADMIN and not force:
+            stat["skipped"] += 1
+            logger.warning("计量点 %s 由后台维护，跳过配置覆盖（需要覆盖请加 --force）", item["code"])
+            continue
+
         Meter.objects.update_or_create(
             code=item["code"],
             defaults={
@@ -98,6 +118,7 @@ def sync_registry() -> dict:
                 "slave": item.get("slave"),
                 "register": item.get("register"),
                 "registers": int(item.get("registers", 2) or 2),
+                "func_code": int(item.get("func_code", 3) or 3),
                 "word_order": item.get("word_order", "big"),
                 "url_path": item.get("url_path", "") or "",
                 "params": item.get("params", {}) or {},
@@ -108,6 +129,8 @@ def sync_registry() -> dict:
                 "max_hourly": _dec(item["max_hourly"]) if item.get("max_hourly") is not None else None,
                 "enabled": bool(item.get("enabled", True)),
                 "remark": item.get("remark", ""),
+                "asset_no": item.get("asset_no", "") or "",
+                "source": Meter.SOURCE_CONFIG,
             },
         )
         stat["meter"] += 1

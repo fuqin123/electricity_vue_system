@@ -1,15 +1,17 @@
 # 后端（backend）—— 数据采集与接口层
 
-> **当前状态：v1.2.0 —— 采集与存储已实现并接现场实测通过。**
+> **当前状态：v1.2.1 —— 采集、存储、只读接口与后台配置接口均已实现并接现场实测通过。**
 >
 > | 能力 | 状态 |
 > | :--- | :--- |
 > | 13 路产线电表（4 台 485 串口服务器，Modbus RTU over TCP） | ✅ 实测 14/14 点位 1.4 秒采完 |
 > | 车间蒸汽总表（第三方平台 API） | ✅ 已接通 |
 > | 小时差值（每小时用了多少）＋ 异常过滤 | ✅ 含缺数 / 换表 / 尖峰 / 偏离整点四类处理 |
-> | MySQL 存储 | ✅ 已建表入库 |
+> | 日 / 月 / 年周期总计（`eep_period_summary`，大屏与后台同源） | ✅ `summarize` 落表，整点自动刷新 |
+> | MySQL 存储 | ✅ 已建表入库（网关 IP/端口/从站号等仪表配置均在库，支持后台维护） |
 > | 能源数据只读接口 | ✅ `/api/energy/*`（与前端契约同构） |
-> | 产量（瓶子数） | ⬜ **本次留空**，`/api/energy/production` 返回 501 |
+> | 后台配置接口 | ✅ v1.2.1 打通 `/api/admin/*`：网关 / 计量点**后台增删改 + 连接测试 + 试采**（写操作 `source=admin`，`seed_registry` 不覆盖） |
+> | 产量（瓶子数） | 🟡 表已建、写入命令已备（`ingest_production`），数据源未接入期间接口如实返回 **null + available=false**（不是 501、不是 0） |
 > | 车间进水总表 | ⬜ 接口地址待现场提供（配置已登记，`enabled: false`） |
 > | 告警引擎 / 报表 / 权限 / SSO | ⬜ 后续版本 |
 >
@@ -60,11 +62,11 @@ backend/
 │  ├─ settings.py               # MySQL / 时区 / CORS / 日志
 │  ├─ urls.py · wsgi.py
 ├─ apps/energy/                 # 能源采集（核心）
-│  ├─ models.py                 # Gateway / Line / Meter / Reading / HourlyUsage / CollectLog
+│  ├─ models.py                 # Gateway / Line / Meter / Reading / HourlyUsage / HourlyProduction / PeriodSummary / CollectLog
 │  ├─ collectors/               # 采集器：base（重试/计时）· modbus_rtu · http_api
-│  ├─ services/                 # collect（编排）· aggregate（小时差值）· snapshot（组装接口）· registry（登记表同步）
-│  ├─ management/commands/      # collect · collect_loop · aggregate · seed_registry · purge_readings
-│  ├─ api.py · urls.py          # 只读接口
+│  ├─ services/                 # collect（编排）· aggregate（小时差值）· snapshot（组装接口）· summary（周期总计）· registry（登记表同步）
+│  ├─ management/commands/      # collect · collect_loop · aggregate · summarize · ingest_production · seed_registry · purge_readings
+│  ├─ api.py · urls.py          # 能源只读接口（/api/energy/*）+ 后台配置接口（/api/admin/*）
 │  ├─ tests.py                  # 12 个单元测试（差值口径 + 字序 + JSON 取值）
 │  └─ migrations/
 └─ docs/
@@ -172,15 +174,23 @@ python manage.py test apps.energy      # 12 个单元测试
 
 ```ts
 export const dataConfig = {
-  mode: 'mock',                                  // ← 改为 'api' 即接后端
+  mode: 'api',          // ← v1.2.1 起为 'api'（读真实库）；改回 'mock' 为内置演示数据
+  mockOnly: [           // 后端尚未实现的域（系统管理 / 告警 / 报表等）继续走演示数据
+    'auth', 'admin.users', /* … */
+  ],
   api: {
     overview: '/api/energy/overview',
     line:     '/api/energy/line/{lineId}',
-    hourly:   '/api/energy/hourly'
+    hourly:   '/api/energy/hourly',
+    meters:   '/api/energy/meters',
+    collectSummary: '/api/energy/collect-summary'
   },
   refreshMs: 30000
 };
 ```
+
+⚠ 后端不可达时大屏会**降级为演示数据并显示醒目提示**（`source='mock'` + notice），
+不会把演示数字当真实数据展示。
 
 **只要后端返回的结构与 `api-contract.md` 一致，前端渲染代码一行都不用改。**
 

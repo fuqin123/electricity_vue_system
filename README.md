@@ -11,8 +11,8 @@
 用一块 1920×1080 大屏做车间实时监控，用一个后台管理系统做数据治理与台账管理，
 让能源管理员能指着数字说清「哪条线、哪个时段、浪费在哪」。
 
-仓库为**前后端分离**结构：`frontend/` 是前端工程（大屏 + 后台），`backend/` 是采集与数据接口（v1.2.0 起已接现场网关跑通），
-`backend/` 是预留的数据接口层（本期尚未实现，契约已先行确定）。
+仓库为**前后端分离**结构：`frontend/` 是前端工程（大屏 + 后台），`backend/` 是采集与数据接口
+（v1.2.0 接通现场网关采集，v1.2.2 打通大屏真实数据与后台配置接口，仪表可在后台直接维护）。
 
 ---
 
@@ -46,7 +46,7 @@ electricity_vue_system/
 │  └─ packages/
 │     └─ shared/                # 共享层：类型 / 配置 / Mock 引擎 / API SDK / 设计令牌
 │
-├─ backend/                     # ★ 后端（v1.2.0：采集 + MySQL + 只读接口，已实测）
+├─ backend/                     # ★ 后端（v1.2.2：采集 + MySQL + 能源接口 + 后台配置接口，已实测）
 │  ├─ README.md                 # 后端规划与规范要求
 │  ├─ requirements.txt          # 依赖（版本已锁定）
 │  ├─ config/settings.example.yaml
@@ -86,7 +86,7 @@ electricity_vue_system/
 | 后台 `frontend/apps/admin` | Vue / Vite / **Element Plus** / ECharts / Pinia / Vue Router(history) / VueUse / SCSS | Element Plus 2.9 |
 | 共享层 `frontend/packages/shared` | TypeScript 类型 · 全局配置 · Mock 引擎 · API SDK · 设计令牌 | TypeScript 5.7 |
 | 视频 | **go2rtc** 转流网关（RTSP → 浏览器可播协议；大屏走 HLS → MJPEG 可校验链路） | 现场已验证 |
-| 后端（v1.2.0） | Django 5.1 + MySQL 8 + pymodbus（Modbus RTU over TCP）+ PyMySQL | Python 3.10+ |
+| 后端（v1.2.2） | Django 5.1 + MySQL 8 + pymodbus（Modbus RTU over TCP）+ PyMySQL | Python 3.10+ |
 | 工具链 | pnpm workspace · vue-tsc · Prettier · Sass | Node ≥ 20.19 · pnpm ≥ 9 |
 
 **视觉基准**

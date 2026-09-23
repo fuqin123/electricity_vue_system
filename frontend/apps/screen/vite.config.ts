@@ -25,8 +25,23 @@ export default defineConfig({
     port: 5173,
     open: false,
     proxy: {
-      // 接入真实后端时打开：把 /api 代理到 Django 服务
-      // '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true }
+      // 接入真实后端：把 /api 代理到 Django 服务
+      // （与线上 Nginx 的 location /api/ 反代同构）
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true
+      }
+    }
+  },
+  preview: {
+    host: '127.0.0.1',
+    port: 4173,
+    // 生产构建的本地预览也要能连后端，否则看到的永远是降级后的演示数据
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true
+      }
     }
   },
   build: {

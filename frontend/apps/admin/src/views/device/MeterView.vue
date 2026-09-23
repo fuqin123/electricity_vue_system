@@ -1,77 +1,310 @@
 <script setup lang="ts">
 /**
- * MeterView —— 计量点位
- * 电 / 水 / 汽 / 气 计量点位的协议、地址与变比系数。
- * ⚠ 电表为累计值，需在采集侧差分；系数填错会直接导致用量整体偏移。
+ * MeterView —— 计量点位（网关、IP、端口、从站号、寄存器、倍率的配置入口）
+ *
+ * 这一页是**现场新增/调整仪表的唯一入口**，不需要登服务器改配置文件：
+ *   · 新增点位 → 填网关、从站号、寄存器起始地址、寄存器数量、倍率、单位；
+ *   · 改完点「试采」→ 立刻返回真实读数与原始报文，当场确认参数对不对；
+ *   · 试采通过后无需其它操作，下一轮采集（默认 60s）就会带上它。
+ *
+ * ⚠ 两个必须知道的约定（否则现场容易踩）：
+ *   ① 串口服务器是 **Modbus RTU over TCP**，不是 Modbus TCP —— 只填「从站号 + 寄存器」，
+ *      没有 Modbus TCP 的「单元标识符」概念（组帧方式不同）；
+ *   ② 后台改过的记录会标记 `source = 后台维护`，此后 `seed_registry` 默认**不再覆盖**它。
+ *      想以配置文件为准必须显式加 `--force`（见 backend/docs/采集说明.md）。
  */
-import { computed, ref } from 'vue';
-import { adminApi } from '@eep/shared';
+import { computed, reactive, ref } from 'vue';
+import { ElMessage, ElMessageBox } from 'element-plus';
+import { adminApi, type Gateway, type MeterPoint } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
-import { notImplemented } from '@/utils/pending';
+import { useSourceBanner } from '@/utils/source';
 
-const category = ref('');
-const protocol = ref('');
+/* ⚠ 不能用 InstanceType<typeof TablePage>：TablePage 是泛型 SFC，
+   推导出的类型不是构造签名，vue-tsc 会报「does not satisfy the constraint」。
+   这里按需要用到的方法声明结构类型即可。 */
+const tableRef = ref<{ reload: (resetPage?: boolean) => void } | null>(null);
+const banner = useSourceBanner('admin.meters');
+
+/* ── 筛选 ─────────────────────────────────────────────── */
+const kind = ref('');
+const gatewayCode = ref('');
 const status = ref('');
+const gateways = ref<Gateway[]>([]);
+
 const extraQuery = computed(() => ({
-  ...(category.value ? { category: category.value } : {}),
-  ...(protocol.value ? { protocol: protocol.value } : {}),
+  ...(kind.value ? { kind: kind.value } : {}),
+  ...(gatewayCode.value ? { gateway: gatewayCode.value } : {}),
   ...(status.value ? { status: status.value } : {})
 }));
 
-const columns: TableColumn[] = [
-  { prop: 'code', label: '点位编号', width: 150 },
-  { prop: 'name', label: '点位名称', minWidth: 180 },
-  { prop: 'category', label: '类别', width: 80 },
-  { prop: 'lineCode', label: '所属产线', width: 100 },
-  { prop: 'protocol', label: '通讯协议', width: 130 },
-  { prop: 'address', label: '地址 / 从站', width: 200 },
-  { prop: 'unit', label: '单位', width: 80 },
-  { prop: 'factor', label: '变比系数', width: 100, mono: true },
-  { prop: 'status', label: '状态', width: 100, slot: 'col-status' },
-  { prop: 'lastAt', label: '最后上报', width: 180, mono: true }
+function fmtNum(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '--';
+  return v.toLocaleString('zh-CN', { maximumFractionDigits: 3 });
+}
+
+/* ── 列定义 ───────────────────────────────────────────── */
+const columns: TableColumn<MeterPoint>[] = [
+  { prop: 'code', label: '点位编号', width: 116 },
+  { prop: 'name', label: '点位名称', minWidth: 190 },
+  { prop: 'category', label: '类别', width: 70 },
+  { prop: 'lineCode', label: '所属产线', width: 92 },
+  { prop: 'gatewayCode', label: '网关', width: 116 },
+  { prop: 'address', label: '地址 / 从站 / 寄存器', minWidth: 260 },
+  { prop: 'factor', label: '倍率', width: 74, mono: true },
+  { prop: 'unit', label: '单位', width: 66 },
+  { prop: 'lastValue', label: '最近累计值', width: 130, mono: true, formatter: (r) => fmtNum(r.lastValue) },
+  { prop: 'todayUsage', label: '今日用量', width: 104, mono: true, formatter: (r) => fmtNum(r.todayUsage) },
+  { prop: 'status', label: '状态', width: 86, slot: 'col-status' },
+  { prop: 'lastAt', label: '最后上报', width: 160, mono: true }
 ];
 
-const STATUS_MAP: Record<string, { text: string; type: 'success' | 'danger' | 'warning' }> = {
+const STATUS_MAP: Record<string, { text: string; type: 'success' | 'danger' | 'warning' | 'info' }> = {
   online: { text: '在线', type: 'success' },
-  offline: { text: '离线', type: 'danger' },
+  offline: { text: '离线', type: 'info' },
   fault: { text: '故障', type: 'warning' }
 };
+
+/* ── 表单（抽屉）───────────────────────────────────────── */
+const drawer = ref(false);
+const saving = ref(false);
+const editingId = ref<number | null>(null);
+
+function blankForm() {
+  return {
+    code: '',
+    name: '',
+    kind: 'elec' as MeterPoint['kind'],
+    scope: 'line' as MeterPoint['scope'],
+    role: 'line' as MeterPoint['role'],
+    lineCode: 'A1',
+    gatewayId: null as number | null,
+    slave: 1 as number | null,
+    register: 1000 as number | null,
+    registers: 2,
+    funcCode: 3,
+    wordOrder: 'big' as MeterPoint['wordOrder'],
+    urlPath: '',
+    paramsText: '{}',
+    valuePath: '',
+    timePath: '',
+    scale: 0.1,
+    unit: 'kWh',
+    maxHourly: null as number | null,
+    enabled: true,
+    remark: '',
+    assetNo: '',
+    installDate: ''
+  };
+}
+
+const form = reactive(blankForm());
+
+/** 当前选择的网关 —— 决定表单显示 Modbus 段还是 HTTP 段 */
+const currentGateway = computed(() => gateways.value.find((g) => g.id === form.gatewayId) ?? null);
+const isModbus = computed(() => currentGateway.value?.kind !== 'http_api');
+
+/** 类别与单位联动：换类别时给一个合理默认值，避免忘填单位 */
+const UNIT_BY_KIND: Record<MeterPoint['kind'], string> = { elec: 'kWh', water: 't', steam: 't' };
+const CATEGORY_BY_KIND: Record<MeterPoint['kind'], string> = { elec: '电', water: '水', steam: '汽' };
+
+function openCreate() {
+  Object.assign(form, blankForm());
+  editingId.value = null;
+  if (gateways.value.length) form.gatewayId = gateways.value[0].id;
+  drawer.value = true;
+}
+
+function openEdit(row: MeterPoint) {
+  editingId.value = row.id;
+  Object.assign(form, {
+    code: row.code,
+    name: row.name,
+    kind: row.kind,
+    scope: row.scope,
+    role: row.role,
+    lineCode: row.lineCode === '—' ? '' : row.lineCode,
+    gatewayId: row.gatewayId,
+    slave: row.slave,
+    register: row.register,
+    registers: row.registers,
+    funcCode: row.funcCode,
+    wordOrder: row.wordOrder,
+    urlPath: row.urlPath,
+    paramsText: JSON.stringify(row.params ?? {}),
+    valuePath: row.valuePath,
+    timePath: row.timePath,
+    scale: row.factor,
+    unit: row.unit,
+    maxHourly: row.maxHourly,
+    enabled: row.enabled,
+    remark: row.remark,
+    assetNo: row.assetNo,
+    installDate: row.installDate
+  });
+  drawer.value = true;
+}
+
+async function submit() {
+  if (!form.code.trim() || !form.name.trim()) {
+    ElMessage.warning('点位编号与名称为必填项');
+    return;
+  }
+  if (!form.gatewayId) {
+    ElMessage.warning('请选择所属网关');
+    return;
+  }
+  let params: Record<string, unknown> = {};
+  try {
+    params = form.paramsText.trim() ? JSON.parse(form.paramsText) : {};
+  } catch {
+    ElMessage.warning('接口参数不是合法 JSON');
+    return;
+  }
+  if (isModbus.value && (form.slave === null || form.register === null)) {
+    ElMessage.warning('串口服务器类型的点位必须填「从站号」与「寄存器起始地址」');
+    return;
+  }
+  if (!isModbus.value && !form.urlPath.trim()) {
+    ElMessage.warning('HTTP API 类型的点位必须填「接口路径」');
+    return;
+  }
+
+  saving.value = true;
+  try {
+    await adminApi.saveMeter(
+      {
+        code: form.code.trim(),
+        name: form.name.trim(),
+        kind: form.kind,
+        scope: form.scope,
+        role: form.role,
+        lineCode: form.scope === 'workshop' ? '' : form.lineCode,
+        gatewayId: form.gatewayId,
+        slave: form.slave,
+        register: form.register,
+        registers: form.registers,
+        funcCode: form.funcCode,
+        wordOrder: form.wordOrder,
+        urlPath: form.urlPath.trim(),
+        params,
+        valuePath: form.valuePath.trim(),
+        timePath: form.timePath.trim(),
+        factor: form.scale,
+        unit: form.unit,
+        maxHourly: form.maxHourly,
+        enabled: form.enabled,
+        remark: form.remark,
+        assetNo: form.assetNo,
+        installDate: form.installDate
+      },
+      editingId.value ?? undefined
+    );
+    ElMessage.success(editingId.value ? '已保存，下一轮采集生效' : '已新增，下一轮采集生效');
+    drawer.value = false;
+    tableRef.value?.reload();
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  } finally {
+    saving.value = false;
+  }
+}
+
+/* ── 试采：现场调参主力 ───────────────────────────────── */
+const testing = ref<number | null>(null);
+const testVisible = ref(false);
+const testResult = ref<{ title: string; ok: boolean; detail: string; raw: string }>({
+  title: '',
+  ok: false,
+  detail: '',
+  raw: ''
+});
+
+async function doTest(row: MeterPoint) {
+  testing.value = row.id;
+  try {
+    const res = await adminApi.testMeter(row.id);
+    testResult.value = {
+      title: `${row.code} ${row.name}`,
+      ok: res.ok,
+      detail: res.detail,
+      raw: res.raw || ''
+    };
+    if (res.ok) tableRef.value?.reload();
+  } catch (e) {
+    testResult.value = { title: row.code, ok: false, detail: (e as Error).message, raw: '' };
+  } finally {
+    testing.value = null;
+    testVisible.value = true;
+  }
+}
+
+/* ── 删除 ─────────────────────────────────────────────── */
+async function doDelete(row: MeterPoint) {
+  try {
+    await ElMessageBox.confirm(
+      `删除计量点「${row.code} ${row.name}」？历史读数与用量会一并删除，且不可恢复。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
+    );
+  } catch {
+    return;
+  }
+  try {
+    await adminApi.deleteMeter(row.id);
+    ElMessage.success('已删除');
+    tableRef.value?.reload();
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  }
+}
+
+/* ── 初始化 ───────────────────────────────────────────── */
+void (async () => {
+  try {
+    gateways.value = await adminApi.getGateways();
+  } catch {
+    /* 网关取不到不影响列表展示，只是新增时选不了 */
+  }
+})();
 </script>
 
 <template>
   <div>
     <PageHeader>
       <template #actions>
-        <el-button @click="notImplemented('点位批量导入')"><el-icon><Upload /></el-icon>&nbsp;批量导入</el-button>
-        <el-button type="primary" @click="notImplemented('新增计量点位')">
-          <el-icon><Plus /></el-icon>&nbsp;新增点位
-        </el-button>
+        <el-button @click="tableRef?.reload(true)"><el-icon><Refresh /></el-icon>&nbsp;重新加载</el-button>
+        <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon>&nbsp;新增点位</el-button>
       </template>
     </PageHeader>
 
+    <el-alert
+      v-if="banner.show"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="mb-16"
+      :title="banner.text"
+    />
+
     <TablePage
+      ref="tableRef"
       :columns="columns"
       :fetch="adminApi.getMeters"
       :extra-query="extraQuery"
       keyword-placeholder="点位编号 / 名称 / 地址"
-      :op-width="150"
-      :max-height="560"
+      :op-width="180"
+      :max-height="520"
     >
       <template #filters>
-        <el-select v-model="category" placeholder="全部类别" clearable style="width: 120px">
-          <el-option label="电" value="电" />
-          <el-option label="水" value="水" />
-          <el-option label="汽" value="汽" />
-          <el-option label="气" value="气" />
+        <el-select v-model="kind" placeholder="全部类别" clearable style="width: 120px">
+          <el-option label="电" value="elec" />
+          <el-option label="水" value="water" />
+          <el-option label="汽" value="steam" />
         </el-select>
-        <el-select v-model="protocol" placeholder="全部协议" clearable style="width: 140px">
-          <el-option label="Modbus TCP" value="Modbus TCP" />
-          <el-option label="Modbus RTU" value="Modbus RTU" />
-          <el-option label="OPC UA" value="OPC UA" />
-          <el-option label="MQTT" value="MQTT" />
-          <el-option label="DL/T645" value="DL/T645" />
+        <el-select v-model="gatewayCode" placeholder="全部网关" clearable style="width: 200px">
+          <el-option v-for="g in gateways" :key="g.code" :label="`${g.code} ${g.name}`" :value="g.code" />
         </el-select>
         <el-select v-model="status" placeholder="全部状态" clearable style="width: 120px">
           <el-option label="在线" value="online" />
@@ -81,15 +314,172 @@ const STATUS_MAP: Record<string, { text: string; type: 'success' | 'danger' | 'w
       </template>
 
       <template #col-status="{ row }">
-        <el-tag :type="STATUS_MAP[row.status]?.type ?? 'info'" size="small">
+        <el-tooltip v-if="!row.lastOk && row.lastError" :content="row.lastError" placement="top">
+          <el-tag :type="STATUS_MAP[row.status]?.type ?? 'info'" size="small">
+            {{ STATUS_MAP[row.status]?.text ?? row.status }}
+          </el-tag>
+        </el-tooltip>
+        <el-tag v-else :type="STATUS_MAP[row.status]?.type ?? 'info'" size="small">
           {{ STATUS_MAP[row.status]?.text ?? row.status }}
         </el-tag>
       </template>
 
       <template #op="{ row }">
-        <el-button link type="primary" @click="notImplemented(`测试连通性 ${row.code}`)">测试</el-button>
-        <el-button link type="primary" @click="notImplemented(`编辑点位 ${row.code}`)">编辑</el-button>
+        <el-button link type="primary" :loading="testing === row.id" @click="doTest(row)">试采</el-button>
+        <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+        <el-button link type="danger" @click="doDelete(row)">删除</el-button>
       </template>
     </TablePage>
+
+    <!-- ══════ 新增 / 编辑抽屉 ══════ -->
+    <el-drawer v-model="drawer" :title="editingId ? '编辑计量点位' : '新增计量点位'" size="620px">
+      <el-form label-width="106px" label-position="right">
+        <el-divider content-position="left">基本信息</el-divider>
+        <el-form-item label="点位编号" required>
+          <el-input v-model="form.code" placeholder="如 E-A1-01，全局唯一" />
+        </el-form-item>
+        <el-form-item label="点位名称" required>
+          <el-input v-model="form.name" placeholder="如 一线生产线电表" />
+        </el-form-item>
+        <el-form-item label="能源类型">
+          <el-radio-group v-model="form.kind" @change="form.unit = UNIT_BY_KIND[form.kind]">
+            <el-radio-button value="elec">电</el-radio-button>
+            <el-radio-button value="water">水</el-radio-button>
+            <el-radio-button value="steam">汽</el-radio-button>
+          </el-radio-group>
+          <span class="form-hint">当前：{{ CATEGORY_BY_KIND[form.kind] }}</span>
+        </el-form-item>
+        <el-form-item label="归属层级">
+          <el-radio-group v-model="form.scope">
+            <el-radio-button value="line">产线级</el-radio-button>
+            <el-radio-button value="workshop">车间总表</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="form.scope === 'line'" label="所属产线">
+          <el-select v-model="form.lineCode" style="width: 100%">
+            <el-option v-for="c in ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']" :key="c" :label="c" :value="c" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="计量角色">
+          <el-select v-model="form.role" style="width: 100%">
+            <el-option label="生产线主表" value="line" />
+            <el-option label="辅机（吹瓶机 / 冰水机）" value="aux" />
+            <el-option label="车间总表" value="total" />
+          </el-select>
+        </el-form-item>
+
+        <el-divider content-position="left">采集网关</el-divider>
+        <el-form-item label="所属网关" required>
+          <el-select v-model="form.gatewayId" placeholder="选择网关" style="width: 100%">
+            <el-option
+              v-for="g in gateways"
+              :key="g.id"
+              :label="`${g.code} ${g.name}（${g.endpoint}）`"
+              :value="g.id"
+            />
+          </el-select>
+        </el-form-item>
+
+        <!-- 串口服务器：Modbus RTU over TCP -->
+        <template v-if="isModbus">
+          <el-form-item label="从站号" required>
+            <el-input-number v-model="form.slave" :min="1" :max="247" controls-position="right" />
+            <span class="form-hint">485 总线上的表地址，填错会读到「无响应」</span>
+          </el-form-item>
+          <el-form-item label="寄存器地址" required>
+            <el-input-number v-model="form.register" :min="0" :max="65535" controls-position="right" />
+            <span class="form-hint">累计值起始地址（现场当前为 1000）</span>
+          </el-form-item>
+          <el-form-item label="寄存器数量">
+            <el-input-number v-model="form.registers" :min="1" :max="10" controls-position="right" />
+            <span class="form-hint">32 位累计值填 2</span>
+          </el-form-item>
+          <el-form-item label="功能码">
+            <el-select v-model="form.funcCode" style="width: 200px">
+              <el-option :value="3" label="03 读保持寄存器（常用）" />
+              <el-option :value="4" label="04 读输入寄存器" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="32 位字序">
+            <el-radio-group v-model="form.wordOrder">
+              <el-radio-button value="big">高字在前（常用）</el-radio-button>
+              <el-radio-button value="little">低字在前</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+        </template>
+
+        <!-- HTTP API -->
+        <template v-else>
+          <el-form-item label="接口路径" required>
+            <el-input v-model="form.urlPath" placeholder="如 /api/v1/device/data" />
+          </el-form-item>
+          <el-form-item label="接口参数">
+            <el-input v-model="form.paramsText" type="textarea" :rows="2" placeholder='JSON，如 {"cid": 135}' />
+          </el-form-item>
+          <el-form-item label="累计值路径">
+            <el-input v-model="form.valuePath" placeholder="如 data.0.device_data.var1" />
+          </el-form-item>
+          <el-form-item label="采集时间路径">
+            <el-input v-model="form.timePath" placeholder="如 data.0.collect_time" />
+          </el-form-item>
+        </template>
+
+        <el-divider content-position="left">换算与限值</el-divider>
+        <el-form-item label="倍率">
+          <el-input-number v-model="form.scale" :step="0.1" :precision="4" controls-position="right" />
+          <span class="form-hint">原始值 × 倍率 = 工程量（现场电表为 0.1）</span>
+        </el-form-item>
+        <el-form-item label="单位">
+          <el-input v-model="form.unit" style="width: 140px" />
+        </el-form-item>
+        <el-form-item label="小时用量上限">
+          <el-input-number v-model="form.maxHourly" :min="0" controls-position="right" />
+          <span class="form-hint">超过即判为异常尖峰、不计入合计；留空表示不判</span>
+        </el-form-item>
+
+        <el-divider content-position="left">台账与备注</el-divider>
+        <el-form-item label="资产编号">
+          <el-input v-model="form.assetNo" placeholder="现场贴的资产标签号" />
+        </el-form-item>
+        <el-form-item label="安装日期">
+          <el-input v-model="form.installDate" placeholder="YYYY-MM-DD" />
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="form.enabled" />
+          <span class="form-hint">停用后该点位不参与采集与统计</span>
+        </el-form-item>
+        <el-form-item label="备注">
+          <el-input v-model="form.remark" type="textarea" :rows="2" />
+        </el-form-item>
+      </el-form>
+
+      <template #footer>
+        <el-button @click="drawer = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="submit">保存</el-button>
+      </template>
+    </el-drawer>
+
+    <!-- ══════ 试采结果 ══════ -->
+    <el-dialog v-model="testVisible" width="620px" :title="`试采结果 · ${testResult.title}`">
+      <el-result
+        :icon="testResult.ok ? 'success' : 'error'"
+        :title="testResult.ok ? '读取成功' : '读取失败'"
+        :sub-title="testResult.detail"
+      />
+      <el-descriptions v-if="testResult.raw" :column="1" border size="small">
+        <el-descriptions-item label="原始报文">{{ testResult.raw }}</el-descriptions-item>
+      </el-descriptions>
+      <template #footer>
+        <el-button type="primary" @click="testVisible = false">知道了</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
+
+<style scoped lang="scss">
+.form-hint {
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+</style>

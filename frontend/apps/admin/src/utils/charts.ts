@@ -98,7 +98,8 @@ export function outputKwhOption(
       {
         name: '产量',
         type: 'bar',
-        data: points.map((p) => +(p.output / outDiv).toFixed(2)),
+        // 产量未接入（null）时保留 null：柱子留空，tooltip 显示 --，不能当 0 画
+        data: points.map((p) => (p.output === null ? null : +(p.output / outDiv).toFixed(2))),
         barMaxWidth: 22,
         itemStyle: {
           borderRadius: [2, 2, 0, 0],
@@ -131,11 +132,22 @@ export function outputKwhOption(
 }
 
 /** 单位电耗横向对标（各产线） */
+/**
+ * 各线单位电耗对标
+ *
+ * ⚠ `unitKwh` 允许为 null（产量未接入时算不出来）。
+ *   这类产线**不参与排序**，只在图末以「--」列出 —— 不能按 0 排序，
+ *   否则算不出来的线会排在最前面，看起来像「能效最好的线」。
+ */
 export function unitKwhCompareOption(
-  rows: { lineCode: string; lineName: string; unitKwh: number }[],
+  rows: { lineCode: string; lineName: string; unitKwh: number | null }[],
   target: number
 ): EChartsOption {
-  const sorted = [...rows].sort((a, b) => a.unitKwh - b.unitKwh);
+  const sorted = [...rows].sort((a, b) => {
+    if (a.unitKwh === null) return 1;
+    if (b.unitKwh === null) return -1;
+    return a.unitKwh - b.unitKwh;
+  });
 
   return {
     animationDuration: 520,
@@ -143,7 +155,10 @@ export function unitKwhCompareOption(
       ...tip(),
       trigger: 'item',
       formatter: (p: unknown) => {
-        const d = p as { name: string; value: number };
+        const d = p as { name: string; value: number | null };
+        if (d.value === null || d.value === undefined) {
+          return `<b style="color:${C.text}">${d.name}</b><br>单位电耗：<b>--</b>（产量未接入，算不出来）`;
+        }
         const diff = ((d.value - target) / target) * 100;
         return (
           `<b style="color:${C.text}">${d.name}</b><br>` +
@@ -162,13 +177,23 @@ export function unitKwhCompareOption(
       {
         type: 'bar',
         barMaxWidth: 16,
-        data: sorted.map((r) => ({
-          value: +r.unitKwh.toFixed(2),
-          itemStyle: {
-            borderRadius: [0, 2, 2, 0],
-            color: r.unitKwh > target ? C.red : C.green
-          }
-        })),
+        data: sorted.map((r) =>
+          r.unitKwh === null
+            ? {
+                // 产量未接入：给 null（柱不画），标签单独显示「--」
+                value: null,
+                name: r.lineName,
+                label: { show: true, formatter: '--', color: C.slate }
+              }
+            : {
+                value: +r.unitKwh.toFixed(2),
+                name: r.lineName,
+                itemStyle: {
+                  borderRadius: [0, 2, 2, 0],
+                  color: r.unitKwh > target ? C.red : C.green
+                }
+              }
+        ),
         label: {
           show: true,
           position: 'right',

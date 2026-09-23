@@ -20,9 +20,14 @@ function rowClass(l: LineData) {
   return l.status === 'slow' ? 'is-warn' : l.status === 'stopped' ? 'is-idle' : '';
 }
 
-function display(l: LineData) {
+/**
+ * 当前小时产量文本：进行中先看整点预期，否则看实绩。
+ * 产量未接入（null）时显示 `--` —— 不能写 0（0 会被读成「确实没产出」）。
+ */
+function displayText(l: LineData) {
   const s = l.hours[props.currentHour] ?? {};
-  return s.partial ? (s.projected ?? 0) : (s.output ?? 0);
+  const v = s.partial ? (s.projected ?? s.output ?? null) : (s.output ?? null);
+  return v === null || v === undefined ? '--' : `${(v / 1000).toFixed(1)}`;
 }
 
 function unitLabel(l: LineData) {
@@ -60,7 +65,7 @@ void pad2;
       </div>
       <div class="line-row__vals">
         <span class="v">
-          <b>{{ (display(l) / 1000).toFixed(1) }}</b>
+          <b>{{ displayText(l) }}</b>
           <span>{{ unitLabel(l) }}</span>
         </span>
         <span class="v">

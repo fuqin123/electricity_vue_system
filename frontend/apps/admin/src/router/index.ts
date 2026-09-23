@@ -45,6 +45,12 @@ const routes: RouteRecordRaw[] = [
 
       /* ── 能源计量 ── */
       {
+        path: 'energy/usage',
+        name: 'energy-usage',
+        component: () => import('@/views/energy/UsageQueryView.vue'),
+        meta: { title: '用量查询' },
+      },
+      {
         path: 'energy/electric',
         name: 'energy-electric',
         component: () => import('@/views/energy/ElectricView.vue'),

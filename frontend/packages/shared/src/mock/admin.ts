@@ -182,38 +182,200 @@ export function mockLines(): LineMaster[] {
 }
 
 export function mockMeters(): MeterPoint[] {
+  /* 镜像现场登记表（`backend/config/settings.yaml`）。
+     默认 mode='api' 时走真实接口，本函数只在后端不可达时兜底 ——
+     内容仍与现场一致，避免离线演示时看到另一套设备名而误判。 */
   const out: MeterPoint[] = [];
   let id = 1;
-  linesConfig.forEach((l, i) => {
+
+  type Def = [string, string, MeterPoint['kind'], string, string, number | null, number | null, number];
+  const defs: Def[] = [
+    // [网关编号, 名称, kind, 产线, 单位, 从站号, 寄存器, 倍率]
+    ['GW-PDB-1', '三线生产线1电表', 'elec', 'A3', 'kWh', 13, 1000, 0.1],
+    ['GW-PDB-1', '三线生产线2电表', 'elec', 'A3', 'kWh', 15, 1000, 0.1],
+    ['GW-PDB-1', '三线吹瓶机电表', 'elec', 'A3', 'kWh', 6, 1000, 0.1],
+    ['GW-PDB-1', '五线生产线电表', 'elec', 'A5', 'kWh', 8, 1000, 0.1],
+    ['GW-PDB-1', '五线吹瓶机电表', 'elec', 'A5', 'kWh', 7, 1000, 0.1],
+    ['GW-PDB-3', '二线生产线电表', 'elec', 'A2', 'kWh', 7, 1000, 0.1],
+    ['GW-PDB-3', '二线吹瓶机电表', 'elec', 'A2', 'kWh', 5, 1000, 0.1],
+    ['GW-PDB-4', '一线生产线电表', 'elec', 'A1', 'kWh', 8, 1000, 0.1],
+    ['GW-PDB-4', '一线吹瓶机电表', 'elec', 'A1', 'kWh', 6, 1000, 0.1],
+    ['GW-TASHI', '四线生产线电表', 'elec', 'A4', 'kWh', 11, 1000, 0.1],
+    ['GW-TASHI', '五线冰水机电表', 'elec', 'A5', 'kWh', 14, 1000, 0.1],
+    ['GW-TASHI', '六线生产线电表', 'elec', 'A6', 'kWh', 10, 1000, 0.1],
+    ['GW-TASHI', '六线吹瓶机电表', 'elec', 'A6', 'kWh', 7, 1000, 0.1]
+  ];
+
+  const gwId: Record<string, number> = { 'GW-PDB-1': 1, 'GW-PDB-3': 2, 'GW-PDB-4': 3, 'GW-TASHI': 4, 'GW-API-DJ': 5 };
+  const gwHost: Record<string, string> = {
+    'GW-PDB-1': '10.112.66.41:8891',
+    'GW-PDB-3': '10.112.66.41:8893',
+    'GW-PDB-4': '10.112.66.41:8894',
+    'GW-TASHI': '10.112.66.133:8890',
+    'GW-API-DJ': 'http://47.111.74.100:8980'
+  };
+
+  defs.forEach((d) => {
+    const [gw, name, kind, lineCode, unit, slave, register, scale] = d;
+    const n = id++;
+    const isAux = name.indexOf('吹瓶') >= 0 || name.indexOf('冰水') >= 0;
     out.push({
-      id: id++,
-      code: `EM-${l.id}-${1001 + i}`,
-      name: `${l.name} 配电柜电表`,
+      id: n,
+      code: 'E-' + lineCode + '-' + String(n).padStart(2, '0'),
+      name,
       category: '电',
-      lineCode: l.id,
-      protocol: i % 2 === 0 ? 'Modbus TCP' : 'DL/T645',
-      address: `10.20.31.${11 + Math.floor(i / 2)}:502`,
-      unit: 'kWh',
-      factor: 1,
-      status: i === 4 ? 'fault' : 'online',
-      lastAt: priorTime(i === 4 ? 96 : 2 + i)
+      lineCode,
+      protocol: 'Modbus RTU over TCP',
+      address: gwHost[gw] + ' / 从站 ' + slave + ' / 寄存器 ' + register + 'x2',
+      unit,
+      factor: scale,
+      status: 'online',
+      lastAt: priorTime(1 + (n % 3)),
+      kind,
+      scope: 'line',
+      role: isAux ? 'aux' : 'line',
+      gatewayId: gwId[gw],
+      gatewayCode: gw,
+      slave,
+      register,
+      registers: 2,
+      funcCode: 3,
+      wordOrder: 'big',
+      urlPath: '',
+      params: {},
+      valuePath: '',
+      timePath: '',
+      maxHourly: 500,
+      enabled: true,
+      source: 'config',
+      remark: '',
+      assetNo: '',
+      installDate: '',
+      lastValue: 6312639.3,
+      lastOk: true,
+      lastError: '',
+      todayUsage: 120 + n * 7,
+      todayHours: 15
     });
   });
-  out.push(
-    { id: id++, code: 'WM-TOTAL-01', name: '车间进水总表', category: '水', lineCode: '—', protocol: 'Modbus TCP', address: '10.20.31.21:502', unit: 't', factor: 0.1, status: 'online', lastAt: priorTime(3) },
-    { id: id++, code: 'SM-TOTAL-01', name: '车间蒸汽总表', category: '汽', lineCode: '—', protocol: 'Modbus TCP', address: '10.20.31.22:502', unit: 't', factor: 0.01, status: 'online', lastAt: priorTime(3) },
-    { id: id++, code: 'AM-TOTAL-01', name: '压缩空气总表', category: '气', lineCode: '—', protocol: 'Modbus RTU', address: 'COM3 / 9600-8-N-1', unit: 'm³', factor: 0.1, status: 'offline', lastAt: priorTime(2880) }
-  );
+
+  // 车间总表：蒸汽已接入（HTTP API）；水表接口地址待现场提供，故停用
+  const totalBase = {
+    registers: 2,
+    funcCode: 3,
+    wordOrder: 'big' as const,
+    gatewayId: 5,
+    gatewayCode: 'GW-API-DJ',
+    source: 'config' as const,
+    assetNo: '',
+    installDate: ''
+  };
+
+  out.push({
+    ...totalBase,
+    id: id++,
+    code: 'W-WS-01',
+    name: '车间进水总表',
+    category: '水',
+    lineCode: '—',
+    protocol: 'HTTP API',
+    address: '待现场提供接口地址',
+    unit: 't',
+    factor: 1,
+    status: 'offline',
+    lastAt: '',
+    kind: 'water',
+    scope: 'workshop',
+    role: 'total',
+    slave: null,
+    register: null,
+    urlPath: '',
+    params: {},
+    valuePath: '',
+    timePath: '',
+    maxHourly: 200,
+    enabled: false,
+    remark: '接口地址 / cid / token 待现场提供',
+    lastValue: null,
+    lastOk: false,
+    lastError: '',
+    todayUsage: null,
+    todayHours: 0
+  });
+
+  out.push({
+    ...totalBase,
+    id: id++,
+    code: 'S-WS-01',
+    name: '一期蒸汽总表 1#',
+    category: '汽',
+    lineCode: '—',
+    protocol: 'HTTP API',
+    address: 'http://47.111.74.100:8980',
+    unit: 't',
+    factor: 1,
+    status: 'online',
+    lastAt: priorTime(1),
+    kind: 'steam',
+    scope: 'workshop',
+    role: 'total',
+    slave: null,
+    register: null,
+    urlPath: '/api/v1/device/data',
+    params: { cid: 135 },
+    valuePath: 'data.0.device_data.var1',
+    timePath: 'data.0.collect_time',
+    maxHourly: 50,
+    enabled: true,
+    remark: '',
+    lastValue: 12345.678,
+    lastOk: true,
+    lastError: '',
+    todayUsage: 3.42,
+    todayHours: 15
+  });
+
   return out;
 }
 
 export function mockGateways(): Gateway[] {
+  /* 同样镜像现场登记表；口径见 mockMeters 顶部注释 */
   return [
-    { id: 1, name: '灌装一车间网关', ip: '10.20.31.11', port: 502, protocol: 'Modbus TCP', pointCount: 24, status: 'online', lastHeartbeat: priorTime(1) },
-    { id: 2, name: '灌装二车间网关', ip: '10.20.31.12', port: 502, protocol: 'Modbus TCP', pointCount: 22, status: 'online', lastHeartbeat: priorTime(1) },
-    { id: 3, name: '公用工程网关', ip: '10.20.31.13', port: 502, protocol: 'Modbus TCP', pointCount: 12, status: 'online', lastHeartbeat: priorTime(2) },
-    { id: 4, name: '空压站网关', ip: '10.20.31.14', port: 4840, protocol: 'OPC UA', pointCount: 8, status: 'offline', lastHeartbeat: priorTime(1440) },
-    { id: 5, name: '视频转流网关', ip: '10.20.31.200', port: 8080, protocol: 'HTTP-FLV', pointCount: 6, status: 'online', lastHeartbeat: priorTime(1) }
+    {
+      id: 1, code: 'GW-PDB-1', name: '一期配电房串口服务器1口',
+      kind: 'modbus_rtu_tcp', protocol: 'Modbus RTU over TCP',
+      ip: '10.112.66.41', port: 8891, baseUrl: '', endpoint: '10.112.66.41:8891',
+      pointCount: 5, status: 'online', lastHeartbeat: priorTime(1),
+      timeoutMs: 1500, intervalSeconds: 60, enabled: true, source: 'config', remark: ''
+    },
+    {
+      id: 2, code: 'GW-PDB-3', name: '一期配电房串口服务器3口',
+      kind: 'modbus_rtu_tcp', protocol: 'Modbus RTU over TCP',
+      ip: '10.112.66.41', port: 8893, baseUrl: '', endpoint: '10.112.66.41:8893',
+      pointCount: 2, status: 'online', lastHeartbeat: priorTime(1),
+      timeoutMs: 1500, intervalSeconds: 60, enabled: true, source: 'config', remark: ''
+    },
+    {
+      id: 3, code: 'GW-PDB-4', name: '一期配电房串口服务器4口',
+      kind: 'modbus_rtu_tcp', protocol: 'Modbus RTU over TCP',
+      ip: '10.112.66.41', port: 8894, baseUrl: '', endpoint: '10.112.66.41:8894',
+      pointCount: 2, status: 'online', lastHeartbeat: priorTime(1),
+      timeoutMs: 1500, intervalSeconds: 60, enabled: true, source: 'config', remark: ''
+    },
+    {
+      id: 4, code: 'GW-TASHI', name: '塔式机房串口服务器',
+      kind: 'modbus_rtu_tcp', protocol: 'Modbus RTU over TCP',
+      ip: '10.112.66.133', port: 8890, baseUrl: '', endpoint: '10.112.66.133:8890',
+      pointCount: 4, status: 'online', lastHeartbeat: priorTime(1),
+      timeoutMs: 1500, intervalSeconds: 60, enabled: true, source: 'config', remark: ''
+    },
+    {
+      id: 5, code: 'GW-API-DJ', name: '顶津能源平台',
+      kind: 'http_api', protocol: 'HTTP API',
+      ip: '', port: null, baseUrl: 'http://47.111.74.100:8980', endpoint: 'http://47.111.74.100:8980',
+      pointCount: 2, status: 'online', lastHeartbeat: priorTime(2),
+      timeoutMs: 3000, intervalSeconds: 60, enabled: true, source: 'config', remark: '蒸汽总表'
+    }
   ];
 }
 
@@ -369,7 +531,8 @@ export function mockAdminOverview(now: Date = new Date()): AdminOverview {
     },
     hourly: ws.hours.map((h) => ({
       label: `${pad2(h.hour)}:00`,
-      output: h.output ?? 0,
+      // 产量未接入时 output 为 null（显示 --），不是 0
+      output: h.output,
       kwh: h.kwh ?? 0,
       unitKwh: h.unitKwh
     })),
@@ -378,7 +541,8 @@ export function mockAdminOverview(now: Date = new Date()): AdminOverview {
     lineUnitKwh: ws.lines.map((l) => ({
       lineCode: l.id,
       lineName: l.name,
-      unitKwh: l.today.unitKwh ?? 0,
+      // unitKwh 为 null 时对标图单独显示「--」，不能按 0 参与排序
+      unitKwh: l.today.unitKwh,
       output: l.today.output
     })),
     latestAlarms: alarms.slice(0, 6).map((a) => ({

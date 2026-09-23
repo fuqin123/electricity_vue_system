@@ -17,8 +17,9 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/line/:lineId',
     name: 'line',
+    // 不用 props: true —— LineView 直接从 route.params 读，
+    // 否则 lineId 会以普通 attribute 落到根元素上并触发 Vue 警告
     component: () => import('@/views/LineView.vue'),
-    props: true,
     meta: { title: '单线详情' }
   },
   { path: '/:pathMatch(.*)*', redirect: '/overview' }

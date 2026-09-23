@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from decimal import Decimal
 
@@ -23,6 +24,34 @@ from pymodbus.framer import FramerType
 from .base import BaseCollector, CollectResult
 
 logger = logging.getLogger(__name__)
+
+#: 「从站号」这个参数在 pymodbus 各版本里改过名，缓存一下探测结果
+_UNIT_PARAM: str | None = None
+
+
+def unit_kwarg(client) -> str:
+    """探测当前 pymodbus 用哪个关键字传从站号。
+
+    pymodbus 的历史包袱（踩过一次，现场表现为**全部电表读取失败**）：
+      · 3.7 及以前  → `read_holding_registers(..., slave=N)`
+      · 3.8 及以后  → 改名为 `device_id=N`（`slave` 保留为兼容别名）
+    代码里写死任一名字，都会在另一种版本上直接抛 TypeError：
+
+        read_holding_registers() got an unexpected keyword argument 'device_id'
+
+    这个报错看起来像「协议不兼容」，实际只是关键字改名，但会让 13 块表全部读不到，
+    现场第一反应会去查 485 接线和从站号 —— 白跑一趟。
+    所以这里按**实际签名**决定用哪个名字，而不是绑定某个版本。
+    """
+    global _UNIT_PARAM
+    if _UNIT_PARAM is None:
+        try:
+            params = inspect.signature(client.read_holding_registers).parameters
+            _UNIT_PARAM = "device_id" if "device_id" in params else "slave"
+        except (TypeError, ValueError):  # pragma: no cover - 极端情况下退回旧名字
+            _UNIT_PARAM = "slave"
+        logger.debug("pymodbus 从站号参数名：%s", _UNIT_PARAM)
+    return _UNIT_PARAM
 
 
 class ModbusRtuOverTcpCollector(BaseCollector):
@@ -74,7 +103,9 @@ class ModbusRtuOverTcpCollector(BaseCollector):
         count = int(meter.registers or 2)
         try:
             rr = self.client.read_holding_registers(
-                address=int(meter.register), count=count, slave=int(meter.slave)
+                address=int(meter.register),
+                count=count,
+                **{unit_kwarg(self.client): int(meter.slave)},
             )
         except Exception as exc:  # noqa: BLE001
             return CollectResult(ok=False, error=f"读取异常：{type(exc).__name__} {exc}")
