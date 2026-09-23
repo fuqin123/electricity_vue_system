@@ -1,4 +1,7 @@
-"""计划任务静默入口 —— 给 `pythonw.exe` 用（不弹控制台窗口）。
+r"""计划任务静默入口 —— 给 `pythonw.exe` 用（不弹控制台窗口）。
+
+> 本模块文档串刻意用原始字符串（前缀 r）：下文出现 Windows 路径，
+> 普通字符串会把 `\p` / `\S` 当转义序列，每次编译都甩一条 `SyntaxWarning`。
 
 ## 为什么不直接用 `pythonw.exe manage.py collect`
 
@@ -18,8 +21,12 @@ Windows 计划任务（不弹窗）：
     schtasks /Create /TN EEP-Collect /SC MINUTE /MO 5 /F ^
       /TR "\"<venv>\\Scripts\\pythonw.exe\" \"<仓库>\\backend\\scripts\\collect_task.py\""
 
-> ⚠ 一定用**装了依赖的那个解释器的 pythonw.exe**（venv 里的），
->   不要用系统 `D:\\python3.13.10\\pythonw.exe` —— 那个环境里没有 Django / PyMySQL / pymodbus。
+> ⚠ `pythonw.exe` 必须来自**装了本项目依赖的那个解释器**。
+>   本机当前用的是 `D:\python3.13.10\pythonw.exe`（实测 Django 6.0.7 + pymodbus 3.15.0，
+>   采集 14/14 点位正常）；若指向一个没装依赖的解释器，日志里只有一行表头加一段
+>   `ModuleNotFoundError` 回溯 —— 看着像「任务在跑」，实际一条数据都没采到。
+>   这也是入口脚本把首行日志写在 `import Django` **之前**的原因：先留下痕迹，再谈干活。
+>   生产环境建议按 `requirements.txt` 单独建 venv，再把任务指向它。
 
 手工验证（可见输出，等价于计划任务那一轮）：
 
