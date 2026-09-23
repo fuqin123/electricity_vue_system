@@ -24,7 +24,7 @@ import {
   type TrendDim,
   type WorkshopData
 } from '@eep/shared';
-import { overviewLinesCompareOption, overviewTrendOption, todayChartOption } from '@/charts';
+import { overviewLinesCompareOption, overviewTrendOption, OVERVIEW_TREND, todayChartOption } from '@/charts';
 import { useEnergyStore } from '@/stores/energy';
 import type { KpiCard } from '@/utils/types';
 import TopBar from '@/components/TopBar.vue';
@@ -49,11 +49,16 @@ const prodOn = dataConfig.productionEnabled;
 const ws = computed<WorkshopData | null>(() => store.workshop);
 
 const DIMS: TrendDim[] = ['年', '月', '日', '时'];
+/**
+ * 说明里必须写清「每柱代表多长时段」：维度 tab 只有「年/月/日/时」一个字，
+ * 看的人分不清这张图画的是每天一根还是每小时一根（v1.2.3 反馈）。
+ * X 轴一律**从左向右时间递增**（最右 = 本期），与后端 daily30/monthly12/yearly5 同序。
+ */
 const DIM_NOTE: Record<TrendDim, string> = {
-  年: '近 5 年 · 车间合计',
-  月: '近 12 个月 · 车间合计（当月为进行中）',
-  日: '近 30 日 · 车间合计（今日为进行中）',
-  时: '今日 24 小时 · 车间合计（虚线柱为计划）'
+  年: '每柱＝1 年 · 近 5 年 · 车间合计',
+  月: '每柱＝1 个月 · 近 12 个月 · 车间合计（当月为进行中）',
+  日: '每柱＝1 天 · 近 30 天 · 车间合计（今日为进行中）',
+  时: '每柱＝1 小时 · 今日 24 小时 · 车间合计（虚线柱为计划）'
 };
 
 /* ── 综合单位电耗仪表 ─────────────────────────────────── */
@@ -69,6 +74,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   if (!w) return [];
   const curH = w.currentHour;
   const h = w.hours[curH];
+  /** yearly5 按时间正序，末项是今年、倒数第二项是去年（同比只用这一种取法） */
   const prevYear = w.yearly5.length > 1 ? w.yearly5[w.yearly5.length - 2] : null;
   const hPlan = Math.round(w.lines.reduce((a, l) => a + l.rated, 0) * PLAN_RATE * PROFILE[curH]);
   /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
@@ -120,6 +126,14 @@ const kpiCards = computed<KpiCard[]>(() => {
 });
 
 /* ── 图表 option ──────────────────────────────────────── */
+/** 图例单位与出数除数同源（见 charts/index.ts 的 OVERVIEW_TREND） */
+const trendUnits = computed(() => OVERVIEW_TREND[dim.value]);
+/** 六线对比面板的说明必须跟着图表的自适应口径走，否则文字会指着一张画了别的东西的图 */
+const compareNote = computed(() =>
+  prodOn
+    ? '条长＝今日产量 · 右侧为单位电耗'
+    : '条长＝今日用电量 · 右侧为占车间合计（产量未接入，算不出单位电耗）'
+);
 const trendOption = computed(() => (ws.value ? overviewTrendOption(ws.value, dim.value) : null));
 const compareOption = computed(() => (ws.value ? overviewLinesCompareOption(ws.value) : null));
 const todayOption = computed(() =>
@@ -270,15 +284,15 @@ const todayNote = computed(() => {
             </div>
           </template>
           <div class="legend">
-            <span class="legend__i legend__i--bar" /><span>产量（万瓶）</span>
-            <span class="legend__i legend__i--line" /><span>用电量（万kWh）</span>
+            <span class="legend__i legend__i--bar" /><span>产量（{{ trendUnits.outUnit }}）</span>
+            <span class="legend__i legend__i--line" /><span>用电量（{{ trendUnits.kwhUnit }}）</span>
           </div>
           <ChartBox :option="trendOption" grow />
         </PanelBox>
 
         <PanelBox
-          title="六条产线产量与单位电耗对比"
-          note="条长＝今日产量 · 右侧为单位电耗"
+          :title="prodOn ? '六条产线产量与单位电耗对比' : '六条产线用电量对比'"
+          :note="compareNote"
           height="var(--c3)"
           body-class="panel__body--col"
         >

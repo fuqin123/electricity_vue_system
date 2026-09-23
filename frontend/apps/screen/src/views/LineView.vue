@@ -28,7 +28,7 @@ import {
   type TrendDim,
   type WorkshopData
 } from '@eep/shared';
-import { lineHeatmapOption, lineTrendOption, todayChartOption } from '@/charts';
+import { lineHeatmapOption, LINE_TREND, lineTrendOption, todayChartOption } from '@/charts';
 import { useEnergyStore } from '@/stores/energy';
 import type { KpiCard } from '@/utils/types';
 import TopBar from '@/components/TopBar.vue';
@@ -63,28 +63,30 @@ const line = computed<LineData | null>(() => store.currentLine);
 
 /* ── 趋势维度（与总览同口径）───────────────────────────── */
 const DIMS: TrendDim[] = ['年', '月', '日', '时'];
+/**
+ * 与总览同一套写法：说明里写清「每柱代表多长时段」，
+ * 否则「日」和「时」两个维度在观感上分不出来（v1.2.3 反馈）。
+ * X 轴一律从左向右时间递增（最右 = 本期）。
+ */
 const DIM_NOTE: Record<TrendDim, string> = {
-  年: '近 5 年 · 本线',
-  月: '近 12 个月 · 本线（当月为进行中）',
-  日: '近 30 日 · 本线（今日为进行中）',
-  时: '今日 24 小时 · 本线'
+  年: '每柱＝1 年 · 近 5 年 · 本线',
+  月: '每柱＝1 个月 · 近 12 个月 · 本线（当月为进行中）',
+  日: '每柱＝1 天 · 近 30 天 · 本线（今日为进行中）',
+  时: '每柱＝1 小时 · 今日 24 小时 · 本线'
 };
 
 /** 单位电耗是否算得出来 —— 决定趋势第二条曲线是「单位电耗」还是「用电量」 */
 const hasUnitKwh = computed(() => line.value?.hours.some((h) => h.unitKwh !== null) ?? false);
 
-/** 各维度的显示单位（单线量级比车间小，单位与总览不同） */
-const TREND_UNITS: Record<TrendDim, { out: string; kwh: string }> = {
-  年: { out: '亿瓶', kwh: '万kWh' },
-  月: { out: '万瓶', kwh: '万kWh' },
-  日: { out: '万瓶', kwh: 'kWh' },
-  时: { out: '千瓶', kwh: 'kWh' }
-};
+/**
+ * 图例单位直接取 charts/index.ts 的 LINE_TREND —— 出数除数与单位文案同源，
+ * 之前这里另写一份，改一处忘一处就会「图例说万瓶、tooltip 说亿瓶」。
+ */
 const trendLegend = computed(() => {
-  const u = TREND_UNITS[dim.value];
+  const u = LINE_TREND[dim.value];
   return {
-    out: `产量（${u.out}）`,
-    second: hasUnitKwh.value ? '单位电耗（kWh/千瓶）' : `用电量（${u.kwh}）`
+    out: `产量（${u.outUnit}）`,
+    second: hasUnitKwh.value ? '单位电耗（kWh/千瓶）' : `用电量（${u.kwhUnit}）`
   };
 });
 

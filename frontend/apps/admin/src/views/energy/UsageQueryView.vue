@@ -127,9 +127,10 @@ const chartOption = computed(() => {
   const wsKey = d.series.find((s) => s.key === 'workshop') ?? d.series[0];
   const points: TrendPoint[] = d.labels.map((label, i) => ({
     label,
-    // 产量未接入，这里恒为 0；图上不画产量柱（见下面 series 只取用电）
-    output: 0,
-    kwh: wsKey.values[i] ?? 0
+    // 产量未接入 → null（图上不画柱、tooltip 显示 --）。写 0 会被读成「这段时间没生产」（ADR-013）。
+    output: null,
+    // 缺数一律留 null：补 0 会让趋势图在断采的地方画出一条「归零又弹回」的假曲线
+    kwh: wsKey.values[i] ?? null
   }));
   return outputKwhOption(points, { labelInterval: d.labels.length > 24 ? 2 : 'auto' });
 });

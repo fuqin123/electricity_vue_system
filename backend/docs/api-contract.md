@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.2.1 ｜ 最后更新：2026-09-22
+> 版本：v1.2.3 ｜ 最后更新：2026-09-23
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -47,6 +47,27 @@
    `types.ts` 中 `UtilityMetric.today / yesterday` 与 `LineData.today.kwh` 等字段类型
    已放宽为 `number | null`，前端按 `--` 显示，不把「还没采到」显示成「用了 0」。
    同理 `HourPoint.kwh` 已经是 `number | null`。
+
+---
+
+## 〇·补二、v1.2.3 趋势序列约定（顺序 + 空值）★ 前端渲染必读
+
+适用字段：`daily30` / `monthly12` / `yearly5`（`/api/energy/overview`、`/api/energy/line/{code}`、
+`/api/admin/overview` 三处同构），元素类型为 `TrendPoint`。
+
+1. **顺序一律时间正序**：数组第 0 项最旧、**末项是当前周期**（今天 / 当月 / 今年）。
+   X 轴直接按数组顺序铺开即可，**前端不要再 `reverse()`** —— 顺序由接口层定死（ADR-018）。
+   需要「上一期」做同比时按下标取（如 `yearly5[length-2]` = 去年）。
+2. **`kwh` 可空**：`TrendPoint.kwh: number | null`。该周期**没有任何可信小时差值**时为 `null`
+   （不是 0），前端渲染成留空 / `--`。
+   ⚠ 类型曾误声明为 `number`，导致 `x.kwh.toFixed()` 通过编译却在运行时抛异常，
+   **整张趋势图不渲染**；把 `null` 兜成 0 又会画出「用量暴跌到零」的假曲线（B-513）。
+   折线必须 `connectNulls: false`，不许拿两端凑中间没采集的那段。
+3. **`output` 可空**：产量未接入期间恒为 `null`（见上文「产量口径」），接入后自动恢复数值口径。
+4. **显示单位由前端按维度决定，且必须与图例同源**：
+   后端只给原始 `kWh` / `瓶`，缩放与单位文案在
+   `apps/screen/src/charts/index.ts` 的 `OVERVIEW_TREND` / `LINE_TREND` 里成对定义，
+   图表与图例都读这一份（B-514 的教训：除数写在图表、单位写在模板，两边会漂）。
 
 ---
 

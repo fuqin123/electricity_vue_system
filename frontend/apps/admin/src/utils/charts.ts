@@ -55,6 +55,21 @@ function valAxis(name = '') {
   };
 }
 
+/**
+ * 缩放 + 保留小数位，缺数（null）原样传成 null。
+ * 与大屏同一条规矩：null 参加除法会被当成 0，图上就成了「这个周期没用电」（B-513）；
+ * 非零值被舍成 0 时自动加精度，避免「23 kWh 在万kWh 轴上显示成 0」。
+ */
+function scale(v: number | null | undefined, div: number, digits: number): number | null {
+  if (v === null || v === undefined || Number.isNaN(v)) return null;
+  if (v === 0) return 0;
+  for (let d = digits; d <= digits + 6; d++) {
+    const s = +(v / div).toFixed(d);
+    if (s !== 0) return s;
+  }
+  return +(v / div).toFixed(digits + 6);
+}
+
 /** 产量柱 + 用电折线（双轴） */
 export function outputKwhOption(
   points: TrendPoint[],
@@ -99,7 +114,7 @@ export function outputKwhOption(
         name: '产量',
         type: 'bar',
         // 产量未接入（null）时保留 null：柱子留空，tooltip 显示 --，不能当 0 画
-        data: points.map((p) => (p.output === null ? null : +(p.output / outDiv).toFixed(2))),
+        data: points.map((p) => scale(p.output, outDiv, 2)),
         barMaxWidth: 22,
         itemStyle: {
           borderRadius: [2, 2, 0, 0],
@@ -120,7 +135,9 @@ export function outputKwhOption(
         name: '用电量',
         type: 'line',
         yAxisIndex: 1,
-        data: points.map((p) => +(p.kwh / kwhDiv).toFixed(3)),
+        data: points.map((p) => scale(p.kwh, kwhDiv, 3)),
+        // 缺数周期之间不连线（拿两端凑中间那段没采集的时段）
+        connectNulls: false,
         smooth: true,
         symbol: 'circle',
         symbolSize: 5,

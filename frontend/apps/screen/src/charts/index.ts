@@ -16,6 +16,7 @@ import {
   type HourPoint,
   type LineData,
   type TrendDim,
+  type TrendPoint,
   type UtilityMetric,
   type WorkshopData
 } from '@eep/shared';
@@ -93,38 +94,88 @@ const grad = (
 ): echarts.graphic.LinearGradient =>
   new echarts.graphic.LinearGradient(x1, y1, x2, y2, stops.map(([offset, color]) => ({ offset, color })));
 
+/**
+ * 缩放 + 保留小数位，**缺数（null）原样传成 null**。
+ *
+ * ⚠ 两种写法都会出错，而且错得很安静（B-513）：
+ *   · `(v / div).toFixed(n)` —— v 为 null 时 JS 把 null 当 0 参加运算，
+ *     得到 0，图上就是一根「这个周期没用电」的零高度柱，正是铁律禁止的补 0；
+ *   · `v.toFixed(n)` —— v 为 null 时抛 TypeError，
+ *     整个 computed 崩掉，**一整张趋势图直接不渲染**。
+ * 传 null 给 ECharts 才是正确表达：柱子留空、折线断开。
+ *
+ * 非零值被舍成 0 时自动加精度（同 B-101 的教训）：
+ * 单线一年只用 23 kWh，在「万kWh」轴上按 2 位小数会显示成 0，
+ * 读起来就是「这一年没用电」—— 量级正常、没有报错的假数字最危险。
+ */
+function scale(v: number | null | undefined, div: number, digits: number): number | null {
+  if (v === null || v === undefined || Number.isNaN(v)) return null;
+  if (v === 0) return 0;
+  for (let d = digits; d <= digits + 6; d++) {
+    const s = +(v / div).toFixed(d);
+    if (s !== 0) return s;
+  }
+  return +(v / div).toFixed(digits + 6);
+}
+
+/**
+ * 趋势图各维度的取数与显示单位。
+ *
+ * ⚠ 除数与单位文案必须同源：之前图例在模板里写死「万瓶 / 万kWh」，
+ *   而「年」维度实际按亿出数、「时」维度按千出数 —— 图例和 tooltip 互相打脸（B-514）。
+ *   模板一律读本表，不要再各写一套。
+ */
+export interface TrendUnits {
+  outDiv: number;
+  outUnit: string;
+  kwhDiv: number;
+  kwhUnit: string;
+  digits: number;
+}
+
+/** 车间总览（量级大） */
+export const OVERVIEW_TREND: Record<TrendDim, TrendUnits> = {
+  年: { outDiv: 1e8, outUnit: '亿瓶', kwhDiv: 1e8, kwhUnit: '亿kWh', digits: 2 },
+  月: { outDiv: 1e4, outUnit: '万瓶', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 2 },
+  日: { outDiv: 1e4, outUnit: '万瓶', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 2 },
+  时: { outDiv: 1e3, outUnit: '千瓶', kwhDiv: 1e3, kwhUnit: '千kWh', digits: 2 }
+};
+
+/** 单线（量级比车间小得多，电量用 kWh / 万kWh） */
+export const LINE_TREND: Record<TrendDim, TrendUnits> = {
+  年: { outDiv: 1e8, outUnit: '亿瓶', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 2 },
+  月: { outDiv: 1e4, outUnit: '万瓶', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 2 },
+  日: { outDiv: 1e4, outUnit: '万瓶', kwhDiv: 1, kwhUnit: 'kWh', digits: 2 },
+  时: { outDiv: 1e3, outUnit: '千瓶', kwhDiv: 1, kwhUnit: 'kWh', digits: 2 }
+};
+
+/** 取某维度的数据源；「时」= 当日逐小时，其余 = 周期总计。序列一律时间正序，末项是本期。 */
+type TrendRow = { label?: string; output: number | null; kwh: number | null; unitKwh?: number | null };
+function pickRows(
+  scope: { hours: HourPoint[]; daily30: TrendPoint[]; monthly12: TrendPoint[]; yearly5: TrendPoint[] },
+  dim: TrendDim
+): TrendRow[] {
+  if (dim === '时') return scope.hours;
+  if (dim === '日') return scope.daily30;
+  if (dim === '月') return scope.monthly12;
+  return scope.yearly5;
+}
+function pickLabels(scope: { hours: HourPoint[] }, dim: TrendDim, rows: TrendRow[]): string[] {
+  if (dim === '时') return scope.hours.map((x) => `${pad2(x.hour)}:00`);
+  return rows.map((x) => x.label ?? '');
+}
+
 /* ══════════════════════════════════════════════════════════
    大屏一 · 产量与用电趋势（年 / 月 / 日 / 时）
    ══════════════════════════════════════════════════════════ */
 export function overviewTrendOption(ws: WorkshopData, dim: TrendDim): echarts.EChartsOption {
-  let labels: string[] = [];
-  let out: (number | null)[] = [];
-  let kwh: (number | null)[] = [];
-  let uq = '万瓶';
-  let eq = '万kWh';
-
-  if (dim === '时') {
-    labels = ws.hours.map((x) => `${pad2(x.hour)}:00`);
-    out = ws.hours.map((x) => (x.output === null ? null : +(x.output / 1000).toFixed(1)));
-    kwh = ws.hours.map((x) => (x.kwh === null ? null : +(x.kwh / 1000).toFixed(2)));
-    uq = '千瓶';
-    eq = '千kWh';
-  } else if (dim === '日') {
-    labels = ws.daily30.map((x) => x.label);
-    // 产量未接入（null）时保留 null：柱子留空显示「--」，不能当 0 画
-    out = ws.daily30.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(2)));
-    kwh = ws.daily30.map((x) => +(x.kwh / 10000).toFixed(3));
-  } else if (dim === '年') {
-    labels = ws.yearly5.map((x) => x.label);
-    out = ws.yearly5.map((x) => (x.output === null ? null : +(x.output / 100000000).toFixed(3)));
-    kwh = ws.yearly5.map((x) => +(x.kwh / 100000000).toFixed(4));
-    uq = '亿瓶';
-    eq = '亿kWh';
-  } else {
-    labels = ws.monthly12.map((x) => x.label);
-    out = ws.monthly12.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(1)));
-    kwh = ws.monthly12.map((x) => +(x.kwh / 10000).toFixed(2));
-  }
+  const t = OVERVIEW_TREND[dim];
+  const rows = pickRows(ws, dim);
+  const labels = pickLabels(ws, dim, rows);
+  const out = rows.map((x) => scale(x.output, t.outDiv, t.digits));
+  const kwh = rows.map((x) => scale(x.kwh, t.kwhDiv, t.digits));
+  const uq = t.outUnit;
+  const eq = t.kwhUnit;
 
   return {
     animationDuration: 600,
@@ -185,17 +236,37 @@ export function overviewTrendOption(ws: WorkshopData, dim: TrendDim): echarts.EC
 /* ══════════════════════════════════════════════════════════
    大屏一 · 六条产线产量与单位电耗对比
    ══════════════════════════════════════════════════════════ */
+/**
+ * 大屏一 · 六条产线横向对比
+ *
+ * ⚠ 与单线趋势图同一套自适应口径（ADR-013）：
+ *   · 产量已接入 → 条长＝今日产量（万瓶），右侧标单位电耗；
+ *   · 产量未接入 → 条长＝今日用电量（kWh），右侧标「用电量 · 占车间合计比例」。
+ * 原来只画产量：产量为 null 时柱子长度 0，**右侧标签也随柱子一起不渲染**，
+ * 于是 958px 宽的面板只有最左边 40px 有线名，看起来像「图没对齐边界 / 图坏了」（B-515）。
+ * 缺数时给「--」而不是把整条抹掉。
+ */
 export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOption {
-  // 产量未接入（output=null）时按 0 排序即可 —— 条形长度本身就是 0，标签会显示 --
-  const ls = [...ws.lines].sort((a, b) => (a.today.output ?? 0) - (b.today.output ?? 0));
+  const byOutput = ws.lines.some((l) => l.today.output !== null);
+  /** 条长用的原始值 */
+  const raw = (l: LineData): number | null => (byOutput ? l.today.output : l.today.kwh);
+  const ls = [...ws.lines].sort((a, b) => (raw(a) ?? 0) - (raw(b) ?? 0));
   const cats = ls.map((l) => `${l.id} 线`);
-  const data = ls.map((l) => ({
-    value: l.today.output === null ? null : +(l.today.output / 10000).toFixed(2),
-    unitKwh: l.today.unitKwh,
-    rate: l.today.rate,
-    plan: +(l.today.plan / 10000).toFixed(2),
-    color: lineColors[l.id]
-  }));
+  /** 车间合计（只累加有可信值的线），用于「占车间」 */
+  const kwhTotal = ws.lines.reduce((a, l) => a + (l.today.kwh ?? 0), 0);
+  const data = ls.map((l) => {
+    const v = raw(l);
+    return {
+      value: byOutput ? scale(v, 10000, 2) : scale(v, 1, 0),
+      unitKwh: l.today.unitKwh,
+      rate: l.today.rate,
+      plan: scale(l.today.plan, 10000, 2),
+      kwh: scale(l.today.kwh, 1, 0),
+      share: kwhTotal > 0 && l.today.kwh !== null ? +((l.today.kwh / kwhTotal) * 100).toFixed(1) : null,
+      color: lineColors[l.id]
+    };
+  });
+  type Row = (typeof data)[number];
 
   return {
     animationDuration: 600,
@@ -203,17 +274,24 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
       ...tip(),
       trigger: 'item',
       formatter: (p: unknown) => {
-        const d = (p as { data: (typeof data)[number] }).data;
+        const d = (p as { data: Row }).data;
+        const n = (v: number | null, u = '') => `${v ?? '--'}${u}`;
         return (
           `<b style="color:#fff">${(p as { name: string }).name}</b><br>` +
-          `今日产量：<b style="font-family:monospace">${d.value ?? '--'}</b> 万瓶<br>` +
-          `计划产量：<b style="font-family:monospace">${d.plan}</b> 万瓶<br>` +
-          `达成率：<b style="font-family:monospace">${d.rate}%</b><br>` +
+          (byOutput
+            ? `今日产量：<b style="font-family:monospace">${n(d.value, ' 万瓶')}</b><br>` +
+              `计划产量：<b style="font-family:monospace">${n(d.plan, ' 万瓶')}</b><br>` +
+              `达成率：<b style="font-family:monospace">${d.rate}%</b><br>`
+            : `今日用电：<b style="font-family:monospace">${n(d.kwh, ' kWh')}</b><br>` +
+              `占车间合计：<b style="font-family:monospace">${n(d.share, '%')}</b><br>` +
+              `今日产量：<b style="font-family:monospace">--</b>（产量未接入）<br>`) +
           `单位电耗：<b style="font-family:monospace">${d.unitKwh === null ? '--' : d.unitKwh.toFixed(2)}</b> kWh/千瓶`
         );
       }
     },
-    grid: gridBox({ left: 4, right: 132, top: 12, bottom: 2 }),
+    // 右侧要留够：最长标签「52.75 万瓶  ·  7.71 kWh/千瓶」约 155px，
+    // 原来只留 132px，标签会被画布右边缘裁掉（同 B-515 的「没对齐边界」）
+    grid: gridBox({ left: 4, right: 170, top: 12, bottom: 2 }),
     xAxis: valAxis('', { min: 0 }),
     yAxis: {
       ...catAxis(cats, { gap: true }),
@@ -227,7 +305,7 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
         itemStyle: {
           borderRadius: [0, 7, 7, 0],
           color: (p: unknown) => {
-            const c = (p as { data: (typeof data)[number] }).data.color;
+            const c = (p as { data: Row }).data.color;
             return grad(0, 0, 1, 0, [
               [0, hexA(c, 0.3)],
               [1, c]
@@ -239,10 +317,13 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
           position: 'right',
           distance: 8,
           formatter: (p: unknown) => {
-            const d = (p as { data: (typeof data)[number] }).data;
+            const d = (p as { data: Row }).data;
             const u = d.unitKwh === null ? '--' : d.unitKwh.toFixed(2);
             const over = d.unitKwh !== null && d.unitKwh > thresholds.unitKwhHigh;
-            return `{a|${d.value ?? '--'} 万瓶}{b|  ·  }{${over ? 'e' : 'c'}|${u}}{d| kWh/千瓶}`;
+            if (byOutput) {
+              return `{a|${d.value ?? '--'} 万瓶}{b|  ·  }{${over ? 'e' : 'c'}|${u}}{d| kWh/千瓶}`;
+            }
+            return `{a|${d.kwh ?? '--'} kWh}{b|  ·  }{c|${d.share ?? '--'}}{d| % 车间}`;
           },
           rich: {
             a: { color: '#e8ecff', fontSize: 12, fontFamily: FONT_NUM },
@@ -423,44 +504,15 @@ function unitKwhRange(uq: (number | null)[]): { min: number; max: number } {
  * 这样在产量接口接入前后，图表都始终有两条有意义的曲线。
  */
 export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsOption {
-  let labels: string[] = [];
-  let out: (number | null)[] = [];
-  let kwh: (number | null)[] = [];
-  let uq: (number | null)[] = [];
+  const t = LINE_TREND[dim];
+  const rows = pickRows(line, dim);
+  const labels = pickLabels(line, dim, rows);
+  const out = rows.map((x) => scale(x.output, t.outDiv, t.digits));
+  const kwh = rows.map((x) => scale(x.kwh, t.kwhDiv, t.digits));
+  const uq: (number | null)[] = rows.map((x) => x.unitKwh ?? null);
   /** 产量与用电量的显示单位：单线量级比车间小得多，每个维度用各自的合适单位 */
-  let outUnit = '千瓶';
-  let kwhUnit = 'kWh';
-
-  if (dim === '时') {
-    labels = line.hours.map((x) => `${pad2(x.hour)}:00`);
-    out = line.hours.map((x) => (x.output === null ? null : +(x.output / 1000).toFixed(1)));
-    kwh = line.hours.map((x) => (x.kwh === null ? null : +x.kwh.toFixed(1)));
-    uq = line.hours.map((x) => x.unitKwh);
-    outUnit = '千瓶';
-    kwhUnit = 'kWh';
-  } else if (dim === '日') {
-    labels = line.daily30.map((x) => x.label);
-    // 产量未接入（null）时保留 null：柱子留空，不能当 0 画
-    out = line.daily30.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(2)));
-    kwh = line.daily30.map((x) => +x.kwh.toFixed(0));
-    uq = line.daily30.map((x) => x.unitKwh ?? null);
-    outUnit = '万瓶';
-    kwhUnit = 'kWh';
-  } else if (dim === '月') {
-    labels = line.monthly12.map((x) => x.label);
-    out = line.monthly12.map((x) => (x.output === null ? null : +(x.output / 10000).toFixed(1)));
-    kwh = line.monthly12.map((x) => +(x.kwh / 10000).toFixed(2));
-    uq = line.monthly12.map((x) => x.unitKwh ?? null);
-    outUnit = '万瓶';
-    kwhUnit = '万kWh';
-  } else {
-    labels = line.yearly5.map((x) => x.label);
-    out = line.yearly5.map((x) => (x.output === null ? null : +(x.output / 100000000).toFixed(3)));
-    kwh = line.yearly5.map((x) => +(x.kwh / 10000).toFixed(1));
-    uq = line.yearly5.map((x) => x.unitKwh ?? null);
-    outUnit = '亿瓶';
-    kwhUnit = '万kWh';
-  }
+  const outUnit = t.outUnit;
+  const kwhUnit = t.kwhUnit;
   const hasUnitKwh = uq.some((v) => v !== null && v !== undefined);
   const target = energyModel.targetUnitKwh;
   const range = unitKwhRange(uq);
@@ -500,11 +552,12 @@ export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsO
         type: hasUnitKwh ? 'line' : 'bar',
         data: out,
         yAxisIndex: 0,
+        // 缺数的周期之间不许连线：连过去就是拿两端凑出中间那段没有采集的时段
+        connectNulls: false,
         barMaxWidth: 26,
         smooth: 0.35,
         symbol: 'circle',
         symbolSize: 5,
-        showSymbol: false,
         lineStyle: { width: 2.4, color: P.cyan, shadowColor: hexA(P.cyan, 0.55), shadowBlur: 10 },
         itemStyle: hasUnitKwh
           ? { color: P.cyan, borderColor: '#0a0d3a', borderWidth: 1.5 }
@@ -530,12 +583,23 @@ export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsO
         type: 'line',
         data: secondData,
         yAxisIndex: 1,
+        connectNulls: false,
         smooth: 0.35,
         symbol: 'circle',
-        symbolSize: 4,
-        showSymbol: false,
+        symbolSize: 5,
         lineStyle: { width: 1.8, color: P.amber, type: hasUnitKwh ? [6, 4] : 'solid' },
-        itemStyle: { color: P.amber },
+        itemStyle: { color: P.amber, borderColor: '#0a0d3a', borderWidth: 1.5 },
+        // 与总览一致：折线下方给一层渐隐阴影。
+        // 只在第二条曲线是「用电量」时画 —— 是「单位电耗」时它是虚线参考线，
+        // 再铺一层面积会把产量曲线下面的空间糊住。
+        areaStyle: hasUnitKwh
+          ? undefined
+          : {
+              color: grad(0, 0, 0, 1, [
+                [0, hexA(P.amber, 0.22)],
+                [1, hexA(P.amber, 0)]
+              ])
+            },
         markLine: hasUnitKwh
           ? {
               silent: true,

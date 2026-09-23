@@ -18,6 +18,7 @@ from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
 from apps.energy.management.commands import collect
 from apps.energy.models import Gateway, HourlyUsage, Line, Meter, PeriodSummary, Reading
 from apps.energy.services import slots
+from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
 from apps.energy.services.snapshot import build_line, build_overview
 
@@ -505,3 +506,75 @@ class CollectorUtilTests(TestCase):
         self.assertIsNone(get_path(payload, "data.5.device_data.var1"))
         self.assertIsNone(get_path(payload, "data.0.nope.var1"))
         self.assertIsNone(get_path(payload, ""))
+
+
+class TrendSeriesOrderTests(TestCase):
+    """趋势序列的时间方向与空值口径（B-512 / B-513）。
+
+    X 轴是「从左向右读时间」，所以 daily30 / monthly12 / yearly5 必须**正序**
+    （末项 = 本期）。原来是倒序：今天落在最左边，看的人要把图反过来读；
+    前端还按「末项 = 本期」取去年值（总览的 yearly5[-2]），倒序时取到的是三年前。
+
+    同时锁住空值口径：某个周期没有任何可信小时差值时 `kwh` 必须是 null。
+    接口给 0，图上就是一根「这个周期没用电」的零高度柱（铁律禁止的补 0）；
+    前端类型声明成非空后，`x.kwh.toFixed()` 还会直接抛异常把整张趋势图带走。
+    """
+
+    #: 刻意选在跨月 + 跨年的位置，顺序写反时断言一定会失败
+    NOW = datetime(2026, 3, 5, 14, 30)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = Line.objects.create(code="A1", name="一线", enabled=True)
+
+    def test_近N日正序且末项是今天(self):
+        days = S.recent_days(30, self.NOW)
+        self.assertEqual(len(days), 30)
+        self.assertEqual(days[0], self.NOW.date() - timedelta(days=29))
+        self.assertEqual(days[-1], self.NOW.date())
+        self.assertEqual(days, sorted(days))
+
+    def test_近N月正序且跨年不回绕(self):
+        months = S.recent_months(12, self.NOW)
+        self.assertEqual([d.strftime("%Y-%m") for d in months][:2], ["2025-04", "2025-05"])
+        self.assertEqual(months[-1].strftime("%Y-%m"), "2026-03")
+        self.assertEqual(months, sorted(months))
+
+    def test_近N年正序(self):
+        self.assertEqual([d.year for d in S.recent_years(5, self.NOW)], [2022, 2023, 2024, 2025, 2026])
+
+    def test_日序列正序且缺数是None不是0(self):
+        PeriodSummary.objects.create(
+            scope=PeriodSummary.SCOPE_LINE,
+            dim=PeriodSummary.DIM_DAY,
+            line=self.line,
+            period_key=self.NOW.strftime("%Y-%m-%d"),
+            start_date=self.NOW.date(),
+            end_date=self.NOW.date(),
+            kwh=Decimal("23.000"),
+            quality=PeriodSummary.Q_OK,
+            covered_hours=3,
+        )
+        series = build_line(self.line, now=self.NOW)["daily30"]
+        self.assertEqual([p["label"] for p in series][0], "02-04")
+        self.assertEqual([p["label"] for p in series][-1], "03-05")
+        self.assertEqual(series[-1]["kwh"], 23.0)
+        self.assertTrue(all(p["kwh"] is None for p in series[:-1]), "没有可信数据的周期必须是 null")
+
+    def test_月序列正序末项是当月(self):
+        months = build_line(self.line, now=self.NOW)["monthly12"]
+        self.assertEqual([p["label"] for p in months][0], "2025-04")
+        self.assertEqual([p["label"] for p in months][-1], "2026-03")
+
+    def test_车间序列同样正序(self):
+        ws = build_overview(self.NOW)["workshop"]
+        self.assertEqual(ws["yearly5"][0]["label"], "2022年")
+        self.assertEqual(ws["yearly5"][-1]["label"], "2026年")
+        self.assertEqual(ws["monthly12"][-1]["label"], "2026-03")
+
+    def test_接口返回的日序列与日期升序一致(self):
+        """端到端锁住契约：接口出来的顺序就是前端 X 轴的顺序。"""
+        today = datetime.now().date()
+        want = [(today - timedelta(days=29 - i)).strftime("%m-%d") for i in range(30)]
+        got = [p["label"] for p in Client().get("/api/energy/line/A1").json()["daily30"]]
+        self.assertEqual(got, want)

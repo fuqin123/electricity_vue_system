@@ -60,7 +60,12 @@ export interface HourPoint {
 export interface TrendPoint {
   label: string;
   output: number | null;
-  kwh: number;
+  /**
+   * 用电量。该周期没有任何可信小时差值时为 **null**（界面留空 / 显示 `--`），不是 0。
+   * ⚠ 曾经声明为 `number`，于是 `x.kwh.toFixed()` 能通过类型检查并在运行时抛异常，
+   *   把整张趋势图带走（B-513）；把 null 兜成 0 又会画出「用量暴跌」的假曲线（B-106）。
+   */
+  kwh: number | null;
   unitKwh?: number | null;
 }
 
@@ -101,10 +106,14 @@ export interface LineData {
     fullOutput: number | null;
     fullKwh: number;
   };
+  /**
+   * 近 30 日（**按日期正序**，末项 = 今日；X 轴从左向右读时间）
+   * ⚠ 字段名里的 30 是桶数上限，语义是「日维度的趋势序列」，改名会牵动接口契约。
+   */
   daily30: TrendPoint[];
-  /** 近 12 个月（与总览同口径，供线别页的「月」维度切换） */
+  /** 近 12 个月（与总览同口径，供线别页的「月」维度切换；同样正序） */
   monthly12: TrendPoint[];
-  /** 近 5 年（供线别页的「年」维度切换） */
+  /** 近 5 年（供线别页的「年」维度切换；同样正序，末项 = 今年） */
   yearly5: TrendPoint[];
   /** 近 7 日 × 24 小时产量，单位「百瓶」，未上报为 null */
   heat: (number | null)[][];

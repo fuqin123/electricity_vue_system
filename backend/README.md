@@ -67,7 +67,7 @@ backend/
 │  ├─ services/                 # collect（编排）· aggregate（小时差值）· snapshot（组装接口）· summary（周期总计）· registry（登记表同步）
 │  ├─ management/commands/      # collect · collect_loop · aggregate · summarize · ingest_production · seed_registry · purge_readings
 │  ├─ api.py · urls.py          # 能源只读接口（/api/energy/*）+ 后台配置接口（/api/admin/*）
-│  ├─ tests.py                  # 12 个单元测试（差值口径 + 字序 + JSON 取值）
+│  ├─ tests.py                  # 44 个单元测试（差值口径 + 序列顺序与空值 + 字序 + JSON 取值）
 │  └─ migrations/
 └─ docs/
    ├─ 采集说明.md                # ★ 现场取数方式、口径、部署、踩坑
@@ -109,7 +109,7 @@ python manage.py runserver 0.0.0.0:8000
 ```bash
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/api/energy/collect-summary
-python manage.py test apps.energy      # 12 个单元测试
+python manage.py test apps.energy      # 44 个单元测试
 ```
 
 ---

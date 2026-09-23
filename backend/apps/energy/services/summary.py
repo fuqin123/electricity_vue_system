@@ -276,16 +276,25 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
     return out
 
 
+# ── 趋势桶序列：一律**按时间正序**（最旧 → 最新）────────────────
+# 这三个函数同时喂给「落表」（summarize_periods，顺序无关）和
+# 「趋势图」（snapshot 的 daily30 / monthly12 / yearly5，顺序就是 X 轴）。
+# 倒序会让当前日期落在 X 轴最左边，看的人得把图反过来读（v1.2.3 B-512）；
+# 前端也按「末项 = 本期」取数（如总览的「去年」取 yearly5[-2]）。
+
+
 def recent_days(count: int, now: datetime | None = None) -> list[date_cls]:
+    """近 count 个自然日，正序，末项为今天。"""
     now = now or datetime.now()
-    return [(now - timedelta(days=i)).date() for i in range(count)]
+    base = now.date()
+    return [base - timedelta(days=i) for i in range(count - 1, -1, -1)]
 
 
 def recent_months(count: int, now: datetime | None = None) -> list[date_cls]:
-    """返回近 count 个月里的每一天（用于提取月份 key）。"""
+    """近 count 个月（每月取 1 号用于提取月份 key），正序，末项为当月。"""
     now = now or datetime.now()
     out: list[date_cls] = []
-    for back in range(count):
+    for back in range(count - 1, -1, -1):
         y = now.year
         m = now.month - back
         while m <= 0:
@@ -296,5 +305,6 @@ def recent_months(count: int, now: datetime | None = None) -> list[date_cls]:
 
 
 def recent_years(count: int, now: datetime | None = None) -> list[date_cls]:
+    """近 count 个自然年（每年取 1 月 1 日），正序，末项为今年。"""
     now = now or datetime.now()
-    return [date_cls(now.year - i, 1, 1) for i in range(count)]
+    return [date_cls(now.year - i, 1, 1) for i in range(count - 1, -1, -1)]
