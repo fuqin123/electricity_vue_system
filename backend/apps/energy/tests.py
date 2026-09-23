@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+from unittest import mock
 
 from django.test import TestCase
 
 from apps.energy.collectors.base import get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
+from apps.energy.management.commands import collect
 from apps.energy.models import Gateway, HourlyUsage, Line, Meter, Reading
+from apps.energy.services import slots
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
 
 DAY = datetime(2026, 9, 22).date()
@@ -247,6 +250,81 @@ class SlotTests(TestCase):
 
         nxt = slots.next_run_at(datetime(2026, 9, 22, 15, 30, 0))
         self.assertEqual(nxt, datetime(2026, 9, 22, 16, 0, 0) + timedelta(seconds=slots.hourly_offset_seconds()))
+
+
+class IfDueGuardTests(TestCase):
+    """`collect --if-due` 的幂等守卫 —— 决定「这一轮到底采不采」。
+
+    现场最常见的两个疑问，都在这里锁死：
+      · 10 点采到了，10:05 / 10:10 … 还会再采吗？ → 不会，直到 11 点。
+      · 11:01 有一路失败，11:06 会再试吗？        → 会，一直试到本小时采全。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = Line.objects.create(code="A2", name="二线")
+        cls.gw = Gateway.objects.create(
+            code="GW-DUE", name="守卫测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=2
+        )
+        cls.meters = [
+            Meter.objects.create(
+                code=f"E-DUE-{i:02d}",
+                name=f"守卫测试表 {i}",
+                kind=Meter.KIND_ELEC,
+                scope=Meter.SCOPE_LINE,
+                line=cls.line,
+                gateway=cls.gw,
+                unit="kWh",
+            )
+            for i in (1, 2)
+        ]
+
+    def _due(self, moment: datetime) -> bool:
+        """在指定时刻问一次「该采吗」——把命令内部的 datetime.now() 冻结住。"""
+        with mock.patch("apps.energy.management.commands.collect.datetime") as frozen:
+            frozen.now.return_value = moment
+            return collect.Command()._is_due(None)
+
+    def _read(self, meter: Meter, at: datetime, ok: bool = True) -> Reading:
+        return Reading.objects.create(
+            meter=meter, at=at, value=Decimal("100"), ok=ok, raw="test"
+        )
+
+    def test_采样窗口未到时不采(self):
+        """整点后还没到 hourly_offset_seconds —— 这一步就是 offset 配置真正生效的地方。
+
+        没有它，计划任务若在 11:00:00 整触发，就会绕过刻意留出的避让窗口，
+        在整点瞬间读表（表内累计可能还没刷新完）。
+        """
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        self.assertFalse(self._due(slots.slot_ready_at(b) - timedelta(seconds=1)))
+
+    def test_本小时采全后跳过(self):
+        """10 点那一轮采全了 → 之后每 5 分钟都跳过，直到 11 点。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        for meter in self.meters:
+            self._read(meter, slots.slot_ready_at(b))
+        self.assertFalse(self._due(slots.slot_ready_at(b) + timedelta(minutes=4)))
+
+    def test_有点位没采到就重试(self):
+        """11:01 只成功一路 → 11:06 必须再跑（这是重试机制本身）。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        self._read(self.meters[0], slots.slot_ready_at(b))
+        self.assertTrue(self._due(slots.slot_ready_at(b) + timedelta(minutes=5)))
+
+    def test_失败读数不算采到(self):
+        """`ok=False` 的读数不算完成 —— 否则一次超时会被当成「已采过」，整个小时就废了。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        for meter in self.meters:
+            self._read(meter, slots.slot_ready_at(b), ok=False)
+        self.assertTrue(self._due(slots.slot_ready_at(b) + timedelta(minutes=5)))
+
+    def test_上一小时的读数顶不了本小时(self):
+        """11 点该采时，10:59 的读数不算数（守卫只看本小时整点之后的读数）。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        for meter in self.meters:
+            self._read(meter, b - timedelta(minutes=1))
+        self.assertTrue(self._due(slots.slot_ready_at(b) + timedelta(minutes=4)))
 
 
 class CollectorUtilTests(TestCase):
