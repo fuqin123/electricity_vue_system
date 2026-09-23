@@ -64,6 +64,10 @@ collect:
   interval_seconds: 60
   boundary_tolerance_minutes: 20
   readings_retention_days: 180
+  # 采集停摆告警阈值（小时）：最新读数超过这么久没更新就在大屏挂告警。
+  # 每小时节奏下最新读数最旧也就约 1 小时前，给 2 小时足够宽松；
+  # 没有这条，采集整体停掉时界面不会有任何提示（各点位 last_ok 仍是上次的 True）。
+  stale_alert_hours: 2
   filter:
     reset_threshold_ratio: 0.5
 

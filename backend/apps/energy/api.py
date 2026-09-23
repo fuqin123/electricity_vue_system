@@ -479,12 +479,17 @@ def period_summary(request: HttpRequest) -> JsonResponse:
             "periodKey": r.period_key,
             "startDate": r.start_date.isoformat(),
             "endDate": r.end_date.isoformat(),
-            "output": float(r.output),
-            "kwh": float(r.kwh),
-            "waterT": float(r.water_t),
-            "steamT": float(r.steam_t),
-            "planOutput": float(r.plan_output),
-            "unitKwh": float(r.unit_kwh) if r.unit_kwh is not None else None,
+            # ⚠ 这里**不要**写 float(r.xxx)：`eep_period_summary` 的数值字段是可空的
+            #   ——「该周期一条可信数据都没有」写 NULL（绝不补 0），
+            #   而 float(None) 会抛 TypeError 让整个接口 500（B-509）。
+            #   直接把 Decimal / None 交给 `EepJSONEncoder`：
+            #   Decimal 统一转 float，None 原生就是 JSON null。
+            "output": r.output,
+            "kwh": r.kwh,
+            "waterT": r.water_t,
+            "steamT": r.steam_t,
+            "planOutput": r.plan_output,
+            "unitKwh": r.unit_kwh,
             "coveredHours": r.covered_hours,
             "quality": r.quality,
             "computedAt": r.computed_at.strftime("%Y-%m-%d %H:%M:%S"),

@@ -23,11 +23,11 @@ from datetime import date as date_cls
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from django.db.models import Sum
+from django.db.models import Max, Sum
 
 from eep import conf
 
-from ..models import HourlyProduction, HourlyUsage, Line, Meter, PeriodSummary
+from ..models import HourlyProduction, HourlyUsage, Line, Meter, PeriodSummary, Reading
 from .aggregate import current_hour_usage
 from . import summary as S
 
@@ -435,8 +435,13 @@ def build_line(line: Line, now: datetime | None = None) -> dict:
 
     # ── 状态判定 ──
     # 有真实产量 → 按产量判定（产能利用率）；否则按用电负荷判定。
-    current = cells.get(now.hour)
-    load = current.value if current and current.value is not None else Decimal(0)
+    #
+    # ⚠ 「用电负荷」必须取**最近一个已结束且有值的小时**，不能取当前小时（B-510）：
+    #   每小时采样节奏下，当前小时的值要等下一个整点的边界采样做差才算得出来
+    #   （见 slots.py）。取当前小时必然恒为 0，于是整点后的整整一个小时里，
+    #   六条产线在大屏上会全部显示「停线」—— 而现场明明在用电
+    #   （实测各线 6—44 kWh/h）。这类「口径没错但取值时机错」的问题，
+    #   正是最容易被当成设备故障的一类。
     if prod.real:
         ref = int(prod.by_hour.get(now.hour) or 0)
         if ref <= 0:
@@ -446,8 +451,13 @@ def build_line(line: Line, now: datetime | None = None) -> dict:
         else:
             status = "running"
     else:
+        latest_hour = max(
+            (h for h, c in cells.items() if h <= now.hour and c.value is not None),
+            default=None,
+        )
+        load = cells[latest_hour].value if latest_hour is not None else Decimal(0)
         base = float(conf.get("energy_defaults.base_load_kwh_per_hour", 20) or 20)
-        if load <= 0:
+        if load is None or load <= 0:
             status = "stopped"
         elif float(load) < base * 0.6:
             status = "slow"
@@ -653,6 +663,33 @@ def build_workshop(now: datetime | None = None) -> dict:
                 "level": "err",
                 "text": f"{meter.name} 采集失败：{meter.last_error or '未知原因'}",
                 "time": meter.last_at.strftime("%H:%M:%S") if meter.last_at else "--:--:--",
+            }
+        )
+
+    # 采集整体停摆提示（B-511）。
+    # 为什么单独做这一条：采集若整体停掉（计划任务被停、机器重启后没恢复、网络断），
+    # 每个点位的 `last_ok` 都还停在上次成功时的 True —— 上面那条失败告警不会触发，
+    # 大屏于是安静地显示**冻结的旧值**，现场只会觉得「今天的数怎么不动」。
+    # 每小时节奏下最新读数最旧也是约 1 小时前，所以阈值给 2 小时足够宽松。
+    stale_hours = int(conf.get("collect.stale_alert_hours", 2) or 2)
+    newest = Reading.objects.filter(meter__enabled=True).aggregate(m=Max("at"))["m"]
+    if newest is None:
+        alerts.append(
+            {
+                "level": "err",
+                "text": "尚无任何采集数据 —— 请确认计划任务 EEP-Collect 是否在运行",
+                "time": "--:--:--",
+            }
+        )
+    elif (now - newest).total_seconds() > stale_hours * 3600:
+        alerts.append(
+            {
+                "level": "err",
+                "text": (
+                    f"采集疑似中断：最新读数停留在 {newest:%m-%d %H:%M}"
+                    f"（已超过 {stale_hours} 小时未更新），请检查计划任务 EEP-Collect"
+                ),
+                "time": newest.strftime("%H:%M:%S"),
             }
         )
 

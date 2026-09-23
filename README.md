@@ -113,6 +113,9 @@ corepack enable && corepack prepare pnpm@latest --activate
 ### 启动
 
 ```bash
+cd backend
+python manage.py runserver 0.0.0.0:8000 # 数据采集服务
+
 cd frontend                 # ← 注意：工作区根在 frontend/ 下
 pnpm install                # 首次约 3—6 分钟
 

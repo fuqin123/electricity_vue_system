@@ -11,14 +11,15 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest import mock
 
-from django.test import TestCase
+from django.test import Client, TestCase
 
 from apps.energy.collectors.base import get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
 from apps.energy.management.commands import collect
-from apps.energy.models import Gateway, HourlyUsage, Line, Meter, Reading
+from apps.energy.models import Gateway, HourlyUsage, Line, Meter, PeriodSummary, Reading
 from apps.energy.services import slots
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
+from apps.energy.services.snapshot import build_line, build_overview
 
 DAY = datetime(2026, 9, 22).date()
 
@@ -325,6 +326,161 @@ class IfDueGuardTests(TestCase):
         for meter in self.meters:
             self._read(meter, b - timedelta(minutes=1))
         self.assertTrue(self._due(slots.slot_ready_at(b) + timedelta(minutes=4)))
+
+
+class LineStatusTests(TestCase):
+    """产线状态判定 —— 用电负荷必须取「最近一个已知的小时」（B-510）。
+
+    现场现象：整点后的整整一个小时里，六条产线在大屏上全是「停线」，
+    但现场明明在用电。根因是状态取了**当前小时**的用电量，
+    而每小时采样节奏下当前小时的值要等下一个整点采样做差才算得出来 —— 恒为 0。
+    """
+
+    NOW = datetime(2026, 9, 23, 13, 30)  # 13:30：当前小时（13 点）必然还没有值
+    DAY = NOW.date()
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = Line.objects.create(code="A9", name="九线", rated=30000)
+        cls.gw = Gateway.objects.create(
+            code="GW-ST", name="状态测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = Meter.objects.create(
+            code="E-A9-01",
+            name="九线产线电表",
+            kind=Meter.KIND_ELEC,
+            scope=Meter.SCOPE_LINE,
+            line=cls.line,
+            gateway=cls.gw,
+            unit="kWh",
+        )
+
+    def _usage(self, hour: int, value: str, quality: str = HourlyUsage.Q_OK) -> None:
+        HourlyUsage.objects.create(
+            meter=self.meter, date=self.DAY, hour=hour, usage=Decimal(value), unit="kWh", quality=quality
+        )
+
+    def _status(self) -> str:
+        return build_line(self.line, self.NOW)["status"]
+
+    def test_当前小时没值时按最近已知小时判定(self):
+        """12 点用了 30 kWh/h ≥ 基础负荷 60%（12）→ 运行中，不能因为 13 点还没值就报停线。"""
+        self._usage(12, "30")
+        self.assertEqual(self._status(), "running")
+
+    def test_低于基础负荷六成判低负荷(self):
+        self._usage(12, "5")
+        self.assertEqual(self._status(), "slow")
+
+    def test_用电为零判停线(self):
+        self._usage(12, "0")
+        self.assertEqual(self._status(), "stopped")
+
+    def test_一条数据都没有判停线(self):
+        self.assertEqual(self._status(), "stopped")
+
+
+class ApiSerializationTests(TestCase):
+    """接口层序列化 —— 可空字段必须是 JSON null，不能让整个接口 500（B-509）。
+
+    `eep_period_summary` 的数值字段是可空的（该周期无可信数据时写 NULL，
+    绝不补 0）。序列化时若直接 `float(r.kwh)`，遇到 NULL 会抛 TypeError，
+    接口 500 —— 而「没数据」恰恰是最常见的正常情况。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = Line.objects.create(code="A1", name="一线")
+        # ① 「一条可信数据都没有」的车间行：数值字段全 NULL
+        PeriodSummary.objects.create(
+            scope=PeriodSummary.SCOPE_WORKSHOP,
+            dim=PeriodSummary.DIM_DAY,
+            period_key=DAY.isoformat(),
+            start_date=DAY,
+            end_date=DAY,
+            quality=PeriodSummary.Q_MISSING,
+            covered_hours=0,
+        )
+        # ② 正常有值的产线行
+        PeriodSummary.objects.create(
+            scope=PeriodSummary.SCOPE_LINE,
+            dim=PeriodSummary.DIM_DAY,
+            period_key=DAY.isoformat(),
+            start_date=DAY,
+            end_date=DAY,
+            line=cls.line,
+            kwh=Decimal("123.456"),
+            quality=PeriodSummary.Q_OK,
+            covered_hours=1,
+        )
+
+    def test_周期总计接口遇空值行仍返回200(self):
+        r = Client().get("/api/energy/period-summary", {"dim": "day", "scope": "workshop"})
+        self.assertEqual(r.status_code, 200)
+        item = r.json()["items"][0]
+        self.assertIsNone(item["output"])
+        self.assertIsNone(item["kwh"])
+        self.assertIsNone(item["waterT"])
+        self.assertIsNone(item["steamT"])
+        self.assertIsNone(item["unitKwh"])
+
+    def test_周期总计接口有值行返回数字(self):
+        r = Client().get(
+            "/api/energy/period-summary", {"dim": "day", "scope": "line", "line": "A1"}
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["items"][0]["kwh"], 123.456)
+
+    def test_总览接口可用(self):
+        self.assertEqual(Client().get("/api/energy/overview").status_code, 200)
+
+    def test_小时明细接口可用(self):
+        r = Client().get("/api/energy/hourly", {"date": DAY.isoformat()})
+        self.assertEqual(r.status_code, 200)
+
+
+class CollectHealthAlertTests(TestCase):
+    """采集停摆必须在界面上看得见（B-511）。
+
+    没有这条告警时，采集整体停掉的现象是「界面一切正常，只是数字不动了」——
+    因为每个点位的 `last_ok` 还停在上次成功时的 True。
+    """
+
+    NOW = datetime(2026, 9, 23, 13, 30)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = Line.objects.create(code="A8", name="八线")
+        cls.gw = Gateway.objects.create(
+            code="GW-H", name="健康测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=8
+        )
+        cls.meter = Meter.objects.create(
+            code="E-A8-01",
+            name="八线产线电表",
+            kind=Meter.KIND_ELEC,
+            scope=Meter.SCOPE_LINE,
+            line=cls.line,
+            gateway=cls.gw,
+            unit="kWh",
+        )
+
+    def _texts(self):
+        return [a["text"] for a in build_overview(self.NOW)["workshop"]["alerts"]]
+
+    def test_读数按时更新时不告警(self):
+        Reading.objects.create(
+            meter=self.meter, at=datetime(2026, 9, 23, 12, 4), value=Decimal("1"), ok=True
+        )
+        self.assertFalse(any("采集疑似中断" in t for t in self._texts()))
+
+    def test_读数停在两小时前时告警(self):
+        Reading.objects.create(
+            meter=self.meter, at=datetime(2026, 9, 23, 10, 4), value=Decimal("1"), ok=True
+        )
+        self.assertTrue(any("采集疑似中断" in t for t in self._texts()))
+
+    def test_从未采到数据时告警(self):
+        self.assertTrue(any("尚无任何采集数据" in t for t in self._texts()))
 
 
 class CollectorUtilTests(TestCase):
