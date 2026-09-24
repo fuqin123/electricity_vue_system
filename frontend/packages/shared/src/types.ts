@@ -45,8 +45,18 @@ export interface HourPoint {
   stopped?: boolean;
   /** 未到时段（预测态，前端渲染为虚线柱） */
   future?: boolean;
-  /** 正在进行中的小时（只累计了部分分钟） */
+  /**
+   * 本小时合计**不完整**。
+   * ⚠ 它不等于「进行中」：进行中的小时（还没结束）和被排除过数据的已结束整点
+   *   都会是 true。要判断「还在跑」只能比对 `currentHour`（见 B-518）。
+   */
   partial?: boolean;
+  /**
+   * 采集侧数据质量。后端一直在发这个字段，此前类型没声明，
+   * 于是前端只能拿 `partial` 猜状态，把已结束的异常整点显示成「进行中」（B-518）。
+   * 文案见 `HOUR_QUALITY_LABEL`。
+   */
+  quality?: 'ok' | 'partial' | 'missing' | 'reset' | 'spike' | 'future';
   /** 整点预期产量，仅 partial 时有值，用于状态判定与展示；产量未接入时为 null */
   projected?: number | null;
   /** 已过时间占比 0—1，仅 partial 时有值 */
@@ -424,10 +434,19 @@ export interface SysParam {
   id: number;
   key: string;
   name: string;
-  value: string;
+  /**
+   * 参数值。**null = 未标定**，与「标定为 0」是两回事：
+   * 例如「每月标准变动费用」为 null 时趋势图不画那条基准线，
+   * 当成 0 会画出「实际费用远高于标准 0.00 元/箱」的假结论。
+   */
+  value: string | null;
+  /** 后端给的可读值（未标定时为「未标定」），界面直接显示这个 */
+  valueText?: string;
   unit: string;
   group: string;
   remark: string;
+  updatedAt?: string;
+  updatedBy?: string;
 }
 
 /** 字典项 */

@@ -114,6 +114,12 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/device/QualityView.vue'),
         meta: { title: '数据质量', desc: '各产线整点数据的应报 / 实收 / 缺失统计' }
       },
+      {
+        path: 'device/readings',
+        name: 'device-readings',
+        component: () => import('@/views/device/ReadingQueryView.vue'),
+        meta: { title: '仪表读数查询', desc: '按时间 / 网关 / 仪表查原始累计读数（排查倍率与断讯）' }
+      },
 
       /* ── 视频监控 ── */
       {

@@ -96,7 +96,7 @@ export interface VideoConfig {
 
 
 export const plantConfig = {
-  name: '康师傅饮料 · 华东生产基地',
+  name: '康师傅饮料 · 长沙工厂',
   shortName: '能源产效管理系统',
   code: 'PLANT 01',
   linesName: 'A1—A6 灌装线'
@@ -120,14 +120,14 @@ export const dataConfig = {
    * 后端把这些接口实现后，从数组里删掉对应项即可，**不用改别处代码**。
    *
    * 已实现（不在本列表里）：energy.*、admin.overview / lines / gateways /
-   *                          meters / quality / collect-logs
+   *                          meters / quality / collect-logs /
+   *                          params（系统参数，v1.4.0）/ readings（仪表读数，v1.4.0）
    */
   mockOnly: [
     'auth',
     'admin.users',
     'admin.roles',
     'admin.menus',
-    'admin.params',
     'admin.dicts',
     'admin.alarms',
     'admin.logs.operation',

@@ -1,6 +1,6 @@
 {
   "name": "@eep/admin",
-  "version": "1.2.4",
+  "version": "1.4.0",
   "private": true,
   "description": "能源产效管理系统 · 后台管理（Element Plus + 源力设计系统）",
   "type": "module",

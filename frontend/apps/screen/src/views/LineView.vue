@@ -299,7 +299,9 @@ const lineAlerts = computed<AlertItem[]>(() => {
 /* ── 图表 option ──────────────────────────────────────── */
 const trendOption = computed(() => (line.value ? lineTrendOption(line.value, dim.value) : null));
 const heatmapOption = computed(() => (line.value ? lineHeatmapOption(line.value) : null));
-const todayOption = computed(() => (line.value ? todayChartOption(line.value.hours, line.value.rated) : null));
+const todayOption = computed(() =>
+  line.value && ws.value ? todayChartOption(line.value.hours, line.value.rated, ws.value.currentHour) : null
+);
 
 const todayNote = computed(() => {
   const l = line.value;

@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.2.3 ｜ 最后更新：2026-09-23
+> 版本：v1.4.0 ｜ 最后更新：2026-09-24
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -68,6 +68,92 @@
    后端只给原始 `kWh` / `瓶`，缩放与单位文案在
    `apps/screen/src/charts/index.ts` 的 `OVERVIEW_TREND` / `LINE_TREND` 里成对定义，
    图表与图例都读这一份（B-514 的教训：除数写在图表、单位写在模板，两边会漂）。
+
+---
+
+## 〇·补三、v1.4.0 新增接口与参数升级 ★ 后台数据视图必读
+
+### 1) `from` / `to` 升级为**小时精度**（影响 3 个接口）
+
+`/api/energy/range`、`/api/energy/dashboard`、`/api/admin/readings` 的时间端点统一为：
+
+| 写法 | 含义 |
+| :--- | :--- |
+| `2026-09-24` | 当日 `00:00` |
+| `2026-09-24 08` / `2026-09-24T08` | 该整点 |
+| `2026-09-24 08:37` | 规范到 `08:00`（本项目最小时间桶 = 1 小时） |
+
+⚠ 格式无法解析时接口返回 400 并写明期望格式，**不静默回退到「今天」** ——
+静默回退会让用户以为筛选生效了，实际看的是另一段时间。
+小时端点只在 `granularity=hour` 时生效；`day` / `month` 的桶是整天/整月，端点规范到周期边界。
+
+### 2) `GET /api/energy/dashboard` ★ 数据中心主数据
+
+参数：`from` / `to`（小时精度，缺省今天 00:00 → 当前整点）、`granularity`（`hour` | `day`）、`line`（可选）。
+
+```json
+{
+  "from": "2026-09-24 00:00", "to": "2026-09-24 15:00",
+  "granularity": "hour", "labels": ["09-24 00:00", "..."], "bucketCount": 16,
+  "energies": {
+    "electric": { "unit": "kWh", "values": [305.9, null], "cumulative": [305.9, 305.9],
+                  "cumulativeCovered": [1, 1], "outputCumulative": [null], "unitCumulative": [null],
+                  "perLineAvailable": true },
+    "water": { "unit": "t", "...": "..." }, "steam": { "unit": "t", "...": "..." }
+  },
+  "cost": { "available": false, "values": [null], "cumulative": [null],
+            "perCase": [null], "perCaseCumulative": [null],
+            "standardPerCase": null,
+            "blockers": ["成本参数未标定：电价、工业水价", "产量数据源未接入，折不出箱数"] },
+  "productionAvailable": false,
+  "totals": { "kwh": 4194.1, "waterT": null, "steamT": 2.22, "output": null,
+              "costYuan": null, "perCaseCost": null }
+}
+```
+
+**读法（三条都不能含糊）**
+
+- `cumulative` 是**跳过缺数格的部分和**，`cumulativeCovered[i]` 说「累加到第 i 格吃进了几格可信数据」。
+  界面必须显示覆盖度（`已覆盖 N/M 个时段`），否则中断过采集的区间会被当成完整区间。
+- `cost.available=false` 时 `values / perCase / perCaseCumulative` 全为 `null`，界面**必须把
+  `cost.blockers` 摊开显示**。单价或箱规任一项未标定 → 费用为 `null`，**绝不按 0 计入**
+  （少算一项会得到偏小但看起来正常的费用，与 B-302 / B-505 同类）。
+- `standardPerCase` 为 `null` = 未标定，**不画基准虚线**；画成 0 等于宣称「标准是 0 元/箱」。
+- 选 `line=A1` 时 `energies.water/steam` 的 `perLineAvailable=false` 且序列全 `null`：
+  水与汽只有车间总表。界面据此**禁用勾选**，不要画一条全零线（零会被读成「这条线没用过水」）。
+
+### 3) `GET/PUT /api/admin/params` 系统参数（成本算料的唯一真值来源）
+
+```json
+{ "list": [ { "id": 3, "key": "price.electric", "name": "电价", "value": 0.65,
+              "valueText": "0.65", "unit": "元/kWh", "group": "成本参数",
+              "remark": "综合电价", "updatedAt": "...", "updatedBy": "admin" } ],
+  "total": 5, "page": 1, "pageSize": 20 }
+```
+
+`PUT /api/admin/params/{id}` body `{"value": 0.72, "remark": "..."}`；
+`value: null` 表示**主动清空 = 未标定**（与填 0 含义不同）。参数键不可改（键是代码取值凭据），
+新增键走 `python manage.py seed_params`。默认登记五项：
+`price.electric` / `price.water` / `price.steam` / `package.bottles_per_case` / `cost.standard_per_case`。
+
+### 4) `GET /api/admin/readings` 仪表原始读数查询
+
+参数：`from` / `to`（小时精度）、`gateway`（id 或编码）、`meter`（id 或编码）、
+`line`、`energy`（`ELECTRIC`/`WATER`/`STEAM`）、`ok`（`1` 只看成功 / `0` 只看失败）、
+`page` / `pageSize`（默认 50，上限 500）。
+
+```json
+{ "list": [ { "id": 1, "collectTime": "2026-09-24 14:04:04", "meter": "E-A4-01",
+              "meterName": "四线 生产线电表", "gateway": "一期配电房塔石", "gatewayId": 1,
+              "line": "A4", "lineName": "四线", "energy": "ELECTRIC", "energyName": "电",
+              "reading": 635929.0, "unit": "kWh", "ok": true,
+              "raw": "slave=11 addr=1000 regs=0061 08fa", "error": "" } ],
+  "total": 98, "page": 1, "pageSize": 50, "from": "...", "to": "..." }
+```
+
+与 `/api/energy/hourly` 的分工：那边是**差分后的用量**，这边是**读数本身 + 原始报文**，
+排查倍率 / 字序 / 断讯从这页开始。`reading` 为 `null` = 这次没读到（不是 0；
+0 会被差值当成真实读数，B-502 的源头就在这张表）。
 
 ---
 

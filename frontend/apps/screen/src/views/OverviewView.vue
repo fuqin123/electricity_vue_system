@@ -140,7 +140,8 @@ const todayOption = computed(() =>
   ws.value
     ? todayChartOption(
         ws.value.hours,
-        ws.value.lines.reduce((a, l) => a + l.rated, 0)
+        ws.value.lines.reduce((a, l) => a + l.rated, 0),
+        ws.value.currentHour
       )
     : null
 );
@@ -193,7 +194,7 @@ const todayNote = computed(() => {
 
     <main
       class="board"
-      style="--l1: 250px; --l2: 400px; --c1: 118px; --c2: 486px; --c3: 276px; --r1: 310px; --r2: 280px"
+      style="--l1: 250px; --l2: 400px; --c1: 118px; --c2: 486px; --r1: 310px; --r2: 280px"
     >
       <!-- ══════ 左列 ══════ -->
       <div class="col">
@@ -290,10 +291,11 @@ const todayNote = computed(() => {
           <ChartBox :option="trendOption" grow />
         </PanelBox>
 
+        <!-- ⚠ 末块面板**不传 height**：左列 / 右列的末块都是自适应撑满（PanelBox 的 panel--grow），
+             这里写死 --c3 会让中列底边比两侧短一截（B-517 的「底部没对齐」）。 -->
         <PanelBox
           :title="prodOn ? '六条产线产量与单位电耗对比' : '六条产线用电量对比'"
           :note="compareNote"
-          height="var(--c3)"
           body-class="panel__body--col"
         >
           <ChartBox :option="compareOption" grow />

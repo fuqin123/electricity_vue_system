@@ -61,6 +61,7 @@ export const menuTree: MenuNode[] = [
     children: [
       { path: '/device/meter', title: '计量点位', icon: 'DataAnalysis' },
       { path: '/device/gateway', title: '采集网关', icon: 'Connection' },
+      { path: '/device/readings', title: '仪表读数查询', icon: 'Histogram' },
       { path: '/device/quality', title: '数据质量', icon: 'CircleCheck' }
     ]
   },

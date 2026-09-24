@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest import mock
 
-from django.test import Client, TestCase
+from django.test import Client, RequestFactory, TestCase
 
 from apps.energy.collectors.base import get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
@@ -24,9 +24,11 @@ from apps.energy.models import (
     EnergyRaw,
     EnergyType,
     PeriodSummary,
+    ProductionHourly,
     ProductionLine,
+    SystemParam,
 )
-from apps.energy.services import slots
+from apps.energy.services import ranges, slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
 from apps.energy.services.snapshot import build_line, build_overview
@@ -636,3 +638,187 @@ class TrendSeriesOrderTests(TestCase):
         want = [(today - timedelta(days=29 - i)).strftime("%m-%d") for i in range(30)]
         got = [p["label"] for p in Client().get("/api/energy/line/A1").json()["daily30"]]
         self.assertEqual(got, want)
+
+
+class HourRangeTests(TestCase):
+    """v1.4.0：起止时间精确到小时（数据中心 / 用量查询 / 仪表读数三处共用）。
+
+    以前只有 `YYYY-MM-DD`，现场反馈「现在的方式无法准确知晓」覆盖到哪一小时；
+    端点统一规范到整点，因为本项目最小的时间桶就是 1 小时。
+    """
+
+    @staticmethod
+    def req(**params):
+        return RequestFactory().get("/api/energy/range", params)
+
+    def test_小时端点规范到整点(self):
+        s, e = ranges.parse_hours(self.req(**{"from": "2026-09-24 08:37", "to": "2026-09-24 14:12"}))
+        self.assertEqual((s.hour, s.minute), (8, 0))
+        self.assertEqual((e.hour, e.minute), (14, 0))
+
+    def test_纯日期取当日零点(self):
+        s, e = ranges.parse_hours(self.req(**{"from": "2026-09-24", "to": "2026-09-24 05"}))
+        self.assertEqual(s, datetime(2026, 9, 24, 0, 0))
+        self.assertEqual(e, datetime(2026, 9, 24, 5, 0))
+
+    def test_T_写法与带秒写法都能解析(self):
+        s, _ = ranges.parse_hours(self.req(**{"from": "2026-09-24T08:15:30", "to": "2026-09-24 09"}))
+        self.assertEqual(s, datetime(2026, 9, 24, 8, 0))
+
+    def test_起止乱序自动交换(self):
+        s, e = ranges.parse_hours(self.req(**{"from": "2026-09-24 14", "to": "2026-09-24 08"}))
+        self.assertLess(s, e)
+
+    def test_非法格式抛错而不是静默取默认(self):
+        """静默回退到「今天」会让用户以为筛选生效了，实际查的是另一段时间。"""
+        with self.assertRaises(ValueError):
+            ranges.parse_hours(self.req(**{"from": "24/09/2026"}))
+
+    def test_小时桶只取端点闭区间(self):
+        """查 08→10 就该是 3 个桶：多一桶少一桶都会让区间的合计对不上。"""
+        buckets = ranges._hour_labels(
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24, 20, 0),
+            start_at=datetime(2026, 9, 24, 8),
+            end_at=datetime(2026, 9, 24, 10),
+        )
+        self.assertEqual([h for _d, h in buckets], [8, 9, 10])
+
+    def test_不给端点时仍是整日行为(self):
+        """大屏与既有调用方没传小时端点，行为必须一字不变。"""
+        buckets = ranges._hour_labels(
+            datetime(2026, 9, 24).date(), datetime(2026, 9, 24).date(), datetime(2026, 9, 24, 3, 0)
+        )
+        self.assertEqual([h for _d, h in buckets], [0, 1, 2, 3])
+
+
+class DashboardCumulativeTests(TestCase):
+    """v1.4.0 数据中心：累计序列与单箱变动费用的缺数口径。
+
+    核心要防的还是那一类错：**缺数被当成 0 参与累计**，或者费用少算一项单价
+    却给出一个看起来正常的偏小数。
+    """
+
+    DAY = datetime(2026, 9, 24).date()
+    NOW = datetime(2026, 9, 24, 10, 30)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        # v1.3.0 起 line_id 全表非空：车间总表挂「车间哨兵行」，这样唯一键处处有效
+        cls.workshop = ProductionLine.objects.create(
+            line_code="WS", line_name="车间", line_type=ProductionLine.TYPE_WORKSHOP
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+
+    def meter(self, code: str, kind: str, scope: str = EnergyMeter.SCOPE_LINE) -> EnergyMeter:
+        owner = self.line if scope == EnergyMeter.SCOPE_LINE else self.workshop
+        return EnergyMeter.objects.create(
+            code=code,
+            name=f"测试表 {code}",
+            energy_type=etype(kind),
+            scope=scope,
+            line=owner,
+            gateway=self.gw,
+            unit="kWh" if kind == EnergyType.ELECTRIC else "t",
+        )
+
+    def usage(self, meter: EnergyMeter, hour: int, value: str, quality: str = EnergyHourly.Q_OK) -> None:
+        EnergyHourly.objects.create(
+            meter=meter,
+            line=meter.line,
+            energy_type=meter.energy_type,
+            stat_date=self.DAY,
+            stat_hour=hour,
+            consumption=Decimal(value) if value else None,
+            unit=meter.unit,
+            quality=quality,
+        )
+
+    def test_累计跳过缺数格并如实给出覆盖度(self):
+        """09 点整块没采到：累计值仍是真实部分和，但 covered 必须停在 1 → 2 而不是 3。"""
+        m = self.meter("E-A1-01", EnergyType.ELECTRIC)
+        self.usage(m, 8, "10")
+        self.usage(m, 10, "40")
+
+        d = ranges.dashboard_range(datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 10), now=self.NOW)
+        e = d["energies"]["electric"]
+        self.assertEqual(d["bucketCount"], 3)
+        self.assertEqual(e["values"], [10.0, None, 40.0])
+        self.assertEqual(e["cumulative"], [10.0, 10.0, 50.0])
+        self.assertEqual(e["cumulativeCovered"], [1, 1, 2])
+        self.assertEqual(d["totals"]["kwh"], 50.0)
+
+    def test_产量未接入时单耗与费用一律为null(self):
+        m = self.meter("E-A1-01", EnergyType.ELECTRIC)
+        self.usage(m, 8, "10")
+        d = ranges.dashboard_range(datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), now=self.NOW)
+        self.assertFalse(d["productionAvailable"])
+        self.assertTrue(all(v is None for v in d["energies"]["electric"]["outputCumulative"]))
+        self.assertTrue(all(v is None for v in d["energies"]["electric"]["unitCumulative"]))
+        self.assertIsNone(d["totals"]["output"])
+        self.assertIn("产量数据源未接入", " ".join(d["cost"]["blockers"]))
+
+    def test_单价未标定不产出偏小费用(self):
+        """库里一个参数都没有 → 费用必须是 None，而不是「按 0 价算出来的 0 元」。"""
+        m = self.meter("E-A1-01", EnergyType.ELECTRIC)
+        self.usage(m, 8, "10")
+        d = ranges.dashboard_range(datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), now=self.NOW)
+        self.assertFalse(d["cost"]["available"])
+        self.assertTrue(all(v is None for v in d["cost"]["values"]))
+        self.assertIn("成本参数未标定", " ".join(d["cost"]["blockers"]))
+
+    def test_算料齐全时单箱变动费用按财务口径算(self):
+        """电 100kWh×0.65 + 水 2t×4.5 + 汽 1t×260 = 334 元；24000 瓶 ÷ 24 = 1000 箱 → 0.334 元/箱"""
+        elec = self.meter("E-A1-01", EnergyType.ELECTRIC)
+        water = self.meter("E-W-01", EnergyType.WATER, EnergyMeter.SCOPE_WORKSHOP)
+        steam = self.meter("E-S-01", EnergyType.STEAM, EnergyMeter.SCOPE_WORKSHOP)
+        self.usage(elec, 8, "100")
+        self.usage(water, 8, "2")
+        self.usage(steam, 8, "1")
+        ProductionHourly.objects.create(
+            line=self.line,
+            stat_date=self.DAY,
+            stat_hour=8,
+            output=Decimal("24000"),
+            quality=ProductionHourly.Q_OK,
+            source=ProductionHourly.SOURCE_MES,
+        )
+        for key, val, unit in (
+            ("price.electric", "0.65", "元/kWh"),
+            ("price.water", "4.5", "元/t"),
+            ("price.steam", "260", "元/t"),
+            ("package.bottles_per_case", "24", "瓶/箱"),
+        ):
+            SystemParam.objects.create(key=key, name=key, value=Decimal(val), unit=unit)
+
+        d = ranges.dashboard_range(datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), now=self.NOW)
+        self.assertTrue(d["cost"]["available"])
+        self.assertEqual(d["cost"]["values"][0], 334.0)
+        self.assertEqual(d["cost"]["perCase"][0], 0.33)
+        # 标准值未标定 → 不画基准线，且不能是 0
+        self.assertIsNone(d["cost"]["standardPerCase"])
+
+    def test_少一项单价时整段费用为null而不是偏小值(self):
+        """只标定电价时，按「水汽 0 元」算出来的费用会偏小且看起来完全正常 —— 必须拒绝。"""
+        elec = self.meter("E-A1-01", EnergyType.ELECTRIC)
+        self.usage(elec, 8, "100")
+        SystemParam.objects.create(key="price.electric", name="电价", value=Decimal("0.65"), unit="元/kWh")
+        SystemParam.objects.create(key="package.bottles_per_case", name="箱规", value=Decimal("24"), unit="瓶/箱")
+        d = ranges.dashboard_range(datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), now=self.NOW)
+        self.assertFalse(d["cost"]["available"])
+        self.assertTrue(all(v is None for v in d["cost"]["values"]))
+
+    def test_按线查询时水汽无数据但不报错(self):
+        """水/汽只有车间总表：选单线时它们的序列是 null，界面据此禁用勾选。"""
+        elec = self.meter("E-A1-01", EnergyType.ELECTRIC)
+        self.usage(elec, 8, "10")
+        d = ranges.dashboard_range(
+            datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), line_code="A1", now=self.NOW
+        )
+        self.assertEqual(d["line"], "A1")
+        self.assertTrue(all(v is None for v in d["energies"]["water"]["values"]))
+        self.assertFalse(d["energies"]["steam"]["perLineAvailable"])

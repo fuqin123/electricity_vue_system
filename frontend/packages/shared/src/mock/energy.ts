@@ -104,7 +104,9 @@ export function hourSample(line: LineConfig, date: Date, hour: number): HourPoin
     output,
     kwh,
     unitKwh: PROD_ENABLED && output !== null && output > 0 ? round2((kwh / output) * 1000) : null,
-    stopped
+    stopped,
+    // 演示数据不存在采集缺陷，一律 ok —— 否则状态列会走「没带 quality」的兜底分支
+    quality: 'ok'
   };
 }
 
@@ -165,6 +167,7 @@ function buildLine(line: LineConfig, now: Date): LineData {
       s.projected = PROD_ENABLED ? (s.output ?? 0) : null;
       s.progress = frac;
       s.partial = true;
+      s.quality = 'partial'; // 进行中：合计本来就还不完整
       s.output = PROD_ENABLED ? Math.round((s.output ?? 0) * frac) : null;
       // 刚过整点时电量很小，取整会带来误差 → 单位电耗跳动，故小额保留 1 位小数
       const scaled = (s.kwh ?? 0) * frac;
@@ -172,6 +175,7 @@ function buildLine(line: LineConfig, now: Date): LineData {
       s.unitKwh = PROD_ENABLED && (s.output ?? 0) > 0 ? round2(((s.kwh ?? 0) / (s.output ?? 1)) * 1000) : null;
     } else if (h > curH) {
       s.future = true;
+      s.quality = 'future';
       s.output = null;
       s.kwh = null;
       s.unitKwh = null;

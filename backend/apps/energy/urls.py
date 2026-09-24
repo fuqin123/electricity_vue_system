@@ -26,6 +26,7 @@ energy_urlpatterns = [
     path("collect-summary", api.collect_summary, name="energy-collect-summary"),
     path("period-summary", api.period_summary, name="energy-period-summary"),
     path("range", api.usage_range, name="energy-range"),
+    path("dashboard", api.dashboard, name="energy-dashboard"),
     path("production", api.production, name="energy-production"),
 ]
 
@@ -35,6 +36,9 @@ _ADMIN_ROUTES = [
     ("lines", api.admin_lines, "admin-lines"),
     ("quality", api.admin_quality, "admin-quality"),
     ("collect-logs", api.admin_collect_logs, "admin-collect-logs"),
+    ("readings", api.admin_readings, "admin-readings"),
+    ("params", api.admin_params, "admin-params"),
+    ("params/<int:pk>", api.admin_param_detail, "admin-param-detail"),
     ("gateways", api.admin_gateways, "admin-gateways"),
     ("gateways/<int:pk>", api.admin_gateway_detail, "admin-gateway-detail"),
     ("gateways/<int:pk>/test", api.admin_gateway_test, "admin-gateway-test"),

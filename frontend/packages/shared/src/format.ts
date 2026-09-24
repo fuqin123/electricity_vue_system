@@ -37,6 +37,22 @@ export function rise(cur: number | null | undefined, prev: number | null | undef
 /** 补零到 2 位 */
 export const pad2 = (n: number | string): string => String(n).padStart(2, '0');
 
+/**
+ * 小时数据质量 → 界面文案。
+ *
+ * ⚠ 已结束的整点只要数据不可信就必须写「异常」。以前前端没有 quality 字段，
+ *   只能拿 `partial` 当「进行中」用，于是 8 点那个端点偏离整点的小时到了 10 点
+ *   还显示「进行中」—— 现场会以为等一会儿就补上了，其实它永远不会再变（B-518）。
+ */
+export const HOUR_QUALITY_LABEL: Record<string, string> = {
+  ok: '正常',
+  future: '计划',
+  missing: '异常·缺数',
+  reset: '异常·换表',
+  spike: '异常·尖峰',
+  partial: '异常·部分缺数'
+};
+
 /** 数值保留 n 位小数（四舍五入），用于统一 mock 与接口口径 */
 export const round2 = (v: number): number => Math.round(v * 100) / 100;
 

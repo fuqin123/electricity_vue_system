@@ -33,6 +33,7 @@ from ..models import (
     ProductionHourly,
     ProductionLine,
 )
+from . import cost
 from . import summary as S
 
 logger = logging.getLogger(__name__)
@@ -42,11 +43,51 @@ DEMO_SOURCES = (ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE)
 
 def parse_range(request) -> tuple[date_cls, date_cls]:
     """从请求里取 from / to，缺省为「今天」。"""
-    today = datetime.now().date()
-    f = request.GET.get("from")
-    t = request.GET.get("to")
-    start = datetime.strptime(f, "%Y-%m-%d").date() if f else today
-    end = datetime.strptime(t, "%Y-%m-%d").date() if t else today
+    start, end = parse_hours(request)
+    return start.date(), end.date()
+
+
+#: 前端时间控件可能给出的几种写法（精确到小时是 v1.4.0 的新要求）
+_HOUR_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H")
+
+
+def parse_hour(raw: str | None, *, default: datetime) -> datetime:
+    """把 `YYYY-MM-DD[ HH[:mm[:ss]]]` 解析成本地时间；纯日期取该日 00:00。
+
+    ⚠ 不要用 `datetime.fromisoformat` 之外的时区猜测：本项目全部按本地时间处理，
+    前端也统一用本地时间拼字符串（`toISOString` 会得到昨天，见 B-508 那条教训）。
+    """
+    if not raw:
+        return default
+    # 统一成空格分隔再解析：前端可能给 `2026-09-24T08:00`，也可能给 `2026-09-24 08:00`
+    text = raw.strip().replace("T", " ")
+    if len(text) == 10:  # 纯日期
+        return datetime.strptime(text, "%Y-%m-%d")
+    for fmt in _HOUR_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"时间格式无法解析：{raw}（期望 YYYY-MM-DD 或 YYYY-MM-DD HH）")
+
+
+def parse_hours(request) -> tuple[datetime, datetime]:
+    """取**精确到小时**的起止时点，缺省为「今天 00:00 → 现在」。
+
+    与 `parse_range` 的区别只在精度：这里返回 datetime，调用方可以按小时裁桶。
+    起止会被规范到整点（分秒归零），因为本项目的最小时间桶就是 1 小时。
+    """
+    now = datetime.now()
+    today = now.date()
+    default_start = datetime.combine(today, time.min)
+    default_end = now.replace(minute=0, second=0, microsecond=0)
+    try:
+        start = parse_hour(request.GET.get("from"), default=default_start)
+        end = parse_hour(request.GET.get("to"), default=default_end)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    start = start.replace(minute=0, second=0, microsecond=0)
+    end = end.replace(minute=0, second=0, microsecond=0)
     if end < start:
         start, end = end, start
     # 上限保护：一次最多查 366 天，避免把库和内存拖垮
@@ -75,15 +116,31 @@ def _workshop_meters() -> list[EnergyMeter]:
 # ══════════════════════════════════════════════════════════════
 
 
-def _hour_labels(start: date_cls, end: date_cls, now: datetime) -> list[tuple[date_cls, int]]:
-    """生成 [起点, 终点] 之间的全部（日期, 小时）桶，末日截止到当前小时。"""
+def _hour_labels(
+    start: date_cls,
+    end: date_cls,
+    now: datetime,
+    *,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> list[tuple[date_cls, int]]:
+    """生成 [起点, 终点] 之间的全部（日期, 小时）桶，末日截止到当前小时。
+
+    `start_at` / `end_at` 给定时按**整点闭区间**裁剪（v1.4.0 的「年月日时 → 年月日时」筛选），
+    不给时沿用旧的「整日」行为，保证大屏与既有调用方口径不变。
+    """
     out: list[tuple[date_cls, int]] = []
     d = start
     while d <= end:
         last_hour = now.hour if d == now.date() else 23
         if d == now.date() and now.hour == 0:
             last_hour = 0
-        for h in range(last_hour + 1):
+        if end_at is not None and d == end_at.date():
+            last_hour = min(last_hour, end_at.hour)
+        first_hour = 0
+        if start_at is not None and d == start_at.date():
+            first_hour = start_at.hour
+        for h in range(first_hour, last_hour + 1):
             out.append((d, h))
         d += timedelta(days=1)
     return out
@@ -222,11 +279,15 @@ def usage_range(
     scope: str = "all",
     line_code: str | None = None,
     now: datetime | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
 ) -> dict:
     """按时间段取用量。
 
     :param scope: 'workshop' 仅车间 / 'line' 指定单线 / 'all' 车间 + 各线
     :param granularity: 'hour' | 'day' | 'month'
+    :param start_at / end_at: 精确到小时的端点（v1.4.0）。只影响 hour 粒度 ——
+        day / month 的桶本身就是整天/整月，端点会被规范到所属周期边界。
     """
     now = now or datetime.now()
     if granularity == "hour":
@@ -247,7 +308,7 @@ def usage_range(
     target_lines = _lines_scope(line_code) if want_lines else []
 
     if granularity == "hour":
-        buckets = _hour_labels(start, end, now)
+        buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at)
         labels = [f"{d:%m-%d} {h:02d}" for d, h in buckets]
         wmat = None
         if want_workshop:
@@ -370,3 +431,224 @@ def _sum_optional(values) -> float | None:
     if not nums:
         return None
     return round(sum(nums), 3)
+
+
+# ══════════════════════════════════════════════════════════════
+#  数据中心：按能源的「累计用量 / 累计产量 / 累计单耗」+ 变动费用
+# ══════════════════════════════════════════════════════════════
+
+
+def _day_list(start: date_cls, end: date_cls, now: datetime) -> list[date_cls]:
+    """[start, end] 内**已经到来**的日期（未来日期没有数据，不生成桶）。"""
+    out: list[date_cls] = []
+    d = start
+    while d <= end and d <= now.date():
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _dec(v: float | None) -> Decimal | None:
+    return None if v is None else Decimal(str(v))
+
+
+def _cumulative(values: list[float | None]) -> tuple[list[float | None], list[int]]:
+    """逐桶累加，并给出「累加到这一格时吃进了几格可信数据」。
+
+    ⚠ 缺数格**跳过但如实计入 covered**：累计值本身仍然算得出来（它是已有部分的真实和），
+    但读者必须能看出「这个累计只覆盖了 N/M 格」，否则中断过采集的区间会被当成完整区间。
+    这是 B-403（进行中周期给覆盖度）在区间上的同款处理。
+    """
+    acc = 0.0
+    covered = 0
+    cum: list[float | None] = []
+    covers: list[int] = []
+    for v in values:
+        if v is not None:
+            acc += v
+            covered += 1
+        cum.append(round(acc, 3) if covered else None)
+        covers.append(covered)
+    return cum, covers
+
+
+def _unit_series(cum_usage: list[float | None], cum_out: list[float | None], scale: float) -> list[float | None]:
+    """累计单耗 = 累计用量 ÷（累计产量 ÷ scale）。产量缺 → None，绝不补 0。"""
+    out: list[float | None] = []
+    for u, o in zip(cum_usage, cum_out):
+        if u is None or o is None or o <= 0:
+            out.append(None)
+            continue
+        out.append(round(u / (o / scale), 3))
+    return out
+
+
+def _output_hour_series(lines: list[ProductionLine], buckets: list[tuple[date_cls, int]]) -> list[float | None]:
+    """按（日期, 小时）取真实产量；未接入的桶给 None（不是 0）。"""
+    if not lines or not buckets:
+        return [None for _ in buckets]
+    rows = (
+        ProductionHourly.objects.filter(
+            line__in=lines,
+            stat_date__in=sorted({d for d, _h in buckets}),
+            quality__in=ProductionHourly.TRUSTED,
+        )
+        .exclude(source__in=DEMO_SOURCES)
+        .values("stat_date", "stat_hour")
+        .annotate(t=Sum("output"))
+    )
+    got = {(r["stat_date"], r["stat_hour"]): r["t"] for r in rows}
+    return [_round(got[b]) if b in got else None for b in buckets]
+
+
+def _output_day_series(lines: list[ProductionLine], days: list[date_cls]) -> list[float | None]:
+    """按天的真实产量（瓶）；未接入的天给 None。"""
+    if not lines or not days:
+        return [None for _ in days]
+    rows = (
+        ProductionHourly.objects.filter(
+            line__in=lines, stat_date__in=days, quality__in=ProductionHourly.TRUSTED
+        )
+        .exclude(source__in=DEMO_SOURCES)
+        .values("stat_date")
+        .annotate(t=Sum("output"))
+    )
+    got = {r["stat_date"]: r["t"] for r in rows}
+    return [_round(got[d], 0) if d in got else None for d in days]
+
+
+def dashboard_range(
+    start_at: datetime,
+    end_at: datetime,
+    *,
+    granularity: str = "hour",
+    line_code: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """数据中心主数据：电 / 水 / 汽三张累计趋势图 + 单箱变动费用主图。
+
+    与 `/api/energy/range` 同源同口径（同一套 `_hour_matrix` 与汇总表），
+    这样后台看板、用量查询页、大屏三处的数字必然一致。
+
+    ⚠ 三条硬口径：
+      · 水 / 汽只有车间总表 —— `line_code` 给定时它们的序列一律 None，并置
+        `perLineAvailable=false`，前端据此**禁用勾选**，而不是画一条全零线；
+      · 产量未接入 → 累计产量 / 累计单耗 / 单箱变动费用一律 None；
+      · 单价或箱规未标定 → 费用整段 None，并在 `cost.blockers` 里写清缺哪一项。
+        缺项**不按 0 计入** —— 那会产出一个偏小的、看起来完全正常的费用。
+    """
+    now = now or datetime.now()
+    granularity = granularity if granularity in ("hour", "day") else "hour"
+    start, end = start_at.date(), end_at.date()
+    lines = _lines_scope(line_code)
+    meters = _line_meters(lines[0]) if (line_code and lines) else _workshop_meters()
+    per_line = line_code is not None
+
+    if granularity == "hour":
+        buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at)
+        labels = [f"{d:%m-%d} {h:02d}:00" for d, h in buckets]
+        emat = _hour_matrix(meters, buckets, start, end) if buckets else {}
+        kwh_vals = [_round(emat[b][0]) for b in buckets]
+        out_vals = _output_hour_series(lines, buckets)
+        if per_line:
+            water_vals = [None for _ in buckets]
+            steam_vals = [None for _ in buckets]
+        else:
+            water_vals = _utility_hour_series(EnergyType.WATER, buckets, start, end)
+            steam_vals = _utility_hour_series(EnergyType.STEAM, buckets, start, end)
+    else:
+        days = _day_list(start, end, now)
+        labels = [d.strftime("%m-%d") for d in days]
+        kwh_vals = [_round(_range_total_kwh(meters, d, d)) for d in days]
+        out_vals = _output_day_series(lines, days)
+        if per_line:
+            water_vals = [None for _ in days]
+            steam_vals = [None for _ in days]
+        else:
+            keys = [(d.strftime("%Y-%m-%d"), d.strftime("%m-%d")) for d in days]
+            water_vals = _utility_series(EnergyType.WATER, PeriodSummary.DIM_DAY, start, end, now, keys)
+            steam_vals = _utility_series(EnergyType.STEAM, PeriodSummary.DIM_DAY, start, end, now, keys)
+
+    cp = cost.load_params()
+    prod_real = any(v is not None for v in out_vals)
+    cum_out, _out_covers = _cumulative(out_vals) if prod_real else ([None] * len(labels), [0] * len(labels))
+
+    def block(values: list[float | None], unit: str) -> dict:
+        cum, covers = _cumulative(values)
+        return {
+            "unit": unit,
+            "values": values,
+            "cumulative": cum,
+            "cumulativeCovered": covers,
+            "outputCumulative": cum_out,
+            "unitCumulative": _unit_series(cum, cum_out, 1000.0),
+            "perLineAvailable": not per_line if unit == "t" else True,
+        }
+
+    energies = {
+        "electric": block(kwh_vals, "kWh"),
+        "water": block(water_vals, "t"),
+        "steam": block(steam_vals, "t"),
+    }
+
+    # ── 变动费用（元）与单箱变动费用（元/箱）──
+    cost_yuan: list[float | None] = []
+    per_case: list[float | None] = []
+    for k, w, s, o in zip(kwh_vals, water_vals, steam_vals, out_vals):
+        kk, ww, ss = _dec(k), _dec(w), _dec(s)
+        cost_yuan.append(_round(cost.variable_cost_yuan(kk, ww, ss, cp), 2))
+        per_case.append(_round(cost.per_case_cost(kk, ww, ss, _dec(o), cp), 2))
+
+    cum_cost, cost_covers = _cumulative(cost_yuan)
+    per_case_cum: list[float | None] = []
+    for c, o in zip(cum_cost, cum_out):
+        if c is None or o is None or o <= 0 or not cp.bottles_per_case:
+            per_case_cum.append(None)
+            continue
+        per_case_cum.append(round(c / (o / float(cp.bottles_per_case)), 2))
+
+    # ── 算不出费用时，把原因说清楚（界面上直接显示，不让人以为系统坏了）──
+    blockers: list[str] = []
+    missing_prices = [
+        label
+        for label, v in (("电价", cp.electric), ("工业水价", cp.water), ("蒸汽单价", cp.steam), ("箱规", cp.bottles_per_case))
+        if v is None or v <= 0
+    ]
+    if missing_prices:
+        blockers.append("成本参数未标定：" + "、".join(missing_prices) + "（后台「系统参数」页维护）")
+    if not prod_real:
+        blockers.append("产量数据源未接入，折不出箱数")
+    if not per_line:
+        if all(v is None for v in water_vals):
+            blockers.append("车间进水总表无数据")
+        if all(v is None for v in steam_vals):
+            blockers.append("蒸汽总表无数据")
+
+    return {
+        "from": start_at.strftime("%Y-%m-%d %H:%M"),
+        "to": end_at.strftime("%Y-%m-%d %H:%M"),
+        "granularity": granularity,
+        "line": line_code.upper() if line_code else None,
+        "labels": labels,
+        "bucketCount": len(labels),
+        "energies": energies,
+        "cost": {
+            "available": cp.complete and prod_real,
+            "values": cost_yuan,
+            "cumulative": cum_cost,
+            "cumulativeCovered": cost_covers,
+            "perCase": per_case,
+            "perCaseCumulative": per_case_cum,
+            "standardPerCase": float(cp.standard_per_case) if cp.standard_per_case is not None else None,
+            "blockers": blockers,
+        },
+        "productionAvailable": prod_real,
+        "totals": {
+            "kwh": _sum_optional(kwh_vals),
+            "waterT": _sum_optional(water_vals),
+            "steamT": _sum_optional(steam_vals),
+            "output": int(sum(v for v in out_vals if v is not None)) if prod_real else None,
+            "costYuan": _sum_optional(cost_yuan),
+            "perCaseCost": per_case_cum[-1] if per_case_cum else None,
+        },
+    }

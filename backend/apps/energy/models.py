@@ -39,6 +39,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from django.db import models
 
 
@@ -585,3 +587,40 @@ class EnergyCollectLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.gateway_id} {self.started_at:%Y-%m-%d %H:%M} {self.ok_count}/{self.total}"
+
+
+class SystemParam(models.Model):
+    """系统参数 —— 成本单价、箱规、标准费用等的**唯一真值来源**。
+
+    为什么落库而不是写在配置文件里：这些数由能源管理员/财务按周期维护（电价有峰谷、
+    汽价随结算调整），改一次不该发一次版；后台「系统参数」页就是它的维护入口。
+    与 ADR-007（阈值以系统参数为唯一真值）同一条思路。
+
+    ⚠ `value` 可空表示「**尚未标定**」，与「标定成 0」是两回事：
+      · 标准变动费用为 NULL → 图上不画那条对比虚线；
+      · 若当成 0，界面会出现「实际费用远高于标准 0.00 元/箱」的假结论 ——
+        与本项目反复强调的「缺数绝不补 0」是同一条铁律。
+    """
+
+    key = models.CharField("参数键", max_length=64, unique=True, help_text="代码里按这个键取值")
+    name = models.CharField("参数名称", max_length=64)
+    value = models.DecimalField("参数值", max_digits=14, decimal_places=4, null=True, blank=True)
+    unit = models.CharField("单位", max_length=24, blank=True, default="")
+    group = models.CharField("分组", max_length=24, default="成本参数")
+    remark = models.CharField("说明", max_length=200, blank=True, default="")
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+    updated_by = models.CharField("更新人", max_length=32, blank=True, default="")
+
+    class Meta:
+        db_table = "system_param"
+        ordering = ["group", "key"]
+        verbose_name = "系统参数"
+        verbose_name_plural = "系统参数"
+
+    def __str__(self) -> str:
+        return f"{self.key}={self.value}{self.unit}"
+
+    @property
+    def number(self) -> Decimal | None:
+        """取值：未标定为 None（调用方必须区分 None 与 0）。"""
+        return self.value

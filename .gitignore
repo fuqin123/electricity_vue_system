@@ -28,7 +28,6 @@ backend/config/settings.*.yaml
 
 # ── 本地工具数据（含会话记忆与日志，不入库）─────────────────
 .workbuddy/
-
 # ── 日志 ────────────────────────────────────────────────────
 logs/
 *.log
@@ -74,3 +73,4 @@ frontend/*-dist.tar.gz
 *-dist.tar.gz
 deploy/docker/.env
 deploy/docker/data/
+.qoder-credits/

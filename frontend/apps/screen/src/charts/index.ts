@@ -6,6 +6,7 @@ import * as echarts from 'echarts';
 import {
   energyModel,
   hexA,
+  HOUR_QUALITY_LABEL,
   int as fmtInt,
   lineColors,
   pad2,
@@ -341,7 +342,7 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
 /* ══════════════════════════════════════════════════════════
    今日分时产量与电耗（已产出实心 / 未到时段描边）
    ══════════════════════════════════════════════════════════ */
-export function todayChartOption(hours: HourPoint[], ratedTotal: number): echarts.EChartsOption {
+export function todayChartOption(hours: HourPoint[], ratedTotal: number, currentHour: number): echarts.EChartsOption {
   const cats = hours.map((x) => pad2(x.hour));
   const out = hours.map((x, i) => {
     if (x.future) {
@@ -370,13 +371,20 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number): echart
         const arr = ps as Array<{ dataIndex: number; marker: string; seriesName: string; value: number | null }>;
         const idx = arr[0].dataIndex;
         const h = hours[idx];
+        /**
+         * 状态后缀与「本线小时明细」同一套判定：进行中只看是不是当前整点，
+         * 已结束的异常小时必须写异常，不能因为 `partial` 就写进行中（B-518）。
+         */
+        const state = h.future
+          ? '计划'
+          : h.hour === currentHour
+            ? '进行中'
+            : h.quality && h.quality !== 'ok'
+              ? (HOUR_QUALITY_LABEL[h.quality] ?? '异常')
+              : '';
         let head =
           `<b style="color:#c9d0f5">${cats[idx]} 时</b>` +
-          (h.future
-            ? '<span style="color:#5f6ba8"> · 计划</span>'
-            : h.partial
-              ? '<span style="color:#5f6ba8"> · 进行中</span>'
-              : '') +
+          (state ? `<span style="color:#5f6ba8"> · ${state}</span>` : '') +
           '<br>';
         arr.forEach((p) => {
           if (p.value === null || p.value === undefined) return;

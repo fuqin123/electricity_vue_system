@@ -236,6 +236,48 @@ export const energyApi = {
     });
   },
 
+  /**
+   * 数据中心主数据（按能源的累计序列 + 单箱变动费用）。
+   * `from` / `to` 精确到小时，格式 `YYYY-MM-DD HH`。
+   */
+  async getDashboard(params: {
+    from?: string;
+    to?: string;
+    granularity?: 'hour' | 'day';
+    line?: string;
+  } = {}): Promise<DashboardResult> {
+    if (!useApi('energy.dashboard')) {
+      const empty: DashboardResult = {
+        from: params.from ?? '',
+        to: params.to ?? '',
+        granularity: params.granularity ?? 'hour',
+        labels: [],
+        bucketCount: 0,
+        energies: {
+          electric: { unit: 'kWh', values: [], cumulative: [], cumulativeCovered: [], outputCumulative: [], unitCumulative: [] },
+          water: { unit: 't', values: [], cumulative: [], cumulativeCovered: [], outputCumulative: [], unitCumulative: [], perLineAvailable: false },
+          steam: { unit: 't', values: [], cumulative: [], cumulativeCovered: [], outputCumulative: [], unitCumulative: [], perLineAvailable: false }
+        },
+        cost: {
+          available: false,
+          values: [],
+          cumulative: [],
+          cumulativeCovered: [],
+          perCase: [],
+          perCaseCumulative: [],
+          standardPerCase: null,
+          blockers: ['后端接口未启用，走演示数据']
+        },
+        productionAvailable: false,
+        totals: { kwh: null, waterT: null, steamT: null, output: null, costYuan: null, perCaseCost: null }
+      };
+      return delay(empty, 120);
+    }
+    return request<DashboardResult>('/api/energy/dashboard', {
+      params: { ...params, granularity: params.granularity ?? 'hour' }
+    });
+  },
+
   /** 小时用量明细（可导出 / 复核），支持时间范围与分页 */
   async getHourlyRange(params: {
     from: string;
@@ -288,6 +330,14 @@ export const adminApi = {
   async getParams(query: PageQuery = { page: 1, pageSize: 20 }): Promise<PageResult<SysParam>> {
     if (!useApi('admin.params')) return delay(page(mockParams(), query));
     return request<PageResult<SysParam>>('/api/admin/params', { params: query as Record<string, string> });
+  },
+  /**
+   * 修改系统参数（成本单价 / 箱规 / 标准变动费用等）。
+   * `value` 传 null 表示「清空 = 未标定」，与传 0 完全不同含义。
+   */
+  async saveParam(id: number, payload: Partial<SysParam>): Promise<SysParam> {
+    if (!useApi('admin.params')) return delay({ ...(payload as SysParam), id }, 220);
+    return request<SysParam>(`/api/admin/params/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
   },
   async getDicts(query: PageQuery = { page: 1, pageSize: 50 }): Promise<PageResult<DictItem>> {
     if (!useApi('admin.dicts')) return delay(page(mockDicts(), query));
@@ -400,6 +450,24 @@ export const adminApi = {
     if (!useApi('admin.collectLogs')) return delay(page(mockCollectLogs(), query));
     return request<PageResult<CollectLog>>('/api/admin/collect-logs', { params: query as Record<string, string> });
   },
+  /**
+   * 仪表读数查询：按时间（精确到小时）/ 网关 / 仪表筛 `energy_raw` 的**原始累计读数**。
+   *
+   * 与 getHourlyRange 的分工：那边是差分后的**用量**，这边是读数本身 ——
+   * 排查「倍率对不对、表有没有读歪」必须看原始累计值与报文，用量表里已经加工掉了。
+   */
+  async getReadings(query: ReadingQuery = {}): Promise<ReadingPage> {
+    const empty: ReadingPage = {
+      list: [],
+      total: 0,
+      page: query.page ?? 1,
+      pageSize: query.pageSize ?? 50,
+      from: query.from ?? '',
+      to: query.to ?? ''
+    };
+    if (!useApi('admin.readings')) return delay(empty, 140);
+    return request<ReadingPage>('/api/admin/readings', { params: query as unknown as Record<string, string> });
+  },
   async getOperationLogs(query: PageQuery = { page: 1, pageSize: 10 }): Promise<PageResult<OperationLog>> {
     if (!useApi('admin.logs.operation')) return delay(page(mockOperationLogs(), query));
     return request<PageResult<OperationLog>>('/api/admin/logs/operation', { params: query as Record<string, string> });
@@ -440,6 +508,104 @@ export interface UsageRangeResult {
   productionAvailable: boolean;
   bucketCount: number;
   cadence?: string;
+}
+
+/**
+ * 数据中心（后台首页）主数据 —— 按「电 / 水 / 汽」三张累计趋势图 + 单箱变动费用主图。
+ * 与 /api/energy/range 同源同口径，三处数字必然一致。
+ */
+export interface DashboardEnergyBlock {
+  /** 计量单位：kWh / t */
+  unit: string;
+  /** 每桶用量（缺数为 null，不是 0） */
+  values: (number | null)[];
+  /** 逐桶累计用量 */
+  cumulative: (number | null)[];
+  /** 累计到该桶时吃进了几格可信数据 —— 与 bucketCount 一起显示「已覆盖 N/M」 */
+  cumulativeCovered: number[];
+  /** 累计产量（瓶）；产量未接入时整段 null */
+  outputCumulative: (number | null)[];
+  /** 累计单耗（用量 ÷ 千瓶）；产量缺 → null */
+  unitCumulative: (number | null)[];
+  /** 该能源是否支持按线拆分（水/汽只有车间总表 → false） */
+  perLineAvailable?: boolean;
+}
+
+export interface DashboardCostBlock {
+  /** 算料是否齐全（单价 + 箱规 + 产量）。false 时下面几条序列都是 null */
+  available: boolean;
+  values: (number | null)[];
+  cumulative: (number | null)[];
+  cumulativeCovered: number[];
+  perCase: (number | null)[];
+  perCaseCumulative: (number | null)[];
+  /** 每月标准变动费用（元/箱）。null = 未标定 → 不画基准虚线 */
+  standardPerCase: number | null;
+  /** 算不出费用时的原因，界面原样显示，别让人以为系统坏了 */
+  blockers: string[];
+}
+
+export interface DashboardResult {
+  from: string;
+  to: string;
+  granularity: 'hour' | 'day';
+  line?: string | null;
+  labels: string[];
+  bucketCount: number;
+  energies: { electric: DashboardEnergyBlock; water: DashboardEnergyBlock; steam: DashboardEnergyBlock };
+  cost: DashboardCostBlock;
+  productionAvailable: boolean;
+  totals: {
+    kwh: number | null;
+    waterT: number | null;
+    steamT: number | null;
+    output: number | null;
+    costYuan: number | null;
+    perCaseCost: number | null;
+  };
+  cadence?: string;
+}
+
+/** 仪表原始读数（energy_raw）—— 累计值本身，不是用量 */
+export interface MeterReading {
+  id: number;
+  collectTime: string;
+  meter: string;
+  meterId: number;
+  meterName: string;
+  gateway: string;
+  gatewayId: number;
+  line: string;
+  lineName: string;
+  energy: string;
+  energyName: string;
+  /** 累计读数；采集失败为 null（不是 0 —— 0 会被差值当成真实读数） */
+  reading: number | null;
+  unit: string;
+  ok: boolean;
+  raw: string;
+  error: string;
+}
+
+export interface ReadingQuery {
+  from?: string;
+  to?: string;
+  gateway?: number | string;
+  meter?: number | string;
+  line?: string;
+  energy?: string;
+  ok?: 0 | 1;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface ReadingPage {
+  list: MeterReading[];
+  total: number;
+  page: number;
+  pageSize: number;
+  from: string;
+  to: string;
 }
 
 /** 单个计量点的试采结果 */

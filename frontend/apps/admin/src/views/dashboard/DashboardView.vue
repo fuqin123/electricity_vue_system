@@ -1,25 +1,90 @@
 <script setup lang="ts">
 /**
  * DashboardView —— 数据中心（后台首页）
- * 指标卡 + 三类趋势图 + 最新告警。数据来自 mock，接真实接口时无需改本页。
+ *
+ * v1.4.0 改版要点（口径全部来自 /api/energy/dashboard，与用量查询页、大屏同源）：
+ *  ① 顶部是**起止时间（精确到小时）**，整页数字都按这个区间出；
+ *  ② 主趋势图 = **单箱变动费用**，叠加「每月标准变动费用」水平虚线做对比；
+ *  ③ 三张**按能源分**的累计趋势图（电为主图、水/汽为辅），每张含累计用量 / 累计产量 / 累计单耗；
+ *  ④ 原「今日用量统计」删除，改为**区间累计用量**显示。
+ *
+ * ⚠ 产量与部分单价尚未接入，所以「累计产量 / 累计单耗 / 单箱变动费用」现在**必然为空**。
+ *   这是如实留空，不是坏了：界面必须把 cost.blockers 的原因显示出来，
+ *   也绝不拿电量反推产量凑一个数（ADR-013 / B-406 同一条铁律）。
  */
 import { computed, onMounted, ref } from 'vue';
-import { adminApi, big, energyModel, int, type AdminOverview } from '@eep/shared';
+import { ElMessage } from 'element-plus';
+import {
+  adminApi,
+  big,
+  energyApi,
+  int,
+  type AdminOverview,
+  type DashboardResult,
+  type DashboardEnergyBlock
+} from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
 import AlarmLevelTag from '@/components/AlarmLevelTag.vue';
-import { outputKwhOption, unitKwhCompareOption } from '@/utils/charts';
+import { costPerCaseOption, energyCumulativeOption, unitKwhCompareOption } from '@/utils/charts';
 import { notImplemented } from '@/utils/pending';
 
+/* ── 时间区间（精确到小时）─────────────────────────────── */
+
+function fmt(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:00`;
+}
+
+function defaultRange(): [string, string] {
+  const now = new Date();
+  return [fmt(new Date(now.getFullYear(), now.getMonth(), now.getDate())), fmt(now)];
+}
+
+const range = ref<[string, string]>(defaultRange());
+const granularity = ref<'hour' | 'day'>('hour');
 const loading = ref(true);
-const data = ref<AdminOverview | null>(null);
-const range = ref<'day' | 'month' | 'year'>('day');
+const dash = ref<DashboardResult | null>(null);
+const overview = ref<AdminOverview | null>(null);
+
+const QUICK: { label: string; span: number; gran: 'hour' | 'day' }[] = [
+  { label: '本小时起', span: 0, gran: 'hour' },
+  { label: '今日', span: 0, gran: 'hour' },
+  { label: '近 3 日', span: 3, gran: 'hour' },
+  { label: '近 30 日', span: 30, gran: 'day' }
+];
+
+function applyQuick(q: (typeof QUICK)[number]) {
+  const now = new Date();
+  if (q.label === '本小时起') {
+    range.value = [fmt(now), fmt(now)];
+  } else if (q.span === 0) {
+    range.value = [fmt(new Date(now.getFullYear(), now.getMonth(), now.getDate())), fmt(now)];
+  } else {
+    const from = new Date(now.getTime() - q.span * 86400000);
+    range.value = [fmt(from), fmt(now)];
+  }
+  granularity.value = q.gran;
+  void load();
+}
 
 async function load() {
+  if (!range.value?.[0] || !range.value?.[1]) {
+    ElMessage.warning('请选择起止时间');
+    return;
+  }
   loading.value = true;
   try {
-    data.value = await adminApi.getOverview();
+    // 两个请求互不依赖，并发出去；看板卡片与图表因此永远同一时刻出数
+    const [d, o] = await Promise.all([
+      energyApi.getDashboard({ from: range.value[0], to: range.value[1], granularity: granularity.value }),
+      adminApi.getOverview()
+    ]);
+    dash.value = d;
+    overview.value = o;
+  } catch (e) {
+    ElMessage.error((e as Error).message);
   } finally {
     loading.value = false;
   }
@@ -27,89 +92,201 @@ async function load() {
 
 onMounted(load);
 
-const kpi = computed(() => data.value?.kpi);
+/* ── 区间累计 KPI ─────────────────────────────────────── */
 
-/**
- * 单位电耗达成情况（越低越好）
- * ⚠ 产量未接入时 unitKwh 为 null —— 此时返回 'flat'，界面会显示 `--`，
- *   **不能**把 null 当 0 去比：0 kWh/千瓶 会被读成「能效完美」。
- */
-const unitTrend = computed<'up' | 'down' | 'flat'>(() => {
-  const d = data.value;
-  if (!d || d.kpi.unitKwh === null) return 'flat';
-  const diff = d.kpi.unitKwh - energyModel.targetUnitKwh;
-  if (Math.abs(diff) < 0.05) return 'flat';
-  return diff > 0 ? 'up' : 'down';
+const t = computed(() => dash.value?.totals ?? null);
+const kpi = computed(() => overview.value?.kpi);
+
+/** 单箱变动费用：算不出就是 null（显示 --），不能显示 0 */
+const perCaseText = computed(() => {
+  const v = t.value?.perCaseCost;
+  return v === null || v === undefined ? '--' : v.toFixed(2);
 });
 
-const trendOption = computed(() => {
-  const d = data.value;
+/* ── 图表 ─────────────────────────────────────────────── */
+
+const labelInterval = computed(() => {
+  const n = dash.value?.bucketCount ?? 0;
+  if (n <= 12) return 0;
+  if (n <= 31) return 2;
+  return Math.floor(n / 10);
+});
+
+const costOption = computed(() => {
+  const d = dash.value;
   if (!d) return null;
-  if (range.value === 'month') return outputKwhOption(d.daily30, { labelInterval: 2 });
-  if (range.value === 'year')
-    return outputKwhOption(d.monthly12, { outDiv: 10000, kwhDiv: 10000 });
-  return outputKwhOption(d.hourly, { outDiv: 1000, kwhDiv: 1000, outUnit: '千瓶', kwhUnit: '千kWh', labelInterval: 1 });
+  return costPerCaseOption(d.labels, d.cost.perCase, d.cost.standardPerCase, {
+    labelInterval: labelInterval.value
+  });
+});
+
+function blockOf(key: 'electric' | 'water' | 'steam'): DashboardEnergyBlock | null {
+  return dash.value?.energies[key] ?? null;
+}
+
+const unitUseLabel = (usageUnit: string) => `${usageUnit}/千瓶`;
+
+const electricOption = computed(() => {
+  const d = dash.value;
+  const b = blockOf('electric');
+  if (!d || !b) return null;
+  return energyCumulativeOption({
+    labels: d.labels,
+    usage: b.cumulative,
+    usageUnit: b.unit,
+    output: b.outputCumulative,
+    unitUse: b.unitCumulative,
+    unitUseLabel: unitUseLabel(b.unit),
+    color: '#1664ff',
+    labelInterval: labelInterval.value
+  });
+});
+
+const waterOption = computed(() => {
+  const d = dash.value;
+  const b = blockOf('water');
+  if (!d || !b) return null;
+  return energyCumulativeOption({
+    labels: d.labels,
+    usage: b.cumulative,
+    usageUnit: b.unit,
+    output: b.outputCumulative,
+    unitUse: b.unitCumulative,
+    unitUseLabel: unitUseLabel(b.unit),
+    color: '#387bff',
+    labelInterval: labelInterval.value
+  });
+});
+
+const steamOption = computed(() => {
+  const d = dash.value;
+  const b = blockOf('steam');
+  if (!d || !b) return null;
+  return energyCumulativeOption({
+    labels: d.labels,
+    usage: b.cumulative,
+    usageUnit: b.unit,
+    output: b.outputCumulative,
+    unitUse: b.unitCumulative,
+    unitUseLabel: unitUseLabel(b.unit),
+    color: '#bd7e00',
+    labelInterval: labelInterval.value
+  });
 });
 
 const compareOption = computed(() =>
-  data.value ? unitKwhCompareOption(data.value.lineUnitKwh, energyModel.targetUnitKwh) : null
+  overview.value ? unitKwhCompareOption(overview.value.lineUnitKwh, 8.2) : null
 );
 
-const monthlyOption = computed(() => (data.value ? outputKwhOption(data.value.monthly12, { labelInterval: 0 }) : null));
-
-function reloadAll() {
-  void load();
+/** 区间覆盖度：累计值吃进了几格可信数据（中断过的区间必须看得出来） */
+function coverage(b: DashboardEnergyBlock | null): string {
+  const n = dash.value?.bucketCount ?? 0;
+  if (!b || !n) return '';
+  const covered = b.cumulativeCovered[b.cumulativeCovered.length - 1] ?? 0;
+  return covered === n ? `${n} 个时段全覆盖` : `已覆盖 ${covered}/${n} 个时段`;
 }
+
+const costNote = computed(() => {
+  const d = dash.value;
+  if (!d) return '';
+  if (d.cost.available) return '实际值 vs 每月标准变动费用';
+  return d.cost.blockers.join(' · ') || '算料未齐，暂时算不出';
+});
 </script>
 
 <template>
   <div>
     <PageHeader>
       <template #actions>
-        <el-button :loading="loading" @click="reloadAll">
-          <el-icon><Refresh /></el-icon>&nbsp;刷新
-        </el-button>
+        <el-button :loading="loading" @click="load"><el-icon><Refresh /></el-icon>&nbsp;刷新</el-button>
         <el-button type="primary" plain @click="notImplemented('导出看板快照')">
           <el-icon><Download /></el-icon>&nbsp;导出
         </el-button>
       </template>
     </PageHeader>
 
-    <!-- 指标卡 -->
+    <!-- 时间区间：整页数字都跟着它走 -->
+    <el-card shadow="never" class="mb-16">
+      <div class="query">
+        <span class="query__label">统计区间</span>
+        <el-date-picker
+          v-model="range"
+          type="datetimerange"
+          value-format="YYYY-MM-DD HH:mm"
+          format="YYYY-MM-DD HH:mm"
+          range-separator="至"
+          start-placeholder="开始时间"
+          end-placeholder="结束时间"
+          :clearable="false"
+          style="width: 380px"
+        />
+        <span class="query__label">粒度</span>
+        <el-radio-group v-model="granularity" size="small" @change="load">
+          <el-radio-button value="hour">按小时</el-radio-button>
+          <el-radio-button value="day">按天</el-radio-button>
+        </el-radio-group>
+        <el-button-group>
+          <el-button v-for="q in QUICK" :key="q.label" size="small" @click="applyQuick(q)">{{ q.label }}</el-button>
+        </el-button-group>
+        <el-button type="primary" size="small" :loading="loading" @click="load">查询</el-button>
+        <span class="query__hint">
+          {{ dash ? `${dash.from} 至 ${dash.to} · ${dash.bucketCount} 个时段` : '加载中…' }}
+        </span>
+      </div>
+    </el-card>
+
+    <!-- 算料不齐时把原因摊开说，别只给一张空图 -->
+    <el-alert
+      v-if="dash && !dash.cost.available"
+      type="info"
+      :closable="false"
+      show-icon
+      class="mb-16"
+      title="单箱变动费用暂时算不出"
+      :description="dash.cost.blockers.join('；') + '。相关指标如实留空（显示 --），不拿电量反推产量凑数。'"
+    />
+
+    <!-- 区间累计指标卡（原「今日用量统计」已按 v1.4.0 改为累计口径） -->
     <div class="stat-grid">
-      <!-- 产量未接入：todayOutput 为 null → 显示 --（不能用 0 兜底，
-           0 会被读成「确实没产出」，与「还没接数据」是两回事） -->
       <StatCard
-        label="今日产量"
-        :value="big(kpi?.todayOutput, '').v"
-        :unit="big(kpi?.todayOutput, '瓶').u"
+        label="区间累计用电"
+        :value="big(t?.kwh ?? 0, '').v"
+        :unit="big(t?.kwh ?? 0, 'kWh').u"
         color="#1664ff"
         :loading="loading"
-        :foot="kpi?.todayOutput == null ? '产量数据源未接入，统一显示 --' : '实时累计，随采集刷新'"
+        :foot="`折合 ${int(t?.kwh ?? 0)} kWh`"
       />
       <StatCard
-        label="今日用电"
-        :value="big(kpi?.todayKwh ?? 0, '').v"
-        :unit="big(kpi?.todayKwh ?? 0, 'kWh').u"
+        label="区间累计用水"
+        :value="t?.waterT === null || t?.waterT === undefined ? '--' : t.waterT.toFixed(2)"
+        unit="t"
         color="#387bff"
         :loading="loading"
-        :foot="`折合 ${int(kpi?.todayKwh ?? 0)} kWh`"
+        :foot="t?.waterT == null ? '车间进水总表未接入' : '车间总表，不可拆分到线别'"
       />
-      <!-- 产量未接入时单位电耗算不出来（分母为 0），显示 `--` 而不是 0 -->
       <StatCard
-        label="综合单位电耗"
-        :value="kpi?.unitKwh === null || kpi?.unitKwh === undefined ? '--' : kpi.unitKwh.toFixed(2)"
-        unit="kWh/千瓶"
-        :color="unitTrend === 'up' ? '#d7312a' : '#2a814b'"
-        :trend="unitTrend"
+        label="区间累计用汽"
+        :value="t?.steamT === null || t?.steamT === undefined ? '--' : t.steamT.toFixed(2)"
+        unit="t"
+        color="#bd7e00"
         :loading="loading"
-        :foot="
-          kpi?.unitKwh === null || kpi?.unitKwh === undefined
-            ? '产量未接入，暂时算不出'
-            : `考核目标 ${energyModel.targetUnitKwh.toFixed(2)} · ${
-                kpi.unitKwh > energyModel.targetUnitKwh ? '未达标' : '达标'
-              }`
-        "
+        :foot="t?.steamT == null ? '蒸汽总表本区间无数据' : '蒸汽总表（已温压补偿）'"
+      />
+      <StatCard
+        label="区间累计产量"
+        :value="big(t?.output ?? null, '').v"
+        :unit="big(t?.output ?? null, '瓶').u"
+        color="#86909c"
+        :loading="loading"
+        :foot="dash && !dash.productionAvailable ? '产量数据源未接入，统一显示 --' : '来自 MES / 计数器报工'"
+      />
+      <StatCard
+        label="单箱变动费用"
+        :value="perCaseText"
+        unit="元/箱"
+        color="#2a814b"
+        :loading="loading"
+        :foot="dash?.cost.standardPerCase ? `标准 ${dash.cost.standardPerCase} 元/箱` : '标准值未标定，暂不比对'"
       />
       <StatCard
         label="未处理告警"
@@ -136,26 +313,52 @@ function reloadAll() {
       />
     </div>
 
-    <!-- 趋势图 -->
+    <!-- 主趋势图：单箱变动费用 vs 每月标准变动费用 -->
     <div class="card">
       <div class="card__head">
-        <h3 class="card__title">产量与用电趋势</h3>
-        <el-radio-group v-model="range" size="small">
-          <el-radio-button value="day">今日分时</el-radio-button>
-          <el-radio-button value="month">近 30 日</el-radio-button>
-          <el-radio-button value="year">近 12 个月</el-radio-button>
-        </el-radio-group>
+        <h3 class="card__title">单箱变动费用趋势</h3>
+        <span class="card__extra">{{ costNote }}</span>
       </div>
       <el-skeleton v-if="loading" :rows="6" animated />
-      <ChartPanel v-else title="" :option="trendOption" :height="300" class="chart-inner" />
+      <ChartPanel v-else title="" :option="costOption" :height="300" class="chart-inner" />
     </div>
 
-    <!-- 对标 + 月度 -->
+    <!-- 三张按能源分的累计趋势图：电为主，水/汽为辅 -->
+    <div class="card mt-16">
+      <div class="card__head">
+        <h3 class="card__title">电力累计用量 · 产量 · 单耗</h3>
+        <span class="card__extra">{{ coverage(dash?.energies.electric ?? null) }}</span>
+      </div>
+      <el-skeleton v-if="loading" :rows="7" animated />
+      <ChartPanel v-else title="" :option="electricOption" :height="320" class="chart-inner" />
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card__head">
+          <h3 class="card__title">水累计用量 · 产量 · 单耗</h3>
+          <span class="card__extra">车间总表 · {{ coverage(dash?.energies.water ?? null) }}</span>
+        </div>
+        <el-skeleton v-if="loading" :rows="5" animated />
+        <ChartPanel v-else title="" :option="waterOption" :height="260" class="chart-inner" />
+      </div>
+
+      <div class="card">
+        <div class="card__head">
+          <h3 class="card__title">汽累计用量 · 产量 · 单耗</h3>
+          <span class="card__extra">车间总表 · {{ coverage(dash?.energies.steam ?? null) }}</span>
+        </div>
+        <el-skeleton v-if="loading" :rows="5" animated />
+        <ChartPanel v-else title="" :option="steamOption" :height="260" class="chart-inner" />
+      </div>
+    </div>
+
+    <!-- 对标 + 最新告警 -->
     <div class="grid-2">
       <div class="card">
         <div class="card__head">
           <h3 class="card__title">各产线单位电耗对标</h3>
-          <span class="card__extra">目标 {{ energyModel.targetUnitKwh.toFixed(2) }} kWh/千瓶</span>
+          <span class="card__extra">目标 8.20 kWh/千瓶</span>
         </div>
         <ChartPanel v-if="!loading" title="" :option="compareOption" :height="260" class="chart-inner" />
         <el-skeleton v-else :rows="5" animated />
@@ -163,45 +366,27 @@ function reloadAll() {
 
       <div class="card">
         <div class="card__head">
-          <h3 class="card__title">近 12 个月产量与用电</h3>
-          <span class="card__extra">当月为进行中</span>
+          <h3 class="card__title">最新告警</h3>
+          <el-button link type="primary" @click="$router.push('/alarm/realtime')">
+            查看全部<el-icon><ArrowRight /></el-icon>
+          </el-button>
         </div>
-        <ChartPanel v-if="!loading" title="" :option="monthlyOption" :height="260" class="chart-inner" />
-        <el-skeleton v-else :rows="5" animated />
-      </div>
-    </div>
-
-    <!-- 最新告警 -->
-    <div class="card">
-      <div class="card__head">
-        <h3 class="card__title">最新告警</h3>
-        <el-button link type="primary" @click="$router.push('/alarm/realtime')">
-          查看全部<el-icon><ArrowRight /></el-icon>
-        </el-button>
-      </div>
-      <el-table v-loading="loading" :data="data?.latestAlarms ?? []" size="default">
-        <el-table-column prop="code" label="告警编号" width="180">
-          <template #default="{ row }"><span class="t-mono">{{ row.code }}</span></template>
-        </el-table-column>
-        <el-table-column label="级别" width="80">
-          <template #default="{ row }"><AlarmLevelTag :level="row.level" /></template>
-        </el-table-column>
-        <el-table-column prop="source" label="来源" width="160" show-overflow-tooltip />
-        <el-table-column prop="content" label="内容" min-width="240" show-overflow-tooltip />
-        <el-table-column label="触发值 / 阈值" width="140">
-          <template #default="{ row }"><span class="t-mono">{{ row.value }} / {{ row.threshold }}</span></template>
-        </el-table-column>
-        <el-table-column prop="occurredAt" label="发生时间" width="180">
-          <template #default="{ row }"><span class="t-mono">{{ row.occurredAt }}</span></template>
-        </el-table-column>
-        <el-table-column label="状态" width="90">
-          <template #default="{ row }">
-            <el-tag :type="row.status === 'active' ? 'danger' : row.status === 'acked' ? 'warning' : 'success'" size="small">
-              {{ row.status === 'active' ? '未处理' : row.status === 'acked' ? '已确认' : '已恢复' }}
-            </el-tag>
+        <el-table v-loading="loading" :data="overview?.latestAlarms ?? []" size="default">
+          <el-table-column prop="code" label="告警编号" min-width="150">
+            <template #default="{ row }"><span class="t-mono">{{ row.code }}</span></template>
+          </el-table-column>
+          <el-table-column label="级别" width="80">
+            <template #default="{ row }"><AlarmLevelTag :level="row.level" /></template>
+          </el-table-column>
+          <el-table-column prop="content" label="内容" min-width="220" show-overflow-tooltip />
+          <el-table-column prop="occurredAt" label="发生时间" width="170">
+            <template #default="{ row }"><span class="t-mono">{{ row.occurredAt }}</span></template>
+          </el-table-column>
+          <template #empty>
+            <el-empty description="告警引擎未接入，暂无数据" :image-size="60" />
           </template>
-        </el-table-column>
-      </el-table>
+        </el-table>
+      </div>
     </div>
   </div>
 </template>
@@ -217,6 +402,8 @@ function reloadAll() {
 }
 
 .card + .card { margin-top: 16px; }
+.mt-16 { margin-top: 16px; }
+.mb-16 { margin-bottom: 16px; }
 
 /* 内嵌图表卡：去掉标题栏留白，避免卡片套卡片 */
 .chart-inner {
@@ -224,5 +411,24 @@ function reloadAll() {
   padding: 0;
 
   :deep(.card__head) { display: none; }
+}
+
+.query {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.query__label {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+
+.query__hint {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  font-family: var(--el-font-family-mono, monospace);
 }
 </style>

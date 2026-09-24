@@ -7,7 +7,7 @@
  * ⚠ 替换真实接口时，只需改动 api 适配层（api/index.ts），页面代码无需变更。
  */
 
-import { linesConfig } from '../config';
+import { linesConfig, plantConfig } from '../config';
 import { isoDateTime, makeRng, pad2, pick, round2 } from '../format';
 import { buildSnapshot } from './energy';
 import type {
@@ -464,7 +464,8 @@ export function mockLoginLogs(): LoginLog[] {
       id: i + 1,
       username: pick(PREFIX, rng),
       ip: `10.20.31.${20 + (i % 60)}`,
-      location: '内网 · 华东生产基地',
+      // 厂名只有一处定义（config.plantConfig），演示数据也不再另写一份，避免改名后漏改
+      location: `内网 · ${plantConfig.name}`,
       browser: i % 2 === 0 ? 'Chrome 131' : 'Edge 131',
       os: i % 2 === 0 ? 'Windows 10' : 'Windows 11',
       result: ok ? 'success' : 'failed',

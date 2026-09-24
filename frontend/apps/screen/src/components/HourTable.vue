@@ -5,7 +5,7 @@
  * 同时统计应报 / 实收点数，供「数据上报质量」复用。
  */
 import { computed } from 'vue';
-import { int, pad2, rise, thresholds, type LineData } from '@eep/shared';
+import { HOUR_QUALITY_LABEL, int, pad2, rise, thresholds, type HourPoint, type LineData } from '@eep/shared';
 
 const props = defineProps<{
   line: LineData;
@@ -26,6 +26,29 @@ interface Row {
   cls: string;
 }
 
+/**
+ * 状态判定。
+ *
+ * ⚠ 「进行中」只能由「这个小时还没结束」推出（`h === currentHour`），**不能看 `partial`**。
+ *   `partial` 的真实含义是「本小时合计不完整」，已结束的整点也会因为有表缺数 /
+ *   端点偏离整点 / 尖峰被排除而被标成 partial —— 那是**数据异常**。
+ *   以前混用的后果：8 点那个异常小时到了 10 点还显示「进行中」，
+ *   现场以为等一会儿就会补上，其实它永远不会再变了（B-518）。
+ */
+function statusOf(s: HourPoint, h: number, currentHour: number): { text: string; color: string; cls: string } {
+  if (s.future) return { text: '计划', color: 'var(--t5)', cls: 'is-future' };
+  if (h === currentHour) return { text: '进行中', color: 'var(--cyan)', cls: '' };
+  if (s.stopped) return { text: '停线', color: 'var(--magenta)', cls: '' };
+  if (s.quality && s.quality !== 'ok') {
+    return { text: HOUR_QUALITY_LABEL[s.quality] ?? '异常', color: 'var(--amber)', cls: 'is-missing' };
+  }
+  // 接口没带 quality（老数据）时退回按值判定，总之不能报「正常」
+  if (s.kwh === null || s.kwh === undefined) {
+    return { text: HOUR_QUALITY_LABEL.missing, color: 'var(--amber)', cls: 'is-missing' };
+  }
+  return { text: '正常', color: 'var(--green)', cls: '' };
+}
+
 const rows = computed<Row[]>(() => {
   const { line, currentHour } = props;
   const order: number[] = [];
@@ -35,30 +58,7 @@ const rows = computed<Row[]>(() => {
   return order.map((h) => {
     const s = line.hours[h];
     const prev = h > 0 ? line.hours[h - 1] : null;
-    let cls = s.future ? 'is-future' : '';
-    let status = '';
-    let statusColor = '';
-
-    if (s.future) {
-      status = '计划';
-      statusColor = 'var(--t5)';
-    } else {
-      if (s.kwh === null || s.kwh === undefined) {
-        status = '电表缺失';
-        statusColor = 'var(--amber)';
-        cls = 'is-missing';
-      }
-      if (s.stopped) {
-        status = '停线';
-        statusColor = 'var(--magenta)';
-      } else if (s.partial) {
-        status = '进行中';
-        statusColor = 'var(--cyan)';
-      } else if (!status) {
-        status = '正常';
-        statusColor = 'var(--green)';
-      }
-    }
+    const { text: status, color: statusColor, cls } = statusOf(s, h, currentHour);
 
     const dlt =
       s.unitKwh !== null && prev && prev.unitKwh !== null && !s.partial && !s.stopped
