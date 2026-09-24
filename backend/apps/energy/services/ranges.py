@@ -25,12 +25,19 @@ from decimal import Decimal
 
 from django.db.models import Sum
 
-from ..models import HourlyProduction, HourlyUsage, Line, Meter, PeriodSummary
+from ..models import (
+    EnergyHourly,
+    EnergyMeter,
+    EnergyType,
+    PeriodSummary,
+    ProductionHourly,
+    ProductionLine,
+)
 from . import summary as S
 
 logger = logging.getLogger(__name__)
 
-DEMO_SOURCES = (HourlyProduction.SOURCE_DEMO, HourlyProduction.SOURCE_NONE)
+DEMO_SOURCES = (ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE)
 
 
 def parse_range(request) -> tuple[date_cls, date_cls]:
@@ -48,19 +55,19 @@ def parse_range(request) -> tuple[date_cls, date_cls]:
     return start, end
 
 
-def _lines_scope(line_code: str | None) -> list[Line]:
+def _lines_scope(line_code: str | None) -> list[ProductionLine]:
     if line_code:
-        ln = Line.objects.filter(code=line_code.upper()).first()
+        ln = ProductionLine.objects.filter(line_code=line_code.upper()).first()
         return [ln] if ln else []
-    return list(Line.objects.filter(enabled=True).order_by("sort", "code"))
+    return list(ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE).order_by("sort", "line_code"))
 
 
-def _line_meters(line: Line) -> list[Meter]:
-    return [m for m in line.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
+def _line_meters(line: ProductionLine) -> list[EnergyMeter]:
+    return [m for m in line.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
 
 
-def _workshop_meters() -> list[Meter]:
-    return list(Meter.objects.filter(kind=Meter.KIND_ELEC, enabled=True))
+def _workshop_meters() -> list[EnergyMeter]:
+    return list(EnergyMeter.objects.filter(energy_type__type_code=EnergyType.ELECTRIC, enabled=True))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -82,38 +89,38 @@ def _hour_labels(start: date_cls, end: date_cls, now: datetime) -> list[tuple[da
     return out
 
 
-def _hour_matrix(meters: list[Meter], buckets: list[tuple[date_cls, int]], start: date_cls, end: date_cls):
+def _hour_matrix(meters: list[EnergyMeter], buckets: list[tuple[date_cls, int]], start: date_cls, end: date_cls):
     """返回 {bucket: (合计|None, quality)}。
 
     口径与小时接口一致：**任一计量点缺数/换表，该小时合计就不成立（给 None）**，
     而不是「有几块算几块」的偏小值。
     """
-    rows = HourlyUsage.objects.filter(
-        meter__in=meters, date__gte=start, date__lte=end
-    ).values("date", "hour", "usage", "quality", "meter_id")
+    rows = EnergyHourly.objects.filter(
+        meter__in=meters, stat_date__gte=start, stat_date__lte=end
+    ).values("stat_date", "stat_hour", "consumption", "quality", "meter_id")
 
     grouped: dict[tuple[date_cls, int], list[dict]] = {}
     for r in rows:
-        grouped.setdefault((r["date"], r["hour"]), []).append(r)
+        grouped.setdefault((r["stat_date"], r["stat_hour"]), []).append(r)
 
     need = len(meters)
     out: dict[tuple[date_cls, int], tuple[Decimal | None, str]] = {}
     for b in buckets:
         got = grouped.get(b, [])
         if len(got) < need:
-            out[b] = (None, HourlyUsage.Q_MISSING)
+            out[b] = (None, EnergyHourly.Q_MISSING)
             continue
-        bad = [r for r in got if r["quality"] in (HourlyUsage.Q_MISSING, HourlyUsage.Q_RESET)]
+        bad = [r for r in got if r["quality"] in (EnergyHourly.Q_MISSING, EnergyHourly.Q_RESET)]
         if bad:
             out[b] = (None, bad[0]["quality"])
             continue
-        usable = [r for r in got if r["quality"] in HourlyUsage.TRUSTED]
+        usable = [r for r in got if r["quality"] in EnergyHourly.TRUSTED]
         if not usable:
             # 同 snapshot.py：一块表都没给出可信值时，合计是 None 而不是 0
-            out[b] = (None, HourlyUsage.Q_PARTIAL)
+            out[b] = (None, EnergyHourly.Q_PARTIAL)
             continue
-        total = sum((r["usage"] or Decimal(0) for r in usable), Decimal(0))
-        quality = HourlyUsage.Q_OK if len(usable) == len(got) else HourlyUsage.Q_PARTIAL
+        total = sum((r["consumption"] or Decimal(0) for r in usable), Decimal(0))
+        quality = EnergyHourly.Q_OK if len(usable) == len(got) else EnergyHourly.Q_PARTIAL
         out[b] = (total, quality)
     return out
 
@@ -123,10 +130,9 @@ def _hour_matrix(meters: list[Meter], buckets: list[tuple[date_cls, int]], start
 # ══════════════════════════════════════════════════════════════
 
 
-def _summary_series(dim: str, scope: str, line: Line | None, keys: list[str]) -> dict[str, PeriodSummary]:
-    qs = PeriodSummary.objects.filter(dim=dim, scope=scope, period_key__in=keys)
-    qs = qs.filter(line=line) if line is not None else qs.filter(line__isnull=True)
-    return {r.period_key: r for r in qs}
+def _summary_series(dim: str, scope: str, line: ProductionLine | None, keys: list[str]):
+    """日/月/年序列 —— 走 summary.period_rows（它把按能源类型分行的表拼回一行）。"""
+    return S.period_rows(dim, scope, line, keys)
 
 
 def _period_keys(dim: str, start: date_cls, end: date_cls, now: datetime) -> list[tuple[str, str]]:
@@ -152,17 +158,17 @@ def _period_keys(dim: str, start: date_cls, end: date_cls, now: datetime) -> lis
     return out
 
 
-def _range_total_kwh(meters: list[Meter], start: date_cls, end: date_cls) -> Decimal | None:
-    agg = HourlyUsage.objects.filter(
-        meter__in=meters, date__gte=start, date__lte=end, quality__in=HourlyUsage.TRUSTED
-    ).aggregate(t=Sum("usage"))
+def _range_total_kwh(meters: list[EnergyMeter], start: date_cls, end: date_cls) -> Decimal | None:
+    agg = EnergyHourly.objects.filter(
+        meter__in=meters, stat_date__gte=start, stat_date__lte=end, quality__in=EnergyHourly.TRUSTED
+    ).aggregate(t=Sum("consumption"))
     return agg["t"]
 
 
-def _range_output(lines: list[Line], start: date_cls, end: date_cls) -> Decimal:
+def _range_output(lines: list[ProductionLine], start: date_cls, end: date_cls) -> Decimal:
     total = (
-        HourlyProduction.objects.filter(
-            line__in=lines, date__gte=start, date__lte=end, quality__in=HourlyProduction.TRUSTED
+        ProductionHourly.objects.filter(
+            line__in=lines, stat_date__gte=start, stat_date__lte=end, quality__in=ProductionHourly.TRUSTED
         )
         .exclude(source__in=DEMO_SOURCES)
         .aggregate(t=Sum("output"))["t"]
@@ -174,13 +180,13 @@ def _utility_series(
     kind: str, dim: str, start: date_cls, end: date_cls, now: datetime, keys: list[tuple[str, str]]
 ) -> list[float | None]:
     """车间水 / 汽：只有总表，不拆分到线别。"""
-    meters = list(Meter.objects.filter(kind=kind, enabled=True))
+    meters = list(EnergyMeter.objects.filter(energy_type__type_code=kind, enabled=True))
     if not meters:
         return [None for _ in keys]
 
     if dim == PeriodSummary.DIM_DAY:
         rows = _summary_series(PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_WORKSHOP, None, [k for k, _ in keys])
-        field = "water_t" if kind == Meter.KIND_WATER else "steam_t"
+        field = "water_t" if kind == EnergyType.WATER else "steam_t"
         out: list[float | None] = []
         for k, _lab in keys:
             row = rows.get(k)
@@ -193,12 +199,12 @@ def _utility_series(
         s, e = S.period_bounds(dim, key)
         row = _summary_series(dim, PeriodSummary.SCOPE_WORKSHOP, None, [key]).get(key)
         if row is not None:
-            val = row.water_t if kind == Meter.KIND_WATER else row.steam_t
+            val = row.water_t if kind == EnergyType.WATER else row.steam_t
             out.append(float(val) if val is not None else None)
             continue
-        agg = HourlyUsage.objects.filter(
-            meter__in=meters, date__gte=s, date__lte=min(e, now.date()), quality__in=HourlyUsage.TRUSTED
-        ).aggregate(t=Sum("usage"))
+        agg = EnergyHourly.objects.filter(
+            meter__in=meters, stat_date__gte=s, stat_date__lte=min(e, now.date()), quality__in=EnergyHourly.TRUSTED
+        ).aggregate(t=Sum("consumption"))
         out.append(float(agg["t"]) if agg["t"] is not None else None)
     return out
 
@@ -259,8 +265,8 @@ def usage_range(
             mat = _hour_matrix(_line_meters(ln), buckets, start, end)
             series.append(
                 {
-                    "key": ln.code,
-                    "name": ln.name,
+                    "key": ln.line_code,
+                    "name": ln.line_name,
                     "unit": "kWh",
                     "values": [_round(mat[b][0]) for b in buckets],
                 }
@@ -268,8 +274,8 @@ def usage_range(
         if wmat is not None:
             quality_series = [wmat[b][1] for b in buckets]
         util = {
-            "water": _utility_hour_series(Meter.KIND_WATER, buckets, start, end),
-            "steam": _utility_hour_series(Meter.KIND_STEAM, buckets, start, end),
+            "water": _utility_hour_series(EnergyType.WATER, buckets, start, end),
+            "steam": _utility_hour_series(EnergyType.STEAM, buckets, start, end),
         }
     else:
         keys = _period_keys(dim, start, end, now)
@@ -298,25 +304,25 @@ def usage_range(
                     continue
                 s, e = S.period_bounds(dim, k)
                 vals.append(_round(_range_total_kwh(_line_meters(ln), s, min(e, now.date()))))
-            series.append({"key": ln.code, "name": ln.name, "unit": "kWh", "values": vals})
+            series.append({"key": ln.line_code, "name": ln.line_name, "unit": "kWh", "values": vals})
 
         util = {
-            "water": _utility_series(Meter.KIND_WATER, dim, start, end, now, keys),
-            "steam": _utility_series(Meter.KIND_STEAM, dim, start, end, now, keys),
+            "water": _utility_series(EnergyType.WATER, dim, start, end, now, keys),
+            "steam": _utility_series(EnergyType.STEAM, dim, start, end, now, keys),
         }
 
     # ── 合计 ──
-    all_lines = list(Line.objects.filter(enabled=True))
+    all_lines = list(ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE))
     if scope == "line" and line_code:
-        all_lines = [ln for ln in all_lines if ln.code == line_code.upper()]
+        all_lines = [ln for ln in all_lines if ln.line_code == line_code.upper()]
     meters = _workshop_meters() if scope in ("workshop", "all") else (
         _line_meters(all_lines[0]) if all_lines else []
     )
     kwh_total = _range_total_kwh(meters, start, min(end, now.date()))
     out_total = _range_output(all_lines, start, min(end, now.date()))
     prod_real = (
-        HourlyProduction.objects.filter(
-            line__in=all_lines, date__gte=start, date__lte=min(end, now.date())
+        ProductionHourly.objects.filter(
+            line__in=all_lines, stat_date__gte=start, stat_date__lte=min(end, now.date())
         )
         .exclude(source__in=DEMO_SOURCES)
         .exists()
@@ -344,7 +350,7 @@ def usage_range(
 
 
 def _utility_hour_series(kind: str, buckets, start: date_cls, end: date_cls) -> list[float | None]:
-    meters = list(Meter.objects.filter(kind=kind, enabled=True))
+    meters = list(EnergyMeter.objects.filter(energy_type__type_code=kind, enabled=True))
     if not meters:
         return [None for _ in buckets]
     mat = _hour_matrix(meters, buckets, start, end)

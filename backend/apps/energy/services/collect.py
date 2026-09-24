@@ -3,7 +3,7 @@
 设计要点：
   · **一个网关一个连接**：13 块电表分布在 4 个串口服务器上，只开 4 条 TCP 连接。
   · **单点失败不影响整轮**：某个从站超时/接线掉了，其余点位照常入库，
-    失败原因写进 Reading.error 与 Meter.last_error，后台能直接看到是哪一块表。
+    失败原因写进 EnergyRaw.error 与 EnergyMeter.last_error，后台能直接看到是哪一块表。
   · 采集**只写原始累计值**，不做差值 —— 差值交给 aggregate.py，
     这样万一算法要改，重跑聚合即可，不用等现场重新采数据。
 """
@@ -19,7 +19,7 @@ from django.db import transaction
 from eep import conf
 
 from ..collectors import CollectResult, build_collector
-from ..models import CollectLog, Gateway, Meter, Reading
+from ..models import EnergyCollectLog, EnergyGateway, EnergyMeter, EnergyRaw
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +35,14 @@ def collect_round(*, gateway_codes: list[str] | None = None, dry_run: bool = Fal
     retry_backoff = float(conf.get("collect.retry_backoff_seconds", 1.0))
     timeout_ms = int(conf.get("collect.timeout_ms", 3000))
 
-    gateways = Gateway.objects.filter(enabled=True)
+    gateways = EnergyGateway.objects.filter(enabled=True)
     if gateway_codes:
         gateways = gateways.filter(code__in=gateway_codes)
 
     summary: dict = {"gateways": [], "total": 0, "ok": 0, "fail": 0, "readings": 0, "dry_run": dry_run}
 
     for gw in gateways:
-        meters = list(Meter.objects.filter(gateway=gw, enabled=True).order_by("code"))
+        meters = list(EnergyMeter.objects.filter(gateway=gw, enabled=True).order_by("code"))
         if not meters:
             continue
 
@@ -57,8 +57,8 @@ def collect_round(*, gateway_codes: list[str] | None = None, dry_run: bool = Fal
         now = datetime.now()
         errors: list[str] = []
         ok_count = 0
-        readings: list[Reading] = []
-        touched: list[Meter] = []
+        readings: list[EnergyRaw] = []
+        touched: list[EnergyMeter] = []
 
         for meter in meters:
             res: CollectResult = results.get(meter.code) or CollectResult(ok=False, error="未返回结果")
@@ -71,10 +71,13 @@ def collect_round(*, gateway_codes: list[str] | None = None, dry_run: bool = Fal
 
             if not dry_run:
                 readings.append(
-                    Reading(
+                    EnergyRaw(
                         meter=meter,
-                        at=at,
-                        value=res.value if res.ok else None,
+                        # 归属在入库时快照一份，汇总时不用连表
+                        line=meter.line,
+                        energy_type=meter.energy_type,
+                        collect_time=at,
+                        reading=res.value if res.ok else None,
                         raw=_truncate(res.raw),
                         ok=res.ok,
                         error=_truncate(res.error),
@@ -89,11 +92,11 @@ def collect_round(*, gateway_codes: list[str] | None = None, dry_run: bool = Fal
 
         if not dry_run:
             with transaction.atomic():
-                Reading.objects.bulk_create(readings, batch_size=200)
-                Meter.objects.bulk_update(
+                EnergyRaw.objects.bulk_create(readings, batch_size=200)
+                EnergyMeter.objects.bulk_update(
                     touched, ["last_value", "last_at", "last_ok", "last_error"], batch_size=200
                 )
-                CollectLog.objects.create(
+                EnergyCollectLog.objects.create(
                     gateway=gw,
                     started_at=started,
                     finished_at=datetime.now(),

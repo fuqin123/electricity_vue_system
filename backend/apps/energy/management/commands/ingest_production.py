@@ -30,7 +30,7 @@ from decimal import Decimal
 
 from django.core.management.base import BaseCommand, CommandError
 
-from ...models import HourlyProduction, Line
+from ...models import ProductionHourly, ProductionLine
 
 logger = logging.getLogger(__name__)
 
@@ -41,23 +41,23 @@ def write_production(
     hour: int,
     output: Decimal | None,
     *,
-    quality: str = HourlyProduction.Q_OK,
-    source: str = HourlyProduction.SOURCE_COUNTER,
+    quality: str = ProductionHourly.Q_OK,
+    source: str = ProductionHourly.SOURCE_COUNTER,
     note: str = "",
-) -> HourlyProduction:
+) -> ProductionHourly:
     """写入（或更新）某线某小时产量。
 
     ⚠ `output=None` 表示**未上报**，写入的是 null 而不是 0 —— 0 会被当成「确实没产出」。
     """
     if not (0 <= int(hour) <= 23):
         raise ValueError(f"小时取值必须在 0—23，收到 {hour}")
-    line = Line.objects.filter(code=line_code.upper()).first()
+    line = ProductionLine.objects.filter(line_code=line_code.upper()).first()
     if line is None:
         raise ValueError(f"产线不存在：{line_code}")
 
-    obj, _created = HourlyProduction.objects.update_or_create(
+    obj, _created = ProductionHourly.objects.update_or_create(
         line=line,
-        date=day,
+        stat_date=day,
         hour=int(hour),
         defaults={
             "output": output,
@@ -118,7 +118,7 @@ class Command(BaseCommand):
           绝不会把占位误当成真实产量。
         """
         now = datetime.now()
-        lines = list(Line.objects.filter(enabled=True))
+        lines = list(ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE))
         total = 0
         for back in range(days):
             day = (now - timedelta(days=back)).date()
@@ -127,26 +127,26 @@ class Command(BaseCommand):
                     if back == 0 and hour > now.hour:
                         continue  # 未到的小时不写字，别制造「未来已有产量」
                     write_production(
-                        line.code,
+                        line.line_code,
                         day,
                         hour,
                         None,
-                        quality=HourlyProduction.Q_NODATA,
-                        source=HourlyProduction.SOURCE_DEMO,
+                        quality=ProductionHourly.Q_NODATA,
+                        source=ProductionHourly.SOURCE_DEMO,
                         note="演示占位：产量数据源未接入",
                     )
                     total += 1
         self.stdout.write(f"已写入演示占位 {total} 条（{days} 天 × {len(lines)} 线 × 已过小时）")
 
     def _print_status(self) -> None:
-        qs = HourlyProduction.objects.all()
+        qs = ProductionHourly.objects.all()
         self.stdout.write("")
         self.stdout.write(f"小时产量记录：{qs.count()} 条")
-        for q in HourlyProduction.QUALITY_CHOICES:
+        for q in ProductionHourly.QUALITY_CHOICES:
             n = qs.filter(quality=q[0]).count()
             if n:
                 self.stdout.write(f"  quality={q[0]:<9} {q[1]:<24} {n} 条")
-        for s in HourlyProduction.SOURCE_CHOICES:
+        for s in ProductionHourly.SOURCE_CHOICES:
             n = qs.filter(source=s[0]).count()
             if n:
                 self.stdout.write(f"  source ={s[0]:<9} {s[1]:<24} {n} 条")

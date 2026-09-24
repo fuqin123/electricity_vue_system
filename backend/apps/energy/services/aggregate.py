@@ -39,7 +39,7 @@ from django.db import transaction
 
 from eep import conf
 
-from ..models import HourlyUsage, Meter, Reading
+from ..models import EnergyHourly, EnergyMeter, EnergyRaw
 from . import slots
 
 logger = logging.getLogger(__name__)
@@ -58,16 +58,16 @@ def hour_window(day: date_cls, hour: int) -> tuple[datetime, datetime]:
     return start, start + timedelta(hours=1)
 
 
-def _last_reading_before(meter: Meter, upper: datetime) -> Reading | None:
+def _last_reading_before(meter: EnergyMeter, upper: datetime) -> EnergyRaw | None:
     """取「采样时间 ≤ upper」的最后一条有效读数（仅作兜底参考，差值计算不用它）。"""
     return (
-        Reading.objects.filter(meter=meter, ok=True, value__isnull=False, at__lte=upper)
+        EnergyRaw.objects.filter(meter=meter, ok=True, reading__isnull=False, collect_time__lte=upper)
         .order_by("-at")
         .first()
     )
 
 
-def boundary_reading(meter: Meter, boundary: datetime) -> Reading | None:
+def boundary_reading(meter: EnergyMeter, boundary: datetime) -> EnergyRaw | None:
     """取「整点 boundary」的读数 = **距该整点最近的一条有效读数**（容差 ±20 分钟）。
 
     三条规则各自换来的东西（都是踩过坑才定下来的，别改）：
@@ -94,14 +94,14 @@ def boundary_reading(meter: Meter, boundary: datetime) -> Reading | None:
     """
     lo = boundary - BOUNDARY_TOLERANCE
     hi = boundary + BOUNDARY_TOLERANCE
-    rows = Reading.objects.filter(
-        meter=meter, ok=True, value__isnull=False, at__gte=lo, at__lte=hi
-    ).only("id", "at", "value")
+    rows = EnergyRaw.objects.filter(
+        meter=meter, ok=True, reading__isnull=False, collect_time__gte=lo, collect_time__lte=hi
+    ).only("id", "collect_time", "reading")
 
-    best: Reading | None = None
+    best: EnergyRaw | None = None
     best_gap = None
     for r in rows:
-        gap = abs((r.at - boundary).total_seconds())
+        gap = abs((r.collect_time - boundary).total_seconds())
         if best_gap is None or gap < best_gap:
             best, best_gap = r, gap
     return best
@@ -124,7 +124,7 @@ SPAN_TOLERANCE = timedelta(minutes=5)
 PHASE_TOLERANCE = timedelta(minutes=10)
 
 
-def compute_hour(meter: Meter, day: date_cls, hour: int) -> dict:
+def compute_hour(meter: EnergyMeter, day: date_cls, hour: int) -> dict:
     """算一个计量点在某小时的用量（不落库，纯计算，便于测试与复查）。"""
     hour_start, end_limit = hour_window(day, hour)
 
@@ -135,88 +135,92 @@ def compute_hour(meter: Meter, day: date_cls, hour: int) -> dict:
     if end is None:
         return {
             "usage": None,
-            "quality": HourlyUsage.Q_MISSING,
+            "quality": EnergyHourly.Q_MISSING,
             "note": f"{end_limit:%H:%M} 的采样槽内无有效读数",
         }
 
     if start is None:
         return {
             "usage": None,
-            "quality": HourlyUsage.Q_MISSING,
+            "quality": EnergyHourly.Q_MISSING,
             "note": f"{hour_start:%H:%M} 的采样槽内无有效读数（无法确定起点）",
-            "end_at": end.at,
-            "end_value": end.value,
+            "end_at": end.collect_time,
+            "end_reading": end.reading,
         }
 
-    base = {"start_at": start.at, "end_at": end.at, "start_value": start.value, "end_value": end.value}
+    base = {"start_at": start.collect_time, "end_at": end.collect_time, "start_reading": start.reading, "end_reading": end.reading}
 
-    delta: Decimal = (end.value - start.value).quantize(Q3)
+    delta: Decimal = (end.reading - start.reading).quantize(Q3)
 
     if delta < 0:
-        drop_ratio = abs(delta) / start.value if start.value else Decimal(0)
+        drop_ratio = abs(delta) / start.reading if start.reading else Decimal(0)
         guess = "疑似换表" if drop_ratio >= RESET_RATIO else "疑似表归零或回退"
         return {
             **base,
             "usage": None,
-            "quality": HourlyUsage.Q_RESET,
-            "note": f"累计值回退 {start.value}→{end.value}（{guess}，差值 {delta}），已丢弃",
+            "quality": EnergyHourly.Q_RESET,
+            "note": f"累计值回退 {start.reading}→{end.reading}（{guess}，差值 {delta}），已丢弃",
         }
 
     if meter.max_hourly is not None and delta > Decimal(meter.max_hourly):
         return {
             **base,
             "usage": delta,
-            "quality": HourlyUsage.Q_SPIKE,
+            "quality": EnergyHourly.Q_SPIKE,
             "note": f"差值 {delta} 超过上限 {meter.max_hourly}，判为异常尖峰，不计入合计",
         }
 
     # 区间长度必须接近 1 小时：端点各自允许 ±20 分钟偏差，
     # 两者叠加最坏可到 ±40 分钟。偏差在 5 分钟以内认为这一小时是干净的；
     # 再大说明端点被挪过位置（例如补采落在很晚的位置），标 partial 但仍然给数。
-    span = (end.at - start.at).total_seconds()
+    span = (end.collect_time - start.collect_time).total_seconds()
     if abs(span - 3600) > SPAN_TOLERANCE.total_seconds():
         return {
             **base,
             "usage": delta,
-            "quality": HourlyUsage.Q_PARTIAL,
-            "note": f"区间长度 {span / 60:.0f} 分钟（起 {start.at:%H:%M:%S} → 止 {end.at:%H:%M:%S}），"
+            "quality": EnergyHourly.Q_PARTIAL,
+            "note": f"区间长度 {span / 60:.0f} 分钟（起 {start.collect_time:%H:%M:%S} → 止 {end.collect_time:%H:%M:%S}），"
                     f"偏离 1 小时，差值仅供参考",
         }
 
     # 相位判定：两个端点是否都按期采到了（见 PHASE_TOLERANCE 的说明）
-    start_lag = abs((start.at - slots.slot_ready_at(hour_start)).total_seconds())
-    end_lag = abs((end.at - slots.slot_ready_at(end_limit)).total_seconds())
+    start_lag = abs((start.collect_time - slots.slot_ready_at(hour_start)).total_seconds())
+    end_lag = abs((end.collect_time - slots.slot_ready_at(end_limit)).total_seconds())
     if max(start_lag, end_lag) > PHASE_TOLERANCE.total_seconds():
         return {
             **base,
             "usage": delta,
-            "quality": HourlyUsage.Q_PARTIAL,
+            "quality": EnergyHourly.Q_PARTIAL,
             "note": f"端点未按期采到（起点偏 {start_lag / 60:.0f} 分、终点偏 {end_lag / 60:.0f} 分），"
                     f"本小时窗口有平移，差值仅供参考",
         }
 
-    return {**base, "usage": delta, "quality": HourlyUsage.Q_OK, "note": ""}
+    return {**base, "usage": delta, "quality": EnergyHourly.Q_OK, "note": ""}
 
 
 @transaction.atomic
 def aggregate_hour(day: date_cls, hour: int, meters=None) -> int:
-    """把某小时的结果写入 HourlyUsage（可重复执行，幂等）。返回写入条数。"""
-    meters = meters if meters is not None else Meter.objects.filter(enabled=True)
+    """把某小时的结果写入 EnergyHourly（可重复执行，幂等）。返回写入条数。"""
+    meters = meters if meters is not None else EnergyMeter.objects.filter(enabled=True)
     written = 0
     for meter in meters:
         res = compute_hour(meter, day, hour)
-        HourlyUsage.objects.update_or_create(
+        EnergyHourly.objects.update_or_create(
             meter=meter,
-            date=day,
-            hour=hour,
+            stat_date=day,
+            stat_hour=hour,
             defaults={
-                "usage": res.get("usage"),
+                # 产线与能源类型在入库时「快照」一份：历史归属不随产线调整而变，
+                # 汇总时也能直接按 (line, energy_type) 分组，不用连表。
+                "line": meter.line,
+                "energy_type": meter.energy_type,
+                "consumption": res.get("usage"),
                 "unit": meter.unit or "kWh",
                 "quality": res["quality"],
                 "start_at": res.get("start_at"),
                 "end_at": res.get("end_at"),
-                "start_value": res.get("start_value"),
-                "end_value": res.get("end_value"),
+                "start_reading": res.get("start_reading"),
+                "end_reading": res.get("end_reading"),
                 "note": res.get("note", ""),
             },
         )
@@ -244,7 +248,7 @@ def aggregate_day(day: date_cls, hours: range | None = None, meters=None) -> int
     return sum(aggregate_hour(day, h, meters=meters) for h in hours)
 
 
-def current_hour_usage(meter: Meter, now: datetime | None = None) -> dict | None:
+def current_hour_usage(meter: EnergyMeter, now: datetime | None = None) -> dict | None:
     """进行中的小时：给一个**参考值**。只用于展示，**不写库**。
 
     ⚠ v1.2.2 修正：必须「本小时内有两条以上读数」才算得出参考值。
@@ -262,21 +266,21 @@ def current_hour_usage(meter: Meter, now: datetime | None = None) -> dict | None
     hour_start = datetime.combine(now.date(), time(now.hour))
 
     in_hour = list(
-        Reading.objects.filter(meter=meter, ok=True, value__isnull=False, at__gte=hour_start).order_by("at")
+        EnergyRaw.objects.filter(meter=meter, ok=True, reading__isnull=False, collect_time__gte=hour_start).order_by("collect_time")
     )
     if len(in_hour) < 2:
         # 0 条：整点后还没采到样；1 条：只有边界基线，还不够做差
         return None
 
     first, latest = in_hour[0], in_hour[-1]
-    progress = (latest.at - first.at).total_seconds() / 3600
-    delta = (latest.value - first.value).quantize(Q3)
+    progress = (latest.collect_time - first.collect_time).total_seconds() / 3600
+    delta = (latest.reading - first.reading).quantize(Q3)
     if delta < 0:  # 换表 / 归零
         return {"usage": None, "progress": max(0.0, min(progress, 1.0)), "reset": True}
     return {"usage": delta, "progress": max(0.0, min(progress, 1.0)), "reset": False}
 
 
-def explain_hour(meter: Meter, day: date_cls, hour: int) -> dict:
+def explain_hour(meter: EnergyMeter, day: date_cls, hour: int) -> dict:
     """把一个小时的差值算给现场看：起点读数、终点读数、时间、差值、判定质量。
 
     为什么需要它：现场核对「数字对不对」时，光看 hourly_usage 里的一个数没法判断，
@@ -291,11 +295,11 @@ def explain_hour(meter: Meter, day: date_cls, hour: int) -> dict:
     def fmt(reading):
         if reading is None:
             return "—"
-        return f"{reading.at:%m-%d %H:%M:%S}={reading.value}"
+        return f"{reading.collect_time:%m-%d %H:%M:%S}={reading.reading}"
 
     span = "—"
     if start is not None and end is not None:
-        span = f"{(end.at - start.at).total_seconds() / 60:.1f} 分钟"
+        span = f"{(end.collect_time - start.collect_time).total_seconds() / 60:.1f} 分钟"
 
     return {
         "meter": meter.code,

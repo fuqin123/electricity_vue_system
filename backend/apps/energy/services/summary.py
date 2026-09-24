@@ -1,36 +1,62 @@
-"""周期总计（日 / 月 / 年）的生成与查询。
+"""周期汇总（日 / 月 / 年）—— **读写都在这里**，别在别处再算一遍。
 
-为什么不每次现算（这是设计决策，别改回「查询时实时聚合」）：
-  · 年 / 月聚合要扫数十万行小时数据，每次刷接口都现算会把大屏拖慢；
-  · 大屏与后台必须拿到**完全相同**的数字，落表是唯一能保证一致的做法；
-  · 历史月份封账后不再变化，落表后可直接作为报表与审计依据。
+v1.3.0 的库表把「一行含电/水/汽」拆成了「按能源类型分行」：
+    eep_period_summary（旧，一维）  →  energy_daily / energy_monthly / energy_yearly
+                                      每行 = (产线 × 能源类型 × 周期)
+
+为了让上层（大屏 / 后台 / 对外接口）保持「一个周期一行、电水汽都有」的旧形状，
+本模块提供 `period_rows()` 把拆开的行**拼回**成 `PeriodRow`。
+接口契约因此一行没改，前端零改动。
 
 口径（与 `aggregate.py` 一脉相承，改之前先读那儿的注释）：
-  · 电量：只累加 `quality = ok` 的小时用量。缺数的小时**不补 0**，只把整段标成 partial。
-  · 产量：只累加 `quality ∈ (ok, estimated)` 的小时产量。产量未接入时全天为 0。
-  · 单位电耗：产量为 0 或未接入时算出的是「除以零」，一律给 `null`，
-    **不要用 0 兜底** —— 0 kWh/千瓶 会被读成「能效完美」，与事实相反。
-  · 覆盖率（covered_hours / expected_hours）决定 quality：
-      全部覆盖 → ok；一个都没有 → missing；其余 → partial。
-    这是「合计宁可空白也不给偏小值」在周期级别上的落法：
-    数字照给（它是可信部分的真实合计），但 quality 会如实告诉读者「这段不完整」。
+  · 只累加 `quality = ok` 的小时用量；缺数的小时**不补 0**，只把整段标成 partial；
+  · 单位电耗在产量为 0 或未接入时给 `null`，**不要用 0 兜底**
+    （0 kWh/千瓶 会被读成「能效完美」，与事实相反）；
+  · 覆盖率决定 quality：全覆盖 → ok、一个都没有 → missing、其余 → partial。
+    这是「合计宁可空白也不给偏小值」在周期级别的落法。
+
+两条容易踩的口径：
+  1. **车间电力合计没有独立总表** —— 它是 6 条产线之和，不是某一行；
+     （水、汽才是挂在车间哨兵行上的总表读数）
+  2. **产量不在 energy_* 汇总表里** —— 产量不是一种能源；
+     单位电耗是查询时用「电的合计 ÷ 产量」算出来的，两边各自可空。
 """
 
 from __future__ import annotations
 
 import calendar
 import logging
+from dataclasses import dataclass
 from datetime import date as date_cls
 from datetime import datetime, timedelta
 from decimal import Decimal
 
 from django.db.models import Count, Sum
 
-from ..models import HourlyProduction, HourlyUsage, Line, Meter, PeriodSummary
+from ..models import (
+    EnergyDaily,
+    EnergyHourly,
+    EnergyMeter,
+    EnergyMonthly,
+    EnergyType,
+    EnergyYearly,
+    PeriodSummary,
+    ProductionHourly,
+    ProductionLine,
+)
 
 logger = logging.getLogger(__name__)
 
 Q3 = Decimal("0.001")
+
+DIM_DAY = PeriodSummary.DIM_DAY
+DIM_MONTH = PeriodSummary.DIM_MONTH
+DIM_YEAR = PeriodSummary.DIM_YEAR
+SCOPE_LINE = PeriodSummary.SCOPE_LINE
+SCOPE_WORKSHOP = PeriodSummary.SCOPE_WORKSHOP
+Q_OK = PeriodSummary.Q_OK
+Q_PARTIAL = PeriodSummary.Q_PARTIAL
+Q_MISSING = PeriodSummary.Q_MISSING
 
 
 # ══════════════════════════════════════════════════════════════
@@ -40,23 +66,23 @@ Q3 = Decimal("0.001")
 
 def period_bounds(dim: str, key: str) -> tuple[date_cls, date_cls]:
     """把 period_key 解析成 [start, end] 闭区间。"""
-    if dim == PeriodSummary.DIM_DAY:
+    if dim == DIM_DAY:
         d = datetime.strptime(key, "%Y-%m-%d").date()
         return d, d
-    if dim == PeriodSummary.DIM_MONTH:
+    if dim == DIM_MONTH:
         y, m = (int(x) for x in key.split("-"))
         last = calendar.monthrange(y, m)[1]
         return date_cls(y, m, 1), date_cls(y, m, last)
-    if dim == PeriodSummary.DIM_YEAR:
+    if dim == DIM_YEAR:
         y = int(key)
         return date_cls(y, 1, 1), date_cls(y, 12, 31)
     raise ValueError(f"未知维度：{dim}")
 
 
 def make_key(dim: str, day: date_cls) -> str:
-    if dim == PeriodSummary.DIM_DAY:
+    if dim == DIM_DAY:
         return day.strftime("%Y-%m-%d")
-    if dim == PeriodSummary.DIM_MONTH:
+    if dim == DIM_MONTH:
         return day.strftime("%Y-%m")
     return day.strftime("%Y")
 
@@ -74,237 +100,376 @@ def _hours_in(start: date_cls, end: date_cls, now: datetime) -> int:
     return hours
 
 
+def _days_in(start: date_cls, end: date_cls, now: datetime) -> int:
+    last = min(end, now.date())
+    if last < start:
+        return 0
+    return (last - start).days + 1
+
+
 # ══════════════════════════════════════════════════════════════
-#  单周期计算
+#  写：生成汇总行
 # ══════════════════════════════════════════════════════════════
-
-
-def _energy_part(meters: list[Meter], start: date_cls, end: date_cls) -> tuple[Decimal | None, int]:
-    """区间电量合计与「齐全的小时数」。
-
-    「齐全」= 该小时上这组计量点**每一个**都有可信的用量行。
-    只要有一块表缺数，这个小时就不计入 covered —— 与小时级「宁可空白」的口径一致。
-    """
-    if not meters:
-        return None, 0
-    rows = HourlyUsage.objects.filter(
-        meter__in=meters, date__gte=start, date__lte=end, quality__in=HourlyUsage.TRUSTED
-    )
-    total = rows.aggregate(t=Sum("usage"))["t"]
-    if total is None:
-        return None, 0
-    covered = (
-        rows.values("date", "hour").annotate(n=Count("id")).filter(n=len(meters)).count()
-    )
-    return Decimal(total), covered
-
-
-def _production_part(lines: list[Line], start: date_cls, end: date_cls) -> tuple[Decimal, int]:
-    """区间产量合计与有产量记录的小时数。未接入时返回 (0, 0)。"""
-    if not lines:
-        return Decimal(0), 0
-    rows = HourlyProduction.objects.filter(
-        line__in=lines, date__gte=start, date__lte=end, quality__in=HourlyProduction.TRUSTED
-    )
-    total = rows.aggregate(t=Sum("output"))["t"]
-    covered = rows.values("date", "hour").annotate(n=Count("id")).filter(n=len(lines)).count()
-    return (Decimal(total) if total is not None else Decimal(0)), covered
 
 
 def _quality_from(covered: int, expected: int) -> str:
-    if expected <= 0:
-        return PeriodSummary.Q_MISSING
-    if covered <= 0:
-        return PeriodSummary.Q_MISSING
+    if expected <= 0 or covered <= 0:
+        return Q_MISSING
     if covered >= expected:
-        return PeriodSummary.Q_OK
-    return PeriodSummary.Q_PARTIAL
+        return Q_OK
+    return Q_PARTIAL
 
 
-def _unit_kwh(kwh: Decimal | None, output: Decimal) -> Decimal | None:
-    """单位电耗 = 电量 ÷ 产量 × 1000。产量为 0 时给 None，不给 0。"""
-    if kwh is None or output <= 0:
-        return None
-    return (kwh / output * 1000).quantize(Q3)
+#: 维度 → (汇总模型, 周期字段名)
+_SUMMARY_MODEL = {
+    DIM_DAY: (EnergyDaily, "stat_date"),
+    DIM_MONTH: (EnergyMonthly, "stat_month"),
+    DIM_YEAR: (EnergyYearly, "stat_year"),
+}
 
 
-def _plan_output(lines: list[Line], start: date_cls, end: date_cls, now: datetime) -> Decimal:
-    """计划产量 = Σ(额定 × 已过小时数)。这是达成率的分母，必须与统计窗口一致。"""
-    last = min(end, now.date())
-    if last < start or not lines:
-        return Decimal(0)
-    hours = _hours_in(start, last, now)
-    rated = sum(l.rated or 0 for l in lines)
-    return Decimal(rated * hours)
+def _period_value(dim: str, start: date_cls) -> object:
+    """周期字段的取值：日=日期、月=当月第一天、年=年份。"""
+    if dim == DIM_DAY:
+        return start
+    if dim == DIM_MONTH:
+        return date_cls(start.year, start.month, 1)
+    return start.year
 
 
-def summarize_period(
-    dim: str, key: str, *, scope: str, line: Line | None, meters: list[Meter], lines: list[Line],
-    now: datetime | None = None,
-) -> dict:
-    """算一个 (层级, 维度, 周期) 的总计，返回可直接写库的字典。"""
-    now = now or datetime.now()
-    start, end = period_bounds(dim, key)
+def _elec_metrics(lines: list[ProductionLine], start: date_cls, end: date_cls) -> tuple[Decimal | None, int]:
+    """一组产线的电量合计，以及「所有电表都有可信数据」的小时数。
 
-    kwh, e_covered = _energy_part(meters, start, end)
-    output, _p_covered = _production_part(lines, start, end)
-
-    expected = _hours_in(start, end, now)
-    quality = _quality_from(e_covered, expected)
-
-    # 水 / 汽：只有车间总表，不拆分到线别
-    water: Decimal | None = None
-    steam: Decimal | None = None
-    if scope == PeriodSummary.SCOPE_WORKSHOP:
-        w_meters = list(Meter.objects.filter(kind=Meter.KIND_WATER, enabled=True))
-        s_meters = list(Meter.objects.filter(kind=Meter.KIND_STEAM, enabled=True))
-        water = _energy_part(w_meters, start, end)[0]
-        steam = _energy_part(s_meters, start, end)[0]
-
-    # ⚠ 没有任何可信数据时写 NULL，不写 0。
-    #   「空合计兜底成 0」是这个项目里反复出现的一类错误（B-502 / B-505 / B-508）：
-    #   0 在界面上是「确实没用」，与「没采到」完全相反。
-    has_energy = kwh is not None
-    has_output = output > 0
-    return {
-        "scope": scope,
-        "line": line,
-        "dim": dim,
-        "period_key": key,
-        "start_date": start,
-        "end_date": end,
-        "output": output.quantize(Decimal("0.1")) if has_output else None,
-        "kwh": kwh.quantize(Q3) if has_energy else None,
-        "water_t": Decimal(water).quantize(Q3) if water is not None else None,
-        "steam_t": Decimal(steam).quantize(Q3) if steam is not None else None,
-        "plan_output": _plan_output(lines, start, end, now).quantize(Decimal("0.1")),
-        "unit_kwh": _unit_kwh(kwh, output),
-        "covered_hours": e_covered,
-        "quality": quality,
-    }
-
-
-def upsert(payload: dict) -> PeriodSummary:
-    """按唯一键写入或更新。"""
-    key = {
-        "scope": payload["scope"],
-        "line": payload["line"],
-        "dim": payload["dim"],
-        "period_key": payload["period_key"],
-    }
-    obj, created = PeriodSummary.objects.update_or_create(defaults=payload, **key)
-    return obj
-
-
-# ══════════════════════════════════════════════════════════════
-#  批量生成
-# ══════════════════════════════════════════════════════════════
-
-
-def summarize_days(day: date_cls, now: datetime | None = None) -> list[PeriodSummary]:
-    """生成某一天的产线级 + 车间级总计。"""
-    now = now or datetime.now()
-    out: list[PeriodSummary] = []
-    enabled_lines = list(Line.objects.filter(enabled=True))
-
-    for line in enabled_lines:
-        meters = [m for m in line.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
-        payload = summarize_period(
-            PeriodSummary.DIM_DAY,
-            make_key(PeriodSummary.DIM_DAY, day),
-            scope=PeriodSummary.SCOPE_LINE,
-            line=line,
-            meters=meters,
-            lines=[line],
-            now=now,
-        )
-        out.append(upsert(payload))
-
-    all_meters = list(Meter.objects.filter(kind=Meter.KIND_ELEC, enabled=True))
-    out.append(
-        upsert(
-            summarize_period(
-                PeriodSummary.DIM_DAY,
-                make_key(PeriodSummary.DIM_DAY, day),
-                scope=PeriodSummary.SCOPE_WORKSHOP,
-                line=None,
-                meters=all_meters,
-                lines=enabled_lines,
-                now=now,
-            )
-        )
+    「齐全」= 那个小时上这组产线**每一块电表**都有可信的小时行。
+    只要有一块表缺数，这个小时就不算 covered —— 与小时级「宁可空白」的口径一致。
+    """
+    meter_qs = EnergyMeter.objects.filter(
+        line__in=lines, energy_type__type_code=EnergyType.ELECTRIC, enabled=True
     )
-    return out
+    n_meters = meter_qs.count()
+    if n_meters == 0:
+        return None, 0
+    rows = EnergyHourly.objects.filter(
+        meter__in=meter_qs,
+        stat_date__gte=start,
+        stat_date__lte=end,
+        quality__in=EnergyHourly.TRUSTED,
+    )
+    total = rows.aggregate(t=Sum("consumption"))["t"]
+    covered = (
+        rows.values("stat_date", "stat_hour").annotate(n=Count("id")).filter(n=n_meters).count()
+    )
+    return (Decimal(total) if total is not None else None), covered
 
 
-def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = None) -> list[PeriodSummary]:
-    """生成某维度的全部周期（传入该维度覆盖到的若干天即可去重）。"""
+def _one_type_metrics(meter: EnergyMeter, start: date_cls, end: date_cls) -> tuple[Decimal | None, int]:
+    """单个计量点（车间水/汽总表）在某周期的合计与覆盖小时数。"""
+
+    def _calc(s: date_cls, e: date_cls) -> tuple[Decimal | None, int]:
+        rows = EnergyHourly.objects.filter(
+            meter=meter, stat_date__gte=s, stat_date__lte=e, quality__in=EnergyHourly.TRUSTED
+        )
+        total = rows.aggregate(t=Sum("consumption"))["t"]
+        return (Decimal(total) if total is not None else None), rows.count()
+
+    return _calc(start, end)
+
+
+def _upsert(model, line: ProductionLine, etype: EnergyType, dim: str, start: date_cls, **fields) -> str:
+    """幂等写入一条汇总行（唯一键 = 产线 × 能源类型 × 周期）。
+
+    返回**周期键**（'2026-09-24' / '2026-09' / '2026'）——
+    汇总表里没有 period_key 这一列（周期由 stat_date / stat_month / stat_year 表达），
+    而调用方要的是「写了哪些周期」，所以在返回时算出来。
+    """
+    lookup = {"line": line, "energy_type": etype, _SUMMARY_MODEL[dim][1]: _period_value(dim, start)}
+    model.objects.update_or_create(defaults=fields, **lookup)
+    return make_key(dim, start)
+
+
+def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
+    """生成（或刷新）某一天的全部汇总行：每条产线 + 车间行 × 每种能源。
+
+    数据源是 `energy_hourly`（只取 quality=ok）。
+    **不是**「日末读数 − 日初读数」—— 那样会静默吞掉采集中断的小时。
+    """
     now = now or datetime.now()
-    keys: list[str] = []
-    for d in days:
-        k = make_key(dim, d)
-        if k not in keys:
-            keys.append(k)
+    lines = list(ProductionLine.objects.all())
+    types = {t.type_code: t for t in EnergyType.objects.all()}
+    written: list[str] = []
 
-    out: list[PeriodSummary] = []
-    enabled_lines = list(Line.objects.filter(enabled=True))
-    all_meters = list(Meter.objects.filter(kind=Meter.KIND_ELEC, enabled=True))
+    for day_key_start in (day,):
+        for line in lines:
+            if line.is_workshop:
+                # 车间行只填水 / 汽（车间电力没有总表，见模块说明）
+                for code in (EnergyType.WATER, EnergyType.STEAM):
+                    etype = types.get(code)
+                    meter = EnergyMeter.objects.filter(
+                        line=line, energy_type=etype, enabled=True
+                    ).first()
+                    if etype is None or meter is None:
+                        continue
+                    total, covered = _one_type_metrics(meter, day, day)
+                    written.append(
+                        _upsert(
+                            EnergyDaily,
+                            line,
+                            etype,
+                            DIM_DAY,
+                            day,
+                            consumption=total,
+                            unit=etype.unit,
+                            covered_count=covered,
+                            expected_count=24,
+                            quality=_quality_from(covered, 24),
+                        )
+                    )
+                continue
 
-    for key in keys:
-        for line in enabled_lines:
-            meters = [m for m in line.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
-            out.append(
-                upsert(
-                    summarize_period(
-                        dim, key, scope=PeriodSummary.SCOPE_LINE, line=line, meters=meters, lines=[line], now=now
+            # 产线行：电力是这块产线自己的电表之和
+            total, covered = _elec_metrics([line], day, day)
+            etype = types.get(EnergyType.ELECTRIC)
+            if etype is not None:
+                written.append(
+                    _upsert(
+                        EnergyDaily,
+                        line,
+                        etype,
+                        DIM_DAY,
+                        day,
+                        consumption=total,
+                        unit=etype.unit,
+                        covered_count=covered,
+                        expected_count=24,
+                        quality=_quality_from(covered, 24),
                     )
                 )
-            )
-        out.append(
-            upsert(
-                summarize_period(
-                    dim,
-                    key,
-                    scope=PeriodSummary.SCOPE_WORKSHOP,
-                    line=None,
-                    meters=all_meters,
-                    lines=enabled_lines,
-                    now=now,
+    return written
+
+
+def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = None) -> list[str]:
+    """生成月 / 年汇总行：**由日行累加**，保证「月 = 该月各日之和」。
+
+    为什么不直接扫小时表：一是省一次全表扫描，二是三者口径天然一致 ——
+    不会出现「日加起来不等于月」这种最难查的对不上。
+    """
+    if dim not in (DIM_MONTH, DIM_YEAR):
+        raise ValueError("summarize_periods 只处理 month / year；日汇总用 summarize_days")
+    now = now or datetime.now()
+    model = _SUMMARY_MODEL[dim][0]
+    written: list[str] = []
+
+    for anchor in days:
+        start, end = period_bounds(dim, make_key(dim, anchor))
+        expected = _days_in(start, end, now) if dim == DIM_MONTH else 0
+        for line in ProductionLine.objects.all():
+            for etype in EnergyType.objects.all():
+                rows = EnergyDaily.objects.filter(
+                    line=line, energy_type=etype, stat_date__gte=start, stat_date__lte=end
                 )
-            )
-        )
-    return out
-
-
-# ── 趋势桶序列：一律**按时间正序**（最旧 → 最新）────────────────
-# 这三个函数同时喂给「落表」（summarize_periods，顺序无关）和
-# 「趋势图」（snapshot 的 daily30 / monthly12 / yearly5，顺序就是 X 轴）。
-# 倒序会让当前日期落在 X 轴最左边，看的人得把图反过来读（v1.2.3 B-512）；
-# 前端也按「末项 = 本期」取数（如总览的「去年」取 yearly5[-2]）。
+                agg = rows.aggregate(t=Sum("consumption"), c=Sum("covered_count"))
+                # 该周期有多少天是有可信数据的（用来算覆盖率）
+                covered_days = rows.filter(quality__in=(Q_OK, Q_PARTIAL)).count()
+                total = agg["t"]
+                if dim == DIM_YEAR:
+                    expected = _days_in(start, end, now)
+                written.append(
+                    _upsert(
+                        model,
+                        line,
+                        etype,
+                        dim,
+                        start,
+                        consumption=Decimal(total) if total is not None else None,
+                        unit=etype.unit,
+                        covered_count=covered_days,
+                        expected_count=expected,
+                        quality=_quality_from(covered_days, expected),
+                    )
+                )
+    return written
 
 
 def recent_days(count: int, now: datetime | None = None) -> list[date_cls]:
-    """近 count 个自然日，正序，末项为今天。"""
+    """近 count 天（含今天），**时间正序**（末项 = 今天）。
+
+    ⚠ 顺序不能反：X 轴是「从左往右读时间」，倒序会把今天放在最左边（B-512）。
+    """
     now = now or datetime.now()
-    base = now.date()
-    return [base - timedelta(days=i) for i in range(count - 1, -1, -1)]
+    return [now.date() - timedelta(days=i) for i in reversed(range(count))]
 
 
 def recent_months(count: int, now: datetime | None = None) -> list[date_cls]:
-    """近 count 个月（每月取 1 号用于提取月份 key），正序，末项为当月。"""
+    """近 count 个月（含当月），返回每月第一天，**时间正序**。"""
     now = now or datetime.now()
     out: list[date_cls] = []
-    for back in range(count - 1, -1, -1):
-        y = now.year
-        m = now.month - back
-        while m <= 0:
-            m += 12
-            y -= 1
+    y, m = now.year, now.month
+    for _ in range(count):
         out.append(date_cls(y, m, 1))
-    return out
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return list(reversed(out))
 
 
 def recent_years(count: int, now: datetime | None = None) -> list[date_cls]:
-    """近 count 个自然年（每年取 1 月 1 日），正序，末项为今年。"""
+    """近 count 年（含今年），返回每年 1 月 1 日，**时间正序**。"""
     now = now or datetime.now()
-    return [date_cls(now.year - i, 1, 1) for i in range(count - 1, -1, -1)]
+    return [date_cls(now.year - i, 1, 1) for i in reversed(range(count))]
+
+
+# ══════════════════════════════════════════════════════════════
+#  读：把拆分的汇总行拼回「一个周期一行」的旧形状
+# ══════════════════════════════════════════════════════════════
+
+
+@dataclass
+class PeriodRow:
+    """一个周期的通行视图（电 / 水 / 汽 / 产量 齐备）。
+
+    字段名与旧的 `PeriodSummary` 行保持一致，**外部读者与接口契约因此不用改**。
+    """
+
+    dim: str
+    key: str
+    scope: str
+    line: ProductionLine | None
+    start_date: date_cls
+    end_date: date_cls
+    kwh: Decimal | None
+    output: Decimal | None
+    unit_kwh: Decimal | None
+    water_t: Decimal | None
+    steam_t: Decimal | None
+    covered_hours: int
+    expected_hours: int
+    quality: str
+
+
+def _line_scope_lines(line: ProductionLine | None) -> list[ProductionLine]:
+    """scope=line 时参与合计的产线（就是它自己）。"""
+    return [line] if line is not None else []
+
+
+def _workshop_scope_lines() -> list[ProductionLine]:
+    """scope=workshop 时参与**电力**合计的产线：全部真实产线（不含车间哨兵行）。"""
+    return list(ProductionLine.objects.filter(line_type=ProductionLine.TYPE_LINE))
+
+
+def period_rows(
+    dim: str,
+    scope: str,
+    line: ProductionLine | None,
+    keys: list[str],
+    now: datetime | None = None,
+) -> dict[str, PeriodRow]:
+    """批量取若干周期的通行视图（缺行的周期会现算补上）。"""
+    now = now or datetime.now()
+    model = _SUMMARY_MODEL[dim][0]
+    period_field = _SUMMARY_MODEL[dim][1]
+    out: dict[str, PeriodRow] = {}
+
+    types = {t.type_code: t for t in EnergyType.objects.all()}
+    elec = types.get(EnergyType.ELECTRIC)
+
+    if scope == SCOPE_WORKSHOP:
+        agg_lines = _workshop_scope_lines()
+    else:
+        agg_lines = _line_scope_lines(line)
+
+    # 车间的水/汽取哨兵行上的总表
+    workshop_line = None
+    if scope == SCOPE_WORKSHOP:
+        workshop_line = ProductionLine.objects.filter(
+            line_type=ProductionLine.TYPE_WORKSHOP
+        ).first()
+
+    for key in keys:
+        start, end = period_bounds(dim, key)
+
+        # ── 电力 ──
+        if elec is None or not agg_lines:
+            kwh, covered = None, 0
+            quality = Q_MISSING
+        else:
+            if dim == DIM_DAY:
+                rows = EnergyDaily.objects.filter(
+                    line__in=agg_lines, energy_type=elec, stat_date=start
+                )
+            else:
+                rows = model.objects.filter(
+                    line__in=agg_lines, energy_type=elec, **{period_field: _period_value(dim, start)}
+                )
+            total = rows.aggregate(t=Sum("consumption"))["t"]
+            kwh = Decimal(total) if total is not None else None
+            if len(agg_lines) == 1:
+                covered = rows.first().covered_count if rows.exists() else 0
+            else:
+                # 车间合计：只有在「每条产线都有数据」的那些天/时段才算覆盖
+                covered = rows.filter(quality__in=(Q_OK, Q_PARTIAL)).count() // 1
+                covered = min(
+                    [r.covered_count for r in rows if r.covered_count] or [0]
+                )
+            if dim == DIM_DAY:
+                expected = _hours_in(start, end, now)
+            else:
+                expected = _days_in(start, end, now)
+            quality = _quality_from(covered, expected)
+
+        # ── 水 / 汽（只有车间级有）──
+        water = steam = None
+        if workshop_line is not None:
+            for code, holder in ((EnergyType.WATER, "water"), (EnergyType.STEAM, "steam")):
+                etype = types.get(code)
+                if etype is None:
+                    continue
+                if dim == DIM_DAY:
+                    row = EnergyDaily.objects.filter(
+                        line=workshop_line, energy_type=etype, stat_date=start
+                    ).first()
+                else:
+                    row = model.objects.filter(
+                        line=workshop_line,
+                        energy_type=etype,
+                        **{period_field: _period_value(dim, start)},
+                    ).first()
+                val = row.consumption if row else None
+                if holder == "water":
+                    water = val
+                else:
+                    steam = val
+
+        # ── 产量（不在汇总表里，按区间现算；24 行/天/线，开销可忽略）──
+        output = None
+        if agg_lines:
+            prod = ProductionHourly.objects.filter(
+                line__in=agg_lines,
+                stat_date__gte=start,
+                stat_date__lte=end,
+                quality__in=ProductionHourly.TRUSTED,
+            ).aggregate(t=Sum("output"))["t"]
+            # 没有**真实**产量记录时给 None（不是 0）：
+            # 0 表示「确实产出为 0」，None 表示「还没接入/没有可信记录」，语义相反。
+            output = Decimal(prod) if prod is not None else None
+
+        unit_kwh = None
+        if kwh is not None and output is not None and output > 0:
+            unit_kwh = (kwh / output * 1000).quantize(Q3)
+
+        out[key] = PeriodRow(
+            dim=dim,
+            key=key,
+            scope=scope,
+            line=line,
+            start_date=start,
+            end_date=end,
+            kwh=kwh,
+            output=output,
+            unit_kwh=unit_kwh,
+            water_t=water,
+            steam_t=steam,
+            covered_hours=covered,
+            expected_hours=expected,
+            quality=quality,
+        )
+    return out

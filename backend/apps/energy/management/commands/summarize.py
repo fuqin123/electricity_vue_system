@@ -43,20 +43,20 @@ class Command(BaseCommand):
 
         if dim in ("month", "all"):
             days = S.recent_months(opts["months"], now)
-            rows = S.summarize_periods(PeriodSummary.DIM_MONTH, days, now)
+            rows = S.summarize_periods(S.DIM_MONTH, days, now)
             touched.extend(rows)
             self.stdout.write(f"月总计：{len(rows)} 条")
 
         if dim in ("year", "all"):
             days = S.recent_years(opts["years"], now)
-            rows = S.summarize_periods(PeriodSummary.DIM_YEAR, days, now)
+            rows = S.summarize_periods(S.DIM_YEAR, days, now)
             touched.extend(rows)
             self.stdout.write(f"年总计：{len(rows)} 条")
 
         if opts["show"]:
             self.stdout.write("")
             for r in touched:
-                if r.dim != PeriodSummary.DIM_DAY or r.scope != PeriodSummary.SCOPE_WORKSHOP:
+                if r.dim != S.DIM_DAY or r.scope != PeriodSummary.SCOPE_WORKSHOP:
                     continue
                 self.stdout.write(
                     f"  {r.period_key} 车间  产量 {r.output} 瓶  电量 {r.kwh} kWh  "

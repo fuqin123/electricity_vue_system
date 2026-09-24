@@ -49,7 +49,20 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
 
 from .collectors import build_collector
-from .models import CollectLog, Gateway, HourlyProduction, HourlyUsage, Line, Meter, PeriodSummary
+from .models import (
+    EnergyYearly,
+    EnergyMonthly,
+    EnergyDaily,
+    EnergyCollectLog,
+    EnergyGateway,
+    EnergyHourly,
+    EnergyMeter,
+    EnergyRaw,
+    EnergyType,
+    PeriodSummary,
+    ProductionHourly,
+    ProductionLine,
+)
 from .services import ranges, slots
 from .services import summary as S
 from .services.snapshot import build_line, build_overview
@@ -156,11 +169,38 @@ def _dec(raw, default=None):
 #  序列化（DB → 前端契约）
 # ══════════════════════════════════════════════════════════════
 
-CATEGORY = {Meter.KIND_ELEC: "电", Meter.KIND_WATER: "水", Meter.KIND_STEAM: "汽"}
-PROTOCOL = {Gateway.KIND_MODBUS: "Modbus RTU over TCP", Gateway.KIND_HTTP: "HTTP API"}
+CATEGORY = {EnergyType.ELECTRIC: "电", EnergyType.WATER: "水", EnergyType.STEAM: "汽"}
+#: 前端短码 → 库里的能源编码。对外契约保持 elec/water/steam 不变，
+#: 库里统一用 ELECTRIC/WATER/STEAM（与 energy_type 表的 type_code 一致）。
+KIND_TO_CODE = {"elec": EnergyType.ELECTRIC, "water": EnergyType.WATER, "steam": EnergyType.STEAM}
 
 
-def gateway_json(g: Gateway, *, point_count: int = 0, last_heartbeat=None) -> dict:
+def _resolve_energy_type(value) -> EnergyType:
+    """把前端传来的能源标识（短码 elec 或编码 ELECTRIC 均可）解析成 EnergyType。"""
+    raw = str(value).strip()
+    code = KIND_TO_CODE.get(raw.lower(), raw.upper())
+    return EnergyType.objects.get(type_code=code)
+
+
+def _workshop_line() -> ProductionLine:
+    """车间哨兵行 —— 水/汽总表的归属。
+
+    ⚠ 不能留空：日/月/年汇总表以 (line, energy_type, 周期) 建唯一键，
+      而 MySQL 的唯一索引把多个 NULL 视为互不相同，留空会让唯一约束失效。
+    """
+    obj, _ = ProductionLine.objects.get_or_create(
+        line_code=ProductionLine.WORKSHOP_CODE,
+        defaults={
+            "line_name": "车间（总表）",
+            "line_type": ProductionLine.TYPE_WORKSHOP,
+            "sort": 0,
+        },
+    )
+    return obj
+PROTOCOL = {EnergyGateway.KIND_MODBUS: "Modbus RTU over TCP", EnergyGateway.KIND_HTTP: "HTTP API"}
+
+
+def gateway_json(g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None) -> dict:
     online = bool(last_heartbeat and (datetime.now() - last_heartbeat) < timedelta(minutes=5))
     return {
         "id": g.id,
@@ -183,7 +223,7 @@ def gateway_json(g: Gateway, *, point_count: int = 0, last_heartbeat=None) -> di
     }
 
 
-def meter_json(m: Meter, *, today_usage=None, today_hours: int = 0) -> dict:
+def meter_json(m: EnergyMeter, *, today_usage=None, today_hours: int = 0) -> dict:
     """计量点 → 前端结构。既供列表展示，也供后台表单回填（字段一一对应）。"""
     if not m.enabled:
         status = "offline"
@@ -209,8 +249,8 @@ def meter_json(m: Meter, *, today_usage=None, today_hours: int = 0) -> dict:
         "id": m.id,
         "code": m.code,
         "name": m.name,
-        "category": CATEGORY.get(m.kind, m.kind),
-        "lineCode": m.line.code if m.line else "—",
+        "category": m.energy_type.type_name,
+        "lineCode": m.line.line_code if m.line else "—",
         "protocol": PROTOCOL.get(m.gateway.kind, m.gateway.kind),
         "address": " / ".join(addr_parts) or "—",
         "unit": m.unit,
@@ -219,7 +259,7 @@ def meter_json(m: Meter, *, today_usage=None, today_hours: int = 0) -> dict:
         "lastAt": m.last_at.strftime("%Y-%m-%d %H:%M:%S") if m.last_at else "",
 
         # ── 表单回填（可编辑配置）──
-        "kind": m.kind,
+        "kind": m.energy_type.frontend_code,
         "scope": m.scope,
         "role": m.role,
         "gatewayId": m.gateway_id,
@@ -249,22 +289,23 @@ def meter_json(m: Meter, *, today_usage=None, today_hours: int = 0) -> dict:
     }
 
 
-def line_json(ln: Line, *, meter_count: int = 0, counter: str = "") -> dict:
+def line_json(ln: ProductionLine, *, meter_count: int = 0, counter: str = "") -> dict:
     return {
         "id": ln.id,
-        "code": ln.code,
-        "name": ln.name,
+        "code": ln.line_code,
+        "name": ln.line_name,
         "product": ln.product,
         "rated": ln.rated,
         "workshop": "灌装车间",
         "meterNo": f"{meter_count} 个电表点位",
         "counterNo": counter or "产量计数器待接入",
-        "status": "running" if ln.enabled else "maintenance",
+        # 产线状态：1 启用 / 0 停用（TINYINT，见 models.ProductionLine）
+        "status": "running" if ln.status == ProductionLine.STATUS_ON else "maintenance",
         "commissionedAt": "",
     }
 
 
-def collect_log_json(r: CollectLog) -> dict:
+def collect_log_json(r: EnergyCollectLog) -> dict:
     return {
         "id": r.id,
         "taskName": f"轮询采集（{r.gateway.code}）" if r.gateway else "轮询采集",
@@ -282,9 +323,9 @@ def _meter_today_usage() -> dict:
     today = datetime.now().date()
     return {
         row["meter_id"]: row
-        for row in HourlyUsage.objects.filter(date=today, quality__in=HourlyUsage.TRUSTED)
+        for row in EnergyHourly.objects.filter(stat_date=today, quality__in=EnergyHourly.TRUSTED)
         .values("meter_id")
-        .annotate(total=Sum("usage"), hours=Count("id"))
+        .annotate(total=Sum("consumption"), hours=Count("id"))
     }
 
 
@@ -292,7 +333,7 @@ def _gateway_last_heartbeat() -> dict:
     """用采集日志的最近一次开始时间当作网关心跳。"""
     return {
         row["gateway_id"]: row["last"]
-        for row in CollectLog.objects.exclude(gateway=None)
+        for row in EnergyCollectLog.objects.exclude(gateway=None)
         .values("gateway_id")
         .annotate(last=Max("started_at"))
     }
@@ -312,7 +353,7 @@ def overview(request: HttpRequest) -> JsonResponse:
 
 @require_GET
 def line_detail(request: HttpRequest, code: str) -> JsonResponse:
-    line = Line.objects.filter(code=code).first()
+    line = ProductionLine.objects.filter(line_code=code).first()
     if line is None:
         return json_err(f"产线不存在：{code}", 404)
     day = _query_date(request)
@@ -332,23 +373,23 @@ def hourly(request: HttpRequest) -> JsonResponse:
     from_raw, to_raw = request.GET.get("from"), request.GET.get("to")
     if from_raw or to_raw:
         start, end = ranges.parse_range(request)
-        qs = HourlyUsage.objects.filter(date__gte=start, date__lte=end).select_related("meter", "meter__line")
+        qs = EnergyHourly.objects.filter(stat_date__gte=start, stat_date__lte=end).select_related("meter", "meter__line")
         scope_desc = f"{start} ~ {end}"
     else:
         start = end = _query_date(request)
-        qs = HourlyUsage.objects.filter(date=start).select_related("meter", "meter__line")
+        qs = EnergyHourly.objects.filter(stat_date=start).select_related("meter", "meter__line")
         scope_desc = str(start)
 
     if request.GET.get("line"):
-        qs = qs.filter(meter__line__code=request.GET["line"])
+        qs = qs.filter(meter__line__line_code=request.GET["line"])
     if request.GET.get("meter"):
         qs = qs.filter(meter__code=request.GET["meter"])
     if request.GET.get("kind"):
-        qs = qs.filter(meter__kind=request.GET["kind"])
+        qs = qs.filter(meter__energy_type__type_code=KIND_TO_CODE.get(request.GET["kind"], request.GET["kind"].upper()))
     if request.GET.get("quality"):
         qs = qs.filter(quality=request.GET["quality"])
 
-    qs = qs.order_by("-date", "-hour", "meter__code")
+    qs = qs.order_by("-stat_date", "-stat_hour", "meter__code")
     total = qs.count()
 
     paged = request.GET.get("page") is not None
@@ -363,11 +404,11 @@ def hourly(request: HttpRequest) -> JsonResponse:
         {
             "meter": r.meter.code,
             "meterName": r.meter.name,
-            "line": r.meter.line.code if r.meter.line else None,
-            "kind": r.meter.kind,
-            "date": r.date.isoformat(),
-            "hour": r.hour,
-            "usage": float(r.usage) if r.usage is not None else None,
+            "line": r.meter.line.line_code if r.meter.line else None,
+            "kind": r.meter.energy_type.frontend_code,
+            "date": r.stat_date.isoformat(),
+            "hour": r.stat_hour,
+            "usage": float(r.consumption) if r.consumption is not None else None,
             "unit": r.unit,
             "quality": r.quality,
             "startAt": r.start_at.strftime("%Y-%m-%d %H:%M:%S") if r.start_at else None,
@@ -393,7 +434,7 @@ def meters(request: HttpRequest) -> JsonResponse:
     """计量点台账：给后台「计量点位」「数据质量」页用。"""
     usage = _meter_today_usage()
     items = []
-    for m in Meter.objects.select_related("line", "gateway").order_by("kind", "code"):
+    for m in EnergyMeter.objects.select_related("line", "gateway").order_by("energy_type__sort", "code"):
         agg = usage.get(m.id) or {}
         items.append(meter_json(m, today_usage=agg.get("total"), today_hours=agg.get("hours", 0)))
     return json_ok({"count": len(items), "items": items})
@@ -402,7 +443,7 @@ def meters(request: HttpRequest) -> JsonResponse:
 @require_GET
 def collect_logs(request: HttpRequest) -> JsonResponse:
     limit = min(int(request.GET.get("limit", 50)), 500)
-    rows = CollectLog.objects.select_related("gateway").order_by("-started_at")[:limit]
+    rows = EnergyCollectLog.objects.select_related("gateway").order_by("-started_at")[:limit]
     items = [
         {
             "gateway": r.gateway.code if r.gateway else "-",
@@ -425,10 +466,10 @@ def collect_logs(request: HttpRequest) -> JsonResponse:
 def collect_summary(request: HttpRequest) -> JsonResponse:
     """采集总览：给巡检 / 首页卡片用。"""
     since = datetime.now() - timedelta(hours=24)
-    agg = CollectLog.objects.filter(started_at__gte=since).aggregate(
+    agg = EnergyCollectLog.objects.filter(started_at__gte=since).aggregate(
         rounds=Count("id"), ok=Sum("ok_count"), fail=Sum("fail_count"), last=Max("started_at")
     )
-    stale = Meter.objects.filter(enabled=True).exclude(last_ok=True).count()
+    stale = EnergyMeter.objects.filter(enabled=True).exclude(last_ok=True).count()
     return json_ok(
         {
             "windowHours": 24,
@@ -437,10 +478,12 @@ def collect_summary(request: HttpRequest) -> JsonResponse:
             "failCount": agg["fail"] or 0,
             "lastCollectAt": agg["last"].strftime("%Y-%m-%d %H:%M:%S") if agg["last"] else None,
             "abnormalMeters": stale,
-            "meterTotal": Meter.objects.filter(enabled=True).count(),
-            "hourlyUsageRows": HourlyUsage.objects.filter(date=datetime.now().date()).count(),
-            "productionRows": HourlyProduction.objects.filter(date=datetime.now().date()).count(),
-            "summaryRows": PeriodSummary.objects.count(),
+            "meterTotal": EnergyMeter.objects.filter(enabled=True).count(),
+            "hourlyUsageRows": EnergyHourly.objects.filter(stat_date=datetime.now().date()).count(),
+            "productionRows": ProductionHourly.objects.filter(stat_date=datetime.now().date()).count(),
+            "summaryRows": (
+                EnergyDaily.objects.count() + EnergyMonthly.objects.count() + EnergyYearly.objects.count()
+            ),
             # 当前采集节奏（现场核对「是不是每小时采一次」时看这个）
             "cadence": slots.describe(),
         }
@@ -449,7 +492,10 @@ def collect_summary(request: HttpRequest) -> JsonResponse:
 
 @require_GET
 def period_summary(request: HttpRequest) -> JsonResponse:
-    """日 / 月 / 年总计 —— 直接读 `eep_period_summary`（后台读的也是它，两边必然一致）。
+    """日 / 月 / 年总计 —— 读 `energy_daily / energy_monthly / energy_yearly`。
+
+    v1.3.0 起这三张表按「产线 × 能源类型」分行，`summary.period_rows()` 会把它们
+    拼回「一个周期一行、电水汽齐备」的形状，**对外结构一字未改**。
 
     参数：dim=day|month|year（默认 day）、scope=line|workshop（默认 workshop）、
           line=A1、limit=N（默认 40，按周期倒序）
@@ -461,41 +507,68 @@ def period_summary(request: HttpRequest) -> JsonResponse:
     if scope not in dict(PeriodSummary.SCOPE_CHOICES):
         return json_err(f"scope 取值必须是 line / workshop，收到 {scope}")
 
-    qs = PeriodSummary.objects.filter(dim=dim, scope=scope).select_related("line")
+    # ── 先取出库里已有的周期键（倒序、取 limit 个）──
+    model, year_mode = {
+        PeriodSummary.DIM_DAY: (EnergyDaily, False),
+        PeriodSummary.DIM_MONTH: (EnergyMonthly, False),
+        PeriodSummary.DIM_YEAR: (EnergyYearly, True),
+    }[dim]
+    field = {PeriodSummary.DIM_DAY: "stat_date", PeriodSummary.DIM_MONTH: "stat_month", PeriodSummary.DIM_YEAR: "stat_year"}[dim]
+
+    line_obj = None
+    qs = model.objects.all()
     if scope == PeriodSummary.SCOPE_LINE:
         code = request.GET.get("line")
         if not code:
             return json_err("scope=line 时必须给 line 参数，如 line=A1")
-        qs = qs.filter(line__code=code)
+        line_obj = ProductionLine.objects.filter(line_code=str(code).upper()).first()
+        if line_obj is None:
+            return json_err(f"产线不存在：{code}")
+        qs = qs.filter(line=line_obj)
     else:
-        qs = qs.filter(line__isnull=True)
+        # 车间级：电力取全部真实产线，水汽取哨兵行 —— period_rows 里处理
+        qs = qs.exclude(line__line_type=ProductionLine.TYPE_WORKSHOP) | qs.filter(
+            line__line_type=ProductionLine.TYPE_WORKSHOP
+        )
 
     limit = min(int(request.GET.get("limit", 40)), 400)
-    items = [
-        {
-            "scope": r.scope,
-            "line": r.line.code if r.line else None,
-            "dim": r.dim,
-            "periodKey": r.period_key,
-            "startDate": r.start_date.isoformat(),
-            "endDate": r.end_date.isoformat(),
-            # ⚠ 这里**不要**写 float(r.xxx)：`eep_period_summary` 的数值字段是可空的
-            #   ——「该周期一条可信数据都没有」写 NULL（绝不补 0），
-            #   而 float(None) 会抛 TypeError 让整个接口 500（B-509）。
-            #   直接把 Decimal / None 交给 `EepJSONEncoder`：
-            #   Decimal 统一转 float，None 原生就是 JSON null。
-            "output": r.output,
-            "kwh": r.kwh,
-            "waterT": r.water_t,
-            "steamT": r.steam_t,
-            "planOutput": r.plan_output,
-            "unitKwh": r.unit_kwh,
-            "coveredHours": r.covered_hours,
-            "quality": r.quality,
-            "computedAt": r.computed_at.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        for r in qs.order_by("-period_key")[:limit]
-    ]
+    keys_raw = sorted({v for v in qs.values_list(field, flat=True) if v is not None}, reverse=True)[:limit]
+    keys = [str(k) if year_mode else (k.strftime("%Y-%m") if dim == PeriodSummary.DIM_MONTH else k.isoformat()) for k in keys_raw]
+
+    rows = S.period_rows(dim, scope, line_obj, keys)
+    line_for_plan = line_obj
+
+    items = []
+    for key in keys:
+        row = rows[key]
+        # 计划产量：汇总表里没有这一列（产量未接入），按额定产能 × 天数 现算，
+        # 供界面显示参考；产量接入后应改为读真实计划。
+        days = (row.end_date - row.start_date).days + 1
+        rated = line_for_plan.rated if line_for_plan is not None else sum(
+            l.rated for l in ProductionLine.objects.filter(line_type=ProductionLine.TYPE_LINE)
+        )
+        items.append(
+            {
+                "scope": row.scope,
+                "line": row.line.line_code if row.line else None,
+                "dim": row.dim,
+                "periodKey": row.key,
+                "startDate": row.start_date.isoformat(),
+                "endDate": row.end_date.isoformat(),
+                # ⚠ 不要写 float(x)：这些字段都可空（该周期没有可信数据时为 NULL，
+                #   绝不补 0），float(None) 会让整个接口 500（B-509）。
+                #   直接把 Decimal / None 交给 `EepJSONEncoder` 即可。
+                "output": row.output,
+                "kwh": row.kwh,
+                "waterT": row.water_t,
+                "steamT": row.steam_t,
+                "planOutput": int(rated * 24 * 0.88 * days) if rated else 0,
+                "unitKwh": row.unit_kwh,
+                "coveredHours": row.covered_hours,
+                "quality": row.quality,
+                "computedAt": "",
+            }
+        )
     return json_ok({"dim": dim, "scope": scope, "count": len(items), "items": items})
 
 
@@ -547,13 +620,13 @@ def production(request: HttpRequest) -> JsonResponse:
       0 会被读成「确实没产出」，与「还没接数据」是两回事）。
 
     与 v1.2.0 的差别：那时返回 501（接口不存在）。现在表结构已经建好
-      （`eep_hourly_production`），接口**如实返回 null** 并用 `available` 明确标注
+      （`production_hourly`），接口**如实返回 null** 并用 `available` 明确标注
       「这不是真实产量」，比直接 501 更好用 —— 前端不必为「产量未接入」写特殊分支，
       只要看 `available` 就知道该显示数值还是显示 `--`。
     """
     day = _query_date(request)
-    rows = HourlyProduction.objects.filter(date=day).select_related("line").order_by("line__code", "hour")
-    real = rows.exclude(source__in=(HourlyProduction.SOURCE_DEMO, HourlyProduction.SOURCE_NONE))
+    rows = ProductionHourly.objects.filter(stat_date=day).select_related("line").order_by("line__line_code", "stat_hour")
+    real = rows.exclude(source__in=(ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE))
 
     return json_ok(
         {
@@ -565,8 +638,8 @@ def production(request: HttpRequest) -> JsonResponse:
             "count": rows.count(),
             "items": [
                 {
-                    "line": r.line.code,
-                    "hour": r.hour,
+                    "line": r.line.line_code,
+                    "hour": r.stat_hour,
                     "output": float(r.output) if r.output is not None else None,
                     "quality": r.quality,
                     "source": r.source,
@@ -596,7 +669,7 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
     since = now - timedelta(hours=24)
 
     usage = _meter_today_usage()
-    expect = Meter.objects.filter(enabled=True, kind=Meter.KIND_ELEC).count() * (now.hour + 1)
+    expect = EnergyMeter.objects.filter(enabled=True, energy_type__type_code=EnergyType.ELECTRIC).count() * (now.hour + 1)
     received = sum(a.get("hours", 0) for a in usage.values())
 
     monthly12 = [
@@ -614,11 +687,11 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
                 "onlineGateways": len(
                     [
                         g
-                        for g in Gateway.objects.filter(enabled=True)
-                        if (CollectLog.objects.filter(gateway=g).order_by("-started_at").first())
+                        for g in EnergyGateway.objects.filter(enabled=True)
+                        if (EnergyCollectLog.objects.filter(gateway=g).order_by("-started_at").first())
                     ]
                 ),
-                "totalGateways": Gateway.objects.filter(enabled=True).count(),
+                "totalGateways": EnergyGateway.objects.filter(enabled=True).count(),
                 "dataQualityRate": round(min(received / expect, 1) * 100, 2) if expect else 0,
             },
             "hourly": [
@@ -649,12 +722,12 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
             "latestAlarms": [],
             "dataSource": {
                 "productionAvailable": any(
-                    HourlyProduction.objects.filter(date=now.date())
-                    .exclude(source__in=(HourlyProduction.SOURCE_DEMO, HourlyProduction.SOURCE_NONE))
+                    ProductionHourly.objects.filter(stat_date=now.date())
+                    .exclude(source__in=(ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE))
                     .exists()
                     for _ in [0]
                 ),
-                "collectRounds24h": CollectLog.objects.filter(started_at__gte=since).count(),
+                "collectRounds24h": EnergyCollectLog.objects.filter(started_at__gte=since).count(),
             },
         }
     )
@@ -663,8 +736,8 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
 @require_GET
 def admin_lines(request: HttpRequest) -> JsonResponse:
     rows = []
-    for ln in Line.objects.order_by("sort", "code"):
-        cnt = ln.meters.filter(kind=Meter.KIND_ELEC, enabled=True).count()
+    for ln in ProductionLine.objects.order_by("sort", "line_code"):
+        cnt = ln.meters.filter(energy_type__type_code=EnergyType.ELECTRIC, enabled=True).count()
         rows.append(line_json(ln, meter_count=cnt))
     return json_ok(_paged(request, rows))
 
@@ -675,18 +748,18 @@ def admin_quality(request: HttpRequest) -> JsonResponse:
     today = datetime.now().date()
     expect = datetime.now().hour + 1
     rows = []
-    for ln in Line.objects.filter(enabled=True).order_by("sort", "code"):
-        meters = [m for m in ln.meters.all() if m.kind == Meter.KIND_ELEC and m.enabled]
-        ok_rows = HourlyUsage.objects.filter(
-            meter__in=meters, date=today, quality__in=HourlyUsage.TRUSTED
+    for ln in ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE).order_by("sort", "line_code"):
+        meters = [m for m in ln.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
+        ok_rows = EnergyHourly.objects.filter(
+            meter__in=meters, stat_date=today, quality__in=EnergyHourly.TRUSTED
         )
-        received = ok_rows.values("hour").distinct().count()
-        missing = sorted(set(range(expect)) - set(ok_rows.values_list("hour", flat=True)))
+        received = ok_rows.values("stat_hour").distinct().count()
+        missing = sorted(set(range(expect)) - set(ok_rows.values_list("stat_hour", flat=True)))
         last = ok_rows.aggregate(last=Max("computed_at"))["last"]
         rows.append(
             {
-                "lineCode": ln.code,
-                "lineName": ln.name,
+                "lineCode": ln.line_code,
+                "lineName": ln.line_name,
                 "expectPoints": expect,
                 "receivedPoints": received,
                 "missingPoints": max(0, expect - received),
@@ -700,7 +773,7 @@ def admin_quality(request: HttpRequest) -> JsonResponse:
 
 @require_GET
 def admin_collect_logs(request: HttpRequest) -> JsonResponse:
-    rows = [collect_log_json(r) for r in CollectLog.objects.select_related("gateway").order_by("-started_at")[:500]]
+    rows = [collect_log_json(r) for r in EnergyCollectLog.objects.select_related("gateway").order_by("-started_at")[:500]]
     return json_ok(_paged(request, rows))
 
 
@@ -731,11 +804,11 @@ def admin_gateways(request: HttpRequest) -> JsonResponse:
         hb = _gateway_last_heartbeat()
         counts = {
             row["gateway_id"]: row["n"]
-            for row in Meter.objects.values("gateway_id").annotate(n=Count("id"))
+            for row in EnergyMeter.objects.values("gateway_id").annotate(n=Count("id"))
         }
         rows = [
             gateway_json(g, point_count=counts.get(g.id, 0), last_heartbeat=hb.get(g.id))
-            for g in Gateway.objects.order_by("code")
+            for g in EnergyGateway.objects.order_by("code")
         ]
         return json_ok(rows)
 
@@ -745,20 +818,20 @@ def admin_gateways(request: HttpRequest) -> JsonResponse:
         return json_err(str(exc))
     if not data.get("code") or not data.get("name"):
         return json_err("网关编号与名称为必填项")
-    if Gateway.objects.filter(code=data["code"]).exists():
+    if EnergyGateway.objects.filter(code=data["code"]).exists():
         return json_err(f"网关编号已存在：{data['code']}", 409)
 
     fields = _apply(data, GATEWAY_FIELDS, GATEWAY_ALIAS)
-    fields.setdefault("kind", Gateway.KIND_MODBUS)
-    fields["source"] = Gateway.SOURCE_ADMIN
-    gw = Gateway.objects.create(**fields)
+    fields.setdefault("kind", EnergyGateway.KIND_MODBUS)
+    fields["source"] = EnergyGateway.SOURCE_ADMIN
+    gw = EnergyGateway.objects.create(**fields)
     return json_ok(gateway_json(gw), status=201)
 
 
 @require_http_methods(["GET", "PUT", "DELETE"])
 @csrf_exempt
 def admin_gateway_detail(request: HttpRequest, pk: int) -> JsonResponse:
-    gw = Gateway.objects.filter(pk=pk).first()
+    gw = EnergyGateway.objects.filter(pk=pk).first()
     if gw is None:
         return json_err("网关不存在", 404)
 
@@ -777,7 +850,7 @@ def admin_gateway_detail(request: HttpRequest, pk: int) -> JsonResponse:
         return json_err(str(exc))
     for field, value in _apply(data, GATEWAY_FIELDS, GATEWAY_ALIAS).items():
         setattr(gw, field, value)
-    gw.source = Gateway.SOURCE_ADMIN  # 后台改过 → 归后台维护，seed_registry 不再覆盖
+    gw.source = EnergyGateway.SOURCE_ADMIN  # 后台改过 → 归后台维护，seed_registry 不再覆盖
     gw.save()
     return json_ok(gateway_json(gw, point_count=gw.meters.count()))
 
@@ -786,7 +859,7 @@ def admin_gateway_detail(request: HttpRequest, pk: int) -> JsonResponse:
 @csrf_exempt
 def admin_gateway_test(request: HttpRequest, pk: int) -> JsonResponse:
     """网关连接测试：对旗下每个计量点试读一次，返回真实读数与错误。"""
-    gw = Gateway.objects.filter(pk=pk).first()
+    gw = EnergyGateway.objects.filter(pk=pk).first()
     if gw is None:
         return json_err("网关不存在", 404)
     ms = [m for m in gw.meters.filter(enabled=True) if m.enabled]
@@ -814,7 +887,8 @@ def admin_gateway_test(request: HttpRequest, pk: int) -> JsonResponse:
 # ── 计量点读写 ────────────────────────────────────────────────
 
 METER_FIELDS = (
-    "code", "name", "kind", "scope", "role", "slave", "register", "registers", "func_code",
+    # ⚠ 不含 "kind"：能源类型已改成外键，由 _save_meter 单独解析前端短码
+    "code", "name", "scope", "role", "slave", "register", "registers", "func_code",
     "word_order", "url_path", "params", "value_path", "time_path", "scale", "unit",
     "max_hourly", "enabled", "remark", "asset_no", "install_date",
 )
@@ -838,7 +912,7 @@ def admin_meters(request: HttpRequest) -> JsonResponse:
     if request.method == "GET":
         usage = _meter_today_usage()
         rows = []
-        for m in Meter.objects.select_related("line", "gateway").order_by("kind", "code"):
+        for m in EnergyMeter.objects.select_related("line", "gateway").order_by("energy_type__sort", "code"):
             agg = usage.get(m.id) or {}
             rows.append(meter_json(m, today_usage=agg.get("total"), today_hours=agg.get("hours", 0)))
         if request.GET.get("kind"):
@@ -857,7 +931,7 @@ def admin_meters(request: HttpRequest) -> JsonResponse:
         return json_err("点位编号与名称为必填项")
     if not data.get("gatewayId"):
         return json_err("必须选择所属网关")
-    if Meter.objects.filter(code=data["code"]).exists():
+    if EnergyMeter.objects.filter(code=data["code"]).exists():
         return json_err(f"点位编号已存在：{data['code']}", 409)
 
     try:
@@ -870,7 +944,7 @@ def admin_meters(request: HttpRequest) -> JsonResponse:
 @require_http_methods(["GET", "PUT", "DELETE"])
 @csrf_exempt
 def admin_meter_detail(request: HttpRequest, pk: int) -> JsonResponse:
-    m = Meter.objects.filter(pk=pk).first()
+    m = EnergyMeter.objects.filter(pk=pk).first()
     if m is None:
         return json_err("计量点不存在", 404)
 
@@ -890,26 +964,31 @@ def admin_meter_detail(request: HttpRequest, pk: int) -> JsonResponse:
     return json_ok(meter_json(m))
 
 
-def _save_meter(m: Meter | None, data: dict) -> Meter:
+def _save_meter(m: EnergyMeter | None, data: dict) -> EnergyMeter:
     """新增或更新计量点。字段校验集中在这里，供 POST 与 PUT 共用。"""
     is_new = m is None
     if is_new:
-        m = Meter(code=str(data["code"]).strip(), name=str(data["name"]).strip(), gateway_id=int(data["gatewayId"]))
-        m.kind = data.get("kind", Meter.KIND_ELEC)
+        m = EnergyMeter(code=str(data["code"]).strip(), name=str(data["name"]).strip(), gateway_id=int(data["gatewayId"]))
 
     if "code" in data:
         m.code = str(data["code"]).strip()
     if "name" in data:
         m.name = str(data["name"]).strip()
 
+    # 能源类型（前端短码 → energy_type 外键）
+    if data.get("kind"):
+        m.energy_type = _resolve_energy_type(data["kind"])
+    elif is_new:
+        m.energy_type = _resolve_energy_type(EnergyType.ELECTRIC)
+
     for field, value in _apply(data, METER_FIELDS, METER_ALIAS).items():
-        if field == "gateway":
+        if field in ("gateway", "line"):
             continue
         setattr(m, field, value)
 
     if "gatewayId" in data or "gateway" in data:
         gw_id = data.get("gatewayId", data.get("gateway"))
-        gw = Gateway.objects.filter(pk=gw_id).first()
+        gw = EnergyGateway.objects.filter(pk=gw_id).first()
         if gw is None:
             raise ValueError(f"网关不存在：{gw_id}")
         m.gateway = gw
@@ -918,16 +997,16 @@ def _save_meter(m: Meter | None, data: dict) -> Meter:
     if "lineCode" in data:
         code = data["lineCode"]
         if code in ("", "—", None):
-            m.line = None
+            m.line = _workshop_line()
         else:
-            ln = Line.objects.filter(code=str(code).upper()).first()
+            ln = ProductionLine.objects.filter(line_code=str(code).upper()).first()
             if ln is None:
                 raise ValueError(f"产线不存在：{code}")
             m.line = ln
 
-    # 车间总表不挂产线
-    if m.scope == Meter.SCOPE_WORKSHOP:
-        m.line = None
+    # 车间总表挂车间哨兵行（不是留空 —— 汇总表的唯一键需要它）
+    if m.scope == EnergyMeter.SCOPE_WORKSHOP:
+        m.line = _workshop_line()
 
     # 校准数值字段：前端可能传字符串
     for f in ("slave", "register", "registers", "func_code", "port"):
@@ -942,15 +1021,15 @@ def _save_meter(m: Meter | None, data: dict) -> Meter:
         m.max_hourly = _dec(m.max_hourly)
 
     # 采集方式与必填项校验：串口类必须有从站号与寄存器，否则采不了
-    if m.gateway.kind == Gateway.KIND_MODBUS:
+    if m.gateway.kind == EnergyGateway.KIND_MODBUS:
         if m.slave is None:
             raise ValueError("串口服务器类型的点位必须填从站号")
         if m.register is None:
             raise ValueError("串口服务器类型的点位必须填寄存器起始地址")
-    if m.gateway.kind == Gateway.KIND_HTTP and not m.url_path:
+    if m.gateway.kind == EnergyGateway.KIND_HTTP and not m.url_path:
         raise ValueError("HTTP API 类型的点位必须填接口路径")
 
-    m.source = Meter.SOURCE_ADMIN  # 后台改过 → 归后台维护
+    m.source = EnergyMeter.SOURCE_ADMIN  # 后台改过 → 归后台维护
     m.save()
     return m
 
@@ -962,7 +1041,7 @@ def admin_meter_test(request: HttpRequest, pk: int) -> JsonResponse:
 
     现场调参主力：改完从站号 / 寄存器 / 倍率，不用等下一轮采集，点一下就知道对不对。
     """
-    m = Meter.objects.select_related("gateway").filter(pk=pk).first()
+    m = EnergyMeter.objects.select_related("gateway").filter(pk=pk).first()
     if m is None:
         return json_err("计量点不存在", 404)
     if not m.enabled:
@@ -975,7 +1054,7 @@ def admin_meter_test(request: HttpRequest, pk: int) -> JsonResponse:
 
     item = result["items"][0]
     if item["ok"] and item["value"] is not None:
-        # 顺手更新最近读数，让列表页立刻能看到结果（真实采集仍由 collect 负责落 Reading）
+        # 顺手更新最近读数，让列表页立刻能看到结果（真实采集仍由 collect 负责落 EnergyRaw）
         m.last_value = Decimal(str(item["value"]))
         m.last_at = datetime.now()
         m.last_ok = True
@@ -995,7 +1074,7 @@ def admin_meter_test(request: HttpRequest, pk: int) -> JsonResponse:
     return json_ok({**item, "durationMs": result["durationMs"], "unit": unit, "detail": detail})
 
 
-def _try_read(gateway: Gateway, meters: list[Meter]) -> dict:
+def _try_read(gateway: EnergyGateway, meters: list[EnergyMeter]) -> dict:
     """共用的试读实现：一次连接读多个点位，返回逐点结果。"""
     import time
 

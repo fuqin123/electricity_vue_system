@@ -117,6 +117,6 @@ class Command(BaseCommand):
         self.stdout.write(f"   └─ 小时差值：{key} 共 {written} 条")
 
         rows = S.summarize_days(prev.date(), now)
-        rows += S.summarize_periods(PeriodSummary.DIM_MONTH, S.recent_months(2, now), now)
-        rows += S.summarize_periods(PeriodSummary.DIM_YEAR, S.recent_years(1, now), now)
+        rows += S.summarize_periods(S.DIM_MONTH, S.recent_months(2, now), now)
+        rows += S.summarize_periods(S.DIM_YEAR, S.recent_years(1, now), now)
         self.stdout.write(f"   └─ 已刷新周期总计（{len(rows)} 条）")

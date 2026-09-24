@@ -16,7 +16,16 @@ from django.test import Client, TestCase
 from apps.energy.collectors.base import get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
 from apps.energy.management.commands import collect
-from apps.energy.models import Gateway, HourlyUsage, Line, Meter, PeriodSummary, Reading
+from apps.energy.models import (
+    EnergyGateway,
+    EnergyHourly,
+    EnergyMeter,
+    EnergyDaily,
+    EnergyRaw,
+    EnergyType,
+    PeriodSummary,
+    ProductionLine,
+)
 from apps.energy.services import slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
@@ -25,28 +34,41 @@ from apps.energy.services.snapshot import build_line, build_overview
 DAY = datetime(2026, 9, 22).date()
 
 
+def etype(code: str = EnergyType.ELECTRIC) -> EnergyType:
+    """取能源类型实例（v1.3.0 起它是一张表，迁移里已灌好三种）。"""
+    return EnergyType.objects.get(type_code=code)
+
+
 class AggregationTests(TestCase):
     """小时差值的口径测试。"""
 
     @classmethod
     def setUpTestData(cls):
-        cls.line = Line.objects.create(code="A1", name="一线")
-        cls.gw = Gateway.objects.create(code="GW-T", name="测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=1)
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        cls.gw = EnergyGateway.objects.create(code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1)
 
-    def make_meter(self, code: str = "E-T-01", **kw) -> Meter:
-        return Meter.objects.create(
+    def make_meter(self, code: str = "E-T-01", **kw) -> EnergyMeter:
+        return EnergyMeter.objects.create(
             code=code,
             name=f"测试表 {code}",
-            kind=kw.pop("kind", Meter.KIND_ELEC),
-            scope=kw.pop("scope", Meter.SCOPE_LINE),
+            energy_type=etype(kw.pop("kind", EnergyType.ELECTRIC)),
+            scope=kw.pop("scope", EnergyMeter.SCOPE_LINE),
             line=kw.pop("line", self.line),
             gateway=self.gw,
             unit="kWh",
             **kw,
         )
 
-    def read(self, meter: Meter, at: datetime, value: str) -> Reading:
-        return Reading.objects.create(meter=meter, at=at, value=Decimal(value), ok=True, raw="test")
+    def read(self, meter: EnergyMeter, at: datetime, value: str) -> EnergyRaw:
+        return EnergyRaw.objects.create(
+            meter=meter,
+            line=meter.line,
+            energy_type=meter.energy_type,
+            collect_time=at,
+            reading=Decimal(value),
+            ok=True,
+            raw="test",
+        )
 
     def test_正常整点差值(self):
         """13:59 与 14:59 两条读数 → 14 点用量 = 30。"""
@@ -55,7 +77,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 14, 59, 50), "130")
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_OK)
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK)
         self.assertEqual(res["usage"], Decimal("30.000"))
 
     def test_端点取最接近整点的那条读数(self):
@@ -67,7 +89,7 @@ class AggregationTests(TestCase):
 
         res = compute_hour(meter, DAY, 14)
         self.assertEqual(res["usage"], Decimal("25.000"))
-        self.assertEqual(res["quality"], HourlyUsage.Q_OK)
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK)
 
     def test_缺读数时置空而不是零(self):
         """14:00 前没有任何读数 → 该小时 missing，usage 必须是 None（绝不能是 0）。"""
@@ -76,7 +98,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 14, 59, 0), "110")
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_MISSING)
+        self.assertEqual(res["quality"], EnergyHourly.Q_MISSING)
         self.assertIsNone(res["usage"])
         self.assertNotEqual(res["usage"], 0)
 
@@ -87,7 +109,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 14, 59, 0), "50")
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_RESET)
+        self.assertEqual(res["quality"], EnergyHourly.Q_RESET)
         self.assertIsNone(res["usage"])
         self.assertIn("疑似换表", res["note"])
 
@@ -98,7 +120,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 14, 59, 0), "400")
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_SPIKE)
+        self.assertEqual(res["quality"], EnergyHourly.Q_SPIKE)
         self.assertEqual(res["usage"], Decimal("300.000"))
 
     def test_容差外不配对_判缺数而不是凑一个数(self):
@@ -119,7 +141,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 14, 59, 50), "130")
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_MISSING)
+        self.assertEqual(res["quality"], EnergyHourly.Q_MISSING)
         self.assertIsNone(res["usage"])
         self.assertIn("采样槽", res["note"])
 
@@ -130,7 +152,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 14, 0, 0), "100")  # 值相同 → 差值会是 0
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_MISSING)
+        self.assertEqual(res["quality"], EnergyHourly.Q_MISSING)
         self.assertIsNone(res["usage"])
         self.assertNotEqual(res["usage"], 0)
 
@@ -149,10 +171,10 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 10, 30, 20), "160")  # 补采，必须被忽略
 
         res = compute_hour(meter, DAY, 9)
-        self.assertEqual(res["quality"], HourlyUsage.Q_OK)
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK)
         self.assertEqual(res["usage"], Decimal("30.000"))
         self.assertEqual(res["end_at"], datetime(2026, 9, 22, 10, 1, 3))
-        self.assertEqual(res["end_value"], Decimal("130"))
+        self.assertEqual(res["end_reading"], Decimal("130"))
 
     def test_整点采样节奏下区间正好一小时(self):
         """整点 + 60 秒采样的两条读数 → 区间严格 1 小时，不累积偏差。"""
@@ -161,7 +183,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 15, 1, 2), "142")
 
         res = compute_hour(meter, DAY, 14)
-        self.assertEqual(res["quality"], HourlyUsage.Q_OK)
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK)
         self.assertEqual(res["usage"], Decimal("42.000"))
         self.assertEqual((res["end_at"] - res["start_at"]).total_seconds(), 3600)
 
@@ -177,7 +199,7 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 15, 50, 23), "130")
 
         res = compute_hour(meter, DAY, 15)
-        self.assertEqual(res["quality"], HourlyUsage.Q_PARTIAL)
+        self.assertEqual(res["quality"], EnergyHourly.Q_PARTIAL)
         self.assertIn("未按期采到", res["note"])
 
     def test_写入小时表可重复执行(self):
@@ -189,9 +211,9 @@ class AggregationTests(TestCase):
         aggregate_hour(DAY, 14, meters=[meter])
         aggregate_hour(DAY, 14, meters=[meter])
 
-        rows = HourlyUsage.objects.filter(meter=meter, date=DAY, hour=14)
+        rows = EnergyHourly.objects.filter(meter=meter, stat_date=DAY, stat_hour=14)
         self.assertEqual(rows.count(), 1)
-        self.assertEqual(rows.first().usage, Decimal("30.000"))
+        self.assertEqual(rows.first().consumption, Decimal("30.000"))
 
     def test_当前小时给参考值(self):
         """进行中的小时：用「本小时内首末两条读数」给参考值，并带上覆盖占比。"""
@@ -223,10 +245,16 @@ class AggregationTests(TestCase):
         self.read(meter, datetime(2026, 9, 22, 13, 1, 0), "100")
         self.assertIsNone(current_hour_usage(meter, now=datetime(2026, 9, 22, 14, 30, 0)))
 
-    def test_车间总表不挂产线(self):
-        """水汽总表 scope=workshop，line 为空，不参与任何产线合计。"""
-        meter = self.make_meter(code="S-T-01", kind=Meter.KIND_STEAM, scope=Meter.SCOPE_WORKSHOP, line=None)
-        self.assertIsNone(meter.line)
+    def test_车间总表挂哨兵行且不进产线合计(self):
+        """水汽总表 scope=workshop —— 挂「车间哨兵行」，且不计入任何产线合计。
+
+        v1.3.0 起改为挂哨兵行而不是留空：日/月/年汇总表以 (line, energy_type, 周期)
+        建唯一键，而 MySQL 把多个 NULL 视为互不相同，留空会让唯一约束失效。
+        """
+        ws = ProductionLine.objects.get(line_code=ProductionLine.WORKSHOP_CODE)
+        meter = self.make_meter(code="S-T-01", kind=EnergyType.STEAM,
+                                scope=EnergyMeter.SCOPE_WORKSHOP, line=ws)
+        self.assertTrue(meter.line.is_workshop)
         self.assertEqual(self.line.meters.count(), 0)
 
 
@@ -264,16 +292,16 @@ class IfDueGuardTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.line = Line.objects.create(code="A2", name="二线")
-        cls.gw = Gateway.objects.create(
-            code="GW-DUE", name="守卫测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=2
+        cls.line = ProductionLine.objects.create(line_code="A2", line_name="二线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-DUE", name="守卫测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=2
         )
         cls.meters = [
-            Meter.objects.create(
+            EnergyMeter.objects.create(
                 code=f"E-DUE-{i:02d}",
                 name=f"守卫测试表 {i}",
-                kind=Meter.KIND_ELEC,
-                scope=Meter.SCOPE_LINE,
+                energy_type=etype(),
+                scope=EnergyMeter.SCOPE_LINE,
                 line=cls.line,
                 gateway=cls.gw,
                 unit="kWh",
@@ -287,9 +315,15 @@ class IfDueGuardTests(TestCase):
             frozen.now.return_value = moment
             return collect.Command()._is_due(None)
 
-    def _read(self, meter: Meter, at: datetime, ok: bool = True) -> Reading:
-        return Reading.objects.create(
-            meter=meter, at=at, value=Decimal("100"), ok=ok, raw="test"
+    def _read(self, meter: EnergyMeter, at: datetime, ok: bool = True) -> EnergyRaw:
+        return EnergyRaw.objects.create(
+            meter=meter,
+            line=meter.line,
+            energy_type=meter.energy_type,
+            collect_time=at,
+            reading=Decimal("100"),
+            ok=ok,
+            raw="test",
         )
 
     def test_采样窗口未到时不采(self):
@@ -342,23 +376,30 @@ class LineStatusTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.line = Line.objects.create(code="A9", name="九线", rated=30000)
-        cls.gw = Gateway.objects.create(
-            code="GW-ST", name="状态测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=9
+        cls.line = ProductionLine.objects.create(line_code="A9", line_name="九线", rated=30000)
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-ST", name="状态测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
         )
-        cls.meter = Meter.objects.create(
+        cls.meter = EnergyMeter.objects.create(
             code="E-A9-01",
             name="九线产线电表",
-            kind=Meter.KIND_ELEC,
-            scope=Meter.SCOPE_LINE,
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
             line=cls.line,
             gateway=cls.gw,
             unit="kWh",
         )
 
-    def _usage(self, hour: int, value: str, quality: str = HourlyUsage.Q_OK) -> None:
-        HourlyUsage.objects.create(
-            meter=self.meter, date=self.DAY, hour=hour, usage=Decimal(value), unit="kWh", quality=quality
+    def _usage(self, hour: int, value: str, quality: str = EnergyHourly.Q_OK) -> None:
+        EnergyHourly.objects.create(
+            meter=self.meter,
+            line=self.meter.line,
+            energy_type=self.meter.energy_type,
+            stat_date=self.DAY,
+            stat_hour=hour,
+            consumption=Decimal(value),
+            unit="kWh",
+            quality=quality,
         )
 
     def _status(self) -> str:
@@ -391,39 +432,47 @@ class ApiSerializationTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.line = Line.objects.create(code="A1", name="一线")
-        # ① 「一条可信数据都没有」的车间行：数值字段全 NULL
-        PeriodSummary.objects.create(
-            scope=PeriodSummary.SCOPE_WORKSHOP,
-            dim=PeriodSummary.DIM_DAY,
-            period_key=DAY.isoformat(),
-            start_date=DAY,
-            end_date=DAY,
-            quality=PeriodSummary.Q_MISSING,
-            covered_hours=0,
-        )
-        # ② 正常有值的产线行
-        PeriodSummary.objects.create(
-            scope=PeriodSummary.SCOPE_LINE,
-            dim=PeriodSummary.DIM_DAY,
-            period_key=DAY.isoformat(),
-            start_date=DAY,
-            end_date=DAY,
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        # 车间哨兵行已由迁移 0006 建好，这里取用即可
+        cls.ws = ProductionLine.objects.get(line_code=ProductionLine.WORKSHOP_CODE)
+        # ① 产线电力：正常有值
+        EnergyDaily.objects.create(
             line=cls.line,
-            kwh=Decimal("123.456"),
+            energy_type=etype(),
+            stat_date=DAY,
+            consumption=Decimal("123.456"),
+            unit="kWh",
+            covered_count=1,
+            expected_count=24,
             quality=PeriodSummary.Q_OK,
-            covered_hours=1,
+        )
+        # ② 车间水表：该周期一条可信数据都没有 → consumption 为 NULL（不是 0）
+        EnergyDaily.objects.create(
+            line=cls.ws,
+            energy_type=etype(EnergyType.WATER),
+            stat_date=DAY,
+            consumption=None,
+            unit="m³",
+            covered_count=0,
+            expected_count=24,
+            quality=PeriodSummary.Q_MISSING,
         )
 
     def test_周期总计接口遇空值行仍返回200(self):
+        """B-509 回归：汇总行有 NULL 值时，接口必须返回 200 + JSON null，而不是 500。
+
+        同时锁住两条口径：
+          · 车间**电力** = 各产线之和（车间没有独立电力总表）；
+          · 水/汽取车间哨兵行的总表，该周期没有可信数据时给 null（不是 0）。
+        """
         r = Client().get("/api/energy/period-summary", {"dim": "day", "scope": "workshop"})
         self.assertEqual(r.status_code, 200)
         item = r.json()["items"][0]
-        self.assertIsNone(item["output"])
-        self.assertIsNone(item["kwh"])
-        self.assertIsNone(item["waterT"])
+        self.assertEqual(item["kwh"], 123.456)   # 车间电力 = 产线之和
+        self.assertIsNone(item["waterT"])        # 空值 → JSON null（绝不补 0）
         self.assertIsNone(item["steamT"])
-        self.assertIsNone(item["unitKwh"])
+        self.assertIsNone(item["output"])        # 产量未接入 → null
+        self.assertIsNone(item["unitKwh"])       # 分母缺失 → 算不出，给 null
 
     def test_周期总计接口有值行返回数字(self):
         r = Client().get(
@@ -451,15 +500,15 @@ class CollectHealthAlertTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.line = Line.objects.create(code="A8", name="八线")
-        cls.gw = Gateway.objects.create(
-            code="GW-H", name="健康测试网关", kind=Gateway.KIND_MODBUS, host="127.0.0.1", port=8
+        cls.line = ProductionLine.objects.create(line_code="A8", line_name="八线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-H", name="健康测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=8
         )
-        cls.meter = Meter.objects.create(
+        cls.meter = EnergyMeter.objects.create(
             code="E-A8-01",
             name="八线产线电表",
-            kind=Meter.KIND_ELEC,
-            scope=Meter.SCOPE_LINE,
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
             line=cls.line,
             gateway=cls.gw,
             unit="kWh",
@@ -469,14 +518,24 @@ class CollectHealthAlertTests(TestCase):
         return [a["text"] for a in build_overview(self.NOW)["workshop"]["alerts"]]
 
     def test_读数按时更新时不告警(self):
-        Reading.objects.create(
-            meter=self.meter, at=datetime(2026, 9, 23, 12, 4), value=Decimal("1"), ok=True
+        EnergyRaw.objects.create(
+            meter=self.meter,
+            line=self.meter.line,
+            energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 9, 23, 12, 4),
+            reading=Decimal("1"),
+            ok=True,
         )
         self.assertFalse(any("采集疑似中断" in t for t in self._texts()))
 
     def test_读数停在两小时前时告警(self):
-        Reading.objects.create(
-            meter=self.meter, at=datetime(2026, 9, 23, 10, 4), value=Decimal("1"), ok=True
+        EnergyRaw.objects.create(
+            meter=self.meter,
+            line=self.meter.line,
+            energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 9, 23, 10, 4),
+            reading=Decimal("1"),
+            ok=True,
         )
         self.assertTrue(any("采集疑似中断" in t for t in self._texts()))
 
@@ -525,7 +584,7 @@ class TrendSeriesOrderTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.line = Line.objects.create(code="A1", name="一线", enabled=True)
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线", status=ProductionLine.STATUS_ON)
 
     def test_近N日正序且末项是今天(self):
         days = S.recent_days(30, self.NOW)
@@ -544,16 +603,15 @@ class TrendSeriesOrderTests(TestCase):
         self.assertEqual([d.year for d in S.recent_years(5, self.NOW)], [2022, 2023, 2024, 2025, 2026])
 
     def test_日序列正序且缺数是None不是0(self):
-        PeriodSummary.objects.create(
-            scope=PeriodSummary.SCOPE_LINE,
-            dim=PeriodSummary.DIM_DAY,
+        EnergyDaily.objects.create(
             line=self.line,
-            period_key=self.NOW.strftime("%Y-%m-%d"),
-            start_date=self.NOW.date(),
-            end_date=self.NOW.date(),
-            kwh=Decimal("23.000"),
+            energy_type=etype(),
+            stat_date=self.NOW.date(),
+            consumption=Decimal("23.000"),
+            unit="kWh",
+            covered_count=3,
+            expected_count=24,
             quality=PeriodSummary.Q_OK,
-            covered_hours=3,
         )
         series = build_line(self.line, now=self.NOW)["daily30"]
         self.assertEqual([p["label"] for p in series][0], "02-04")

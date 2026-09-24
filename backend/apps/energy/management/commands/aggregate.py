@@ -20,7 +20,7 @@ from datetime import datetime
 from django.core.management.base import BaseCommand, CommandError
 from django.utils.dateparse import parse_date
 
-from apps.energy.models import HourlyUsage, Meter
+from apps.energy.models import EnergyHourly, EnergyMeter
 from apps.energy.services.aggregate import aggregate_day, aggregate_hour, aggregate_recent, explain_hour
 
 
@@ -42,7 +42,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         meters = None
         if options.get("meter"):
-            meter = Meter.objects.filter(code=options["meter"]).first()
+            meter = EnergyMeter.objects.filter(code=options["meter"]).first()
             if meter is None:
                 raise CommandError(f"计量点不存在：{options['meter']}")
             meters = [meter]
@@ -74,13 +74,13 @@ class Command(BaseCommand):
             self._verify(meters, options)
 
         if options.get("show"):
-            from apps.energy.models import HourlyUsage as HU
+            from apps.energy.models import EnergyHourly as HU
 
             qs = HU.objects.select_related("meter").order_by("-date", "-hour", "meter__code")[:40]
             flag = {"ok": "  ", "partial": "~ ", "missing": "× ", "reset": "R ", "spike": "! "}
             self.stdout.write(f"{'计量点':<12}{'日期':<12}{'时':<4}{'用量':>12}  {'质量':<9}说明")
             for r in qs:
-                usage = f"{r.usage}" if r.usage is not None else "—"
+                usage = f"{r.consumption}" if r.consumption is not None else "—"
                 self.stdout.write(
                     f"{r.meter.code:<12}{r.date}  {r.hour:>2}  {usage:>12}  "
                     f"{flag.get(r.quality, '')}{r.quality:<9}{r.note[:44]}"
@@ -94,7 +94,7 @@ class Command(BaseCommand):
         """
         day = parse_date(options.get("date") or "") or datetime.now().date()
         hours = list(self._parse_hours(options.get("hours")))
-        ms = meters if meters is not None else list(Meter.objects.filter(enabled=True).order_by("code"))
+        ms = meters if meters is not None else list(EnergyMeter.objects.filter(enabled=True).order_by("code"))
 
         self.stdout.write("")
         self.stdout.write(self.style.MIGRATE_HEADING(f"端点核对 · {day}"))

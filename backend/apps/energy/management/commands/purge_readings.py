@@ -3,7 +3,7 @@
     python manage.py purge_readings --days 180          删除 180 天前的原始读数
     python manage.py purge_readings --days 180 --dry-run 只统计不删
 
-为什么可以删原始读数：**小时差值（HourlyUsage）是永久保留的**，
+为什么可以删原始读数：**小时差值（EnergyHourly）是永久保留的**，
 大屏和报表都只读差值表；原始读数的作用是「出问题时能复查、算法改了能重算」，
 保留半年足够覆盖排查与回归需求。
 
@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from django.core.management.base import BaseCommand
 
-from apps.energy.models import Reading
+from apps.energy.models import EnergyHourly, EnergyRaw
 from eep import conf
 
 
@@ -30,7 +30,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         days = int(options["days"] or conf.get("collect.readings_retention_days", 180))
         cutoff = datetime.now() - timedelta(days=days)
-        qs = Reading.objects.filter(at__lt=cutoff)
+        qs = EnergyRaw.objects.filter(collect_time__lt=cutoff)
         count = qs.count()
 
         if options["dry_run"]:
@@ -48,7 +48,7 @@ class Command(BaseCommand):
             ids = list(qs.values_list("id", flat=True)[:batch])
             if not ids:
                 break
-            Reading.objects.filter(id__in=ids).delete()
+            EnergyRaw.objects.filter(id__in=ids).delete()
             deleted += len(ids)
             self.stdout.write(f"  已删除 {deleted}/{count}")
 

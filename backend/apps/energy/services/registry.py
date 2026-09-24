@@ -16,7 +16,7 @@ from django.db import transaction
 
 from eep import conf
 
-from ..models import Gateway, Line, Meter
+from ..models import EnergyGateway, EnergyMeter, EnergyType, ProductionLine
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,26 @@ def _dec(value, default="1") -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError):
         return Decimal(default)
+
+
+#: 配置里的能源短码 → energy_type.type_code
+KIND_TO_TYPE_CODE = {"elec": "ELECTRIC", "water": "WATER", "steam": "STEAM"}
+
+
+def _energy_type(kind: str) -> EnergyType:
+    """把配置里的能源标识（短码 elec 或编码 ELECTRIC）解析成 EnergyType 实例。
+
+    ⚠ 解析不到就直接报错，不要静默兜底成「电」—— 那会让水表按电来统计。
+    """
+    raw = str(kind or "").strip()
+    code = KIND_TO_TYPE_CODE.get(raw.lower(), raw.upper())
+    obj = EnergyType.objects.filter(type_code=code).first()
+    if obj is None:
+        raise ValueError(
+            f"未知能源类型 {kind!r}：配置文件里请写 {' / '.join(KIND_TO_TYPE_CODE)} "
+            f"之一（或 energy_type 表里的编码）"
+        )
+    return obj
 
 
 @transaction.atomic
@@ -42,31 +62,38 @@ def sync_registry(*, force: bool = False) -> dict:
 
     # ── 产线 ────────────────────────────────────────────────
     for item in conf.get("lines", []) or []:
-        Line.objects.update_or_create(
-            code=item["code"],
+        ProductionLine.objects.update_or_create(
+            line_code=item["code"],
             defaults={
-                "name": item.get("name", item["code"]),
+                "line_name": item.get("name", item["code"]),
                 "rated": int(item.get("rated", 0) or 0),
                 "product": item.get("product", ""),
                 "sort": int(item.get("sort", 0) or 0),
-                "enabled": bool(item.get("enabled", True)),
+                # 配置里的 enabled 只映射到 status；line_type 一律是产线
+                # （车间哨兵行由 0006 迁移建好，配置里不要出现，否则会把 it 变回产线）
+                "status": (
+                    ProductionLine.STATUS_ON if item.get("enabled", True) else ProductionLine.STATUS_OFF
+                ),
+                "line_type": ProductionLine.TYPE_LINE,
             },
         )
         stat["line"] += 1
 
     # ── 网关 ────────────────────────────────────────────────
-    gw_map: dict[str, Gateway] = {}
+    gw_map: dict[str, EnergyGateway] = {}
     for item in conf.get("gateways", []) or []:
-        existed = Gateway.objects.filter(code=item["code"]).first()
+        existed = EnergyGateway.objects.filter(code=item["code"]).first()
         gw_map[item["code"]] = existed  # 先记下，供计量点引用（含被跳过的）
-        if existed is not None and existed.source == Gateway.SOURCE_ADMIN and not force:
+        if existed is not None and existed.source == EnergyGateway.SOURCE_ADMIN and not force:
             stat["skipped"] += 1
             logger.warning("网关 %s 由后台维护，跳过配置覆盖（需要覆盖请加 --force）", item["code"])
             continue
-        gw, _ = Gateway.objects.update_or_create(
+        gw, _ = EnergyGateway.objects.update_or_create(
             code=item["code"],
             defaults={
                 "name": item.get("name", item["code"]),
+                # 配置里写的是短码（elec/water/steam），库里是 ENERGY 编码
+                # 网关的 kind 是「网关类型」（modbus_rtu_tcp / http_api），与能源类型无关
                 "kind": item["kind"],
                 "host": item.get("host", "") or "",
                 "port": item.get("port"),
@@ -75,44 +102,54 @@ def sync_registry(*, force: bool = False) -> dict:
                 "interval_seconds": int(item.get("interval_seconds", 60) or 60),
                 "enabled": bool(item.get("enabled", True)),
                 "remark": item.get("remark", ""),
-                "source": Gateway.SOURCE_CONFIG,
+                "source": EnergyGateway.SOURCE_CONFIG,
             },
         )
         gw_map[gw.code] = gw
         stat["gateway"] += 1
 
-    line_map = {ln.code: ln for ln in Line.objects.all()}
+    line_map = {ln.line_code: ln for ln in ProductionLine.objects.all()}
 
     # ── 计量点 ──────────────────────────────────────────────
     for item in conf.get("meters", []) or []:
         gw_code = item.get("gateway")
-        gw = gw_map.get(gw_code) or Gateway.objects.filter(code=gw_code).first()
+        gw = gw_map.get(gw_code) or EnergyGateway.objects.filter(code=gw_code).first()
         if gw is None:
             raise ValueError(f"计量点 {item.get('code')} 引用了不存在的网关：{gw_code}")
 
         line = None
         if item.get("line"):
-            line = line_map.get(item["line"]) or Line.objects.filter(code=item["line"]).first()
+            line = line_map.get(item["line"]) or ProductionLine.objects.filter(line_code=item["line"]).first()
             if line is None:
                 raise ValueError(f"计量点 {item.get('code')} 引用了不存在的产线：{item['line']}")
 
-        scope = item.get("scope", Meter.SCOPE_LINE)
-        if scope == Meter.SCOPE_WORKSHOP:
-            line = None  # 车间总表不挂在任何产线
+        scope = item.get("scope", EnergyMeter.SCOPE_LINE)
+        if scope == EnergyMeter.SCOPE_WORKSHOP:
+            # 车间水/汽总表挂「车间哨兵行」—— 汇总表的唯一键需要 line，
+            # 留空会让 MySQL 的唯一约束失效（多个 NULL 互不相同）
+            line = ProductionLine.objects.get_or_create(
+                line_code=ProductionLine.WORKSHOP_CODE,
+                defaults={
+                    "line_name": "车间（总表）",
+                    "line_type": ProductionLine.TYPE_WORKSHOP,
+                    "sort": 0,
+                },
+            )[0]
 
-        existed = Meter.objects.filter(code=item["code"]).first()
-        if existed is not None and existed.source == Meter.SOURCE_ADMIN and not force:
+        existed = EnergyMeter.objects.filter(code=item["code"]).first()
+        if existed is not None and existed.source == EnergyMeter.SOURCE_ADMIN and not force:
             stat["skipped"] += 1
             logger.warning("计量点 %s 由后台维护，跳过配置覆盖（需要覆盖请加 --force）", item["code"])
             continue
 
-        Meter.objects.update_or_create(
+        EnergyMeter.objects.update_or_create(
             code=item["code"],
             defaults={
                 "name": item.get("name", item["code"]),
-                "kind": item["kind"],
+                # 配置里写的是能源短码（elec/water/steam），库里是 ELECTRIC/WATER/STEAM
+                "energy_type": _energy_type(item["kind"]),
                 "scope": scope,
-                "role": item.get("role", Meter.ROLE_LINE),
+                "role": item.get("role", EnergyMeter.ROLE_LINE),
                 "line": line,
                 "gateway": gw,
                 "slave": item.get("slave"),
@@ -130,7 +167,7 @@ def sync_registry(*, force: bool = False) -> dict:
                 "enabled": bool(item.get("enabled", True)),
                 "remark": item.get("remark", ""),
                 "asset_no": item.get("asset_no", "") or "",
-                "source": Meter.SOURCE_CONFIG,
+                "source": EnergyMeter.SOURCE_CONFIG,
             },
         )
         stat["meter"] += 1

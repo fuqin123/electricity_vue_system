@@ -9,15 +9,15 @@
 
 from __future__ import annotations
 
-from apps.energy.models import Gateway
+from apps.energy.models import EnergyGateway
 
 from .base import BaseCollector, CollectResult, get_path
 from .http_api import HttpApiCollector
 from .modbus_rtu import ModbusRtuOverTcpCollector
 
 COLLECTORS: dict[str, type[BaseCollector]] = {
-    Gateway.KIND_MODBUS: ModbusRtuOverTcpCollector,
-    Gateway.KIND_HTTP: HttpApiCollector,
+    EnergyGateway.KIND_MODBUS: ModbusRtuOverTcpCollector,
+    EnergyGateway.KIND_HTTP: HttpApiCollector,
 }
 
 

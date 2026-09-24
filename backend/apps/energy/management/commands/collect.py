@@ -33,7 +33,7 @@ from django.core.management.base import BaseCommand
 
 from apps.energy.services.aggregate import aggregate_recent
 from apps.energy.services.collect import collect_round
-from apps.energy.models import Meter, PeriodSummary, Reading
+from apps.energy.models import EnergyMeter, PeriodSummary, EnergyRaw
 from apps.energy.services import slots
 from apps.energy.services import summary as S
 
@@ -89,8 +89,8 @@ class Command(BaseCommand):
         if not options["dry_run"] and not options["no_summary"]:
             now = datetime.now()
             written = S.summarize_days(now.date(), now)
-            written += S.summarize_periods(PeriodSummary.DIM_MONTH, S.recent_months(2, now), now)
-            written += S.summarize_periods(PeriodSummary.DIM_YEAR, S.recent_years(1, now), now)
+            written += S.summarize_periods(S.DIM_MONTH, S.recent_months(2, now), now)
+            written += S.summarize_periods(S.DIM_YEAR, S.recent_years(1, now), now)
             self.stdout.write(f"周期总计：刷新今天 + 近 2 月 + 今年，共 {len(written)} 条")
 
         # 有失败时返回非 0，方便计划任务判定
@@ -122,13 +122,13 @@ class Command(BaseCommand):
         if slots.due_slot(now) is None:
             return False
         b = slots.hour_start(now)
-        ms = Meter.objects.filter(enabled=True)
+        ms = EnergyMeter.objects.filter(enabled=True)
         if gateway_codes:
             ms = ms.filter(gateway__code__in=gateway_codes)
         ms = list(ms)
         if not ms:
             return True
         done = set(
-            Reading.objects.filter(meter__in=ms, at__gte=b, ok=True).values_list("meter_id", flat=True)
+            EnergyRaw.objects.filter(meter__in=ms, collect_time__gte=b, ok=True).values_list("meter_id", flat=True)
         )
         return len(done) < len(ms)

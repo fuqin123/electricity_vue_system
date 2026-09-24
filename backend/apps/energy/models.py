@@ -1,23 +1,40 @@
-"""数据模型 —— 采集侧的对象模型。
+"""数据模型 —— v1.3.0 重新设计后的库表结构。
 
-分层说明（这是整套采集的口径基础，改之前先想清楚）：
+设计全文见 `backend/docs/数据库设计-v1.3.0.md`（含「为什么这么改」的逐条理由）。
+这里只强调三条最容易改错的地方：
 
-    Gateway 网关 ──< Meter 计量点 ──< Reading 原始读数（累计值）
-                                 ├─< HourlyUsage 小时用量（差值，交付给大屏的就是它）
-                                 └─< HourlyProduction 小时产量（产量侧接入后写入）
+## 一、表名前缀统一为业务语义
 
-    Line 产线 ──< PeriodSummary 日 / 月 / 年总计（产线级与车间级）
+    eep_line              → production_line      产线
+    eep_gateway           → energy_gateway       采集网关
+    eep_meter             → energy_meter         计量点（仪表）
+    eep_reading           → energy_raw           原始累计读数
+    eep_hourly_usage      → energy_hourly        小时用量（差值）
+    eep_hourly_production → production_hourly    小时产量
+    eep_collect_log       → energy_collect_log   采集日志
+    eep_period_summary    → 拆成 energy_daily / energy_monthly / energy_yearly
 
-  · **Reading 存的是电表/流量计的累计值**（如 6,312,640.6 kWh），不是用量。
-  · **HourlyUsage 才是「这个小时用了多少」**，由「本小时末读数 − 上小时末读数」得出。
-  · 产线级、车间级的**小时**用量不落表，查询时按 Meter 聚合出来，避免两处口径不一致。
-  · 但**日 / 月 / 年总计落表**（PeriodSummary）：这类聚合窗口长、算一次开销大，
-    且大屏与后台都要读，落表才能保证两边数字完全一致、且历史数据可回溯。
+## 二、分层：原始值 → 小时用量 → 日/月/年
+
+    production_line ─┬─< energy_meter ─< energy_raw ─(差值)─> energy_hourly
+                     │        └── energy_gateway
+                     ├─< production_hourly
+                     └─< energy_daily ─> energy_monthly ─> energy_yearly
+
+  · `energy_raw.reading` 是**累计值**（如 6,312,639.3 kWh），不是用量；
+  · `energy_hourly.consumption` 才是「这个小时用了多少」；
+  · **日/月/年一律由 `energy_hourly` 累加得出**，绝不用「日末读数 − 日初读数」——
+    后者在采集中断时会静默吞掉缺的那几小时（见 docs/02 的 B-502）。
+
+## 三、两条铁律（模型层面就用可空字段挡住）
+
+  1. **缺数绝不补 0。** 所有用量字段（`consumption`）与读数端点都可空：
+     NULL = 没采到 / 不可信，0 = 确实没用。两者语义相反。
+  2. **只有 `quality='ok'` 才进合计。** 见 `EnergyHourly.TRUSTED`。
 
 ⚠ 产量侧（灌装机计数器 / 装箱机 PLC / MES 班报工）**尚未改造**，
-  因此 HourlyProduction 目前只有 `ingest_production` 写入的 **null 占位**
-  （source=demo / quality=nodata），接口对这类行一律返回 **null**（不是 0），
-  绝不拿电量反推产量。
+  `production_hourly` 目前只有 `ingest_production` 写入的 null 占位，
+  接口对这类行一律返回 null（不是 0），绝不拿电量反推产量。
 """
 
 from __future__ import annotations
@@ -25,7 +42,93 @@ from __future__ import annotations
 from django.db import models
 
 
-class Gateway(models.Model):
+class EnergyType(models.Model):
+    """能源类型（水 / 电 / 汽）—— 替代原来的 `Meter.kind` 字符串。
+
+    为什么单独建表：能源类型是被 `energy_meter` / `energy_raw` / `energy_hourly`
+    与三级汇总共同引用的维度，用字符串会在各处散落魔法值；建表后单位、名称、
+    排序都只有一处定义。新增一种能源（如压缩空气）只需加一行 + 加计量点，
+    **不用改代码**。
+    """
+
+    ELECTRIC = "ELECTRIC"
+    WATER = "WATER"
+    STEAM = "STEAM"
+
+    #: 接口层给前端的短码（前端 `MeterPoint.kind` 用的是 elec/water/steam）
+    FRONTEND_CODE = {ELECTRIC: "elec", WATER: "water", STEAM: "steam"}
+    #: 默认单位（现场确认后以 `unit` 字段为准）
+    DEFAULT_UNIT = {ELECTRIC: "kWh", WATER: "m³", STEAM: "t"}
+
+    type_code = models.CharField("能源编码", max_length=20, unique=True)
+    type_name = models.CharField("能源名称", max_length=50)
+    unit = models.CharField("单位", max_length=20)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    enabled = models.BooleanField("启用", default=True)
+
+    class Meta:
+        db_table = "energy_type"
+        ordering = ["sort", "id"]
+        verbose_name = "能源类型"
+        verbose_name_plural = "能源类型"
+
+    def __str__(self) -> str:
+        return f"{self.type_name}({self.type_code})"
+
+    @property
+    def frontend_code(self) -> str:
+        return self.FRONTEND_CODE.get(self.type_code, self.type_code.lower())
+
+
+class ProductionLine(models.Model):
+    """产线（含一条「车间」哨兵行）。
+
+    ⚠ **车间哨兵行**（`line_type='workshop'`，`line_code='WORKSHOP'`）是刻意加的：
+      车间水表 / 蒸汽表是**总表，不属于任何产线**，而日/月/年汇总表要按
+      `line_id` 建唯一键。若把 `line_id` 设为可空，MySQL 的唯一索引会把多个
+      NULL 视为互不相同 —— 唯一约束对总表就**形同失效**，重复行能照样插进去。
+      有一条真实记录（而不是 NULL）才能让唯一键真正生效。
+      界面上的「产线列表」按 `line_type` 过滤，看不到它。
+
+    ⚠ 另一个口径：**车间电力合计没有独立总表**，它等于 6 条产线之和；
+      而车间水 / 汽用哨兵行的总表读数。两者的算法不同，别混。
+    """
+
+    TYPE_LINE = "line"
+    TYPE_WORKSHOP = "workshop"
+    TYPE_CHOICES = [(TYPE_LINE, "产线"), (TYPE_WORKSHOP, "车间（总表）")]
+
+    STATUS_ON = 1
+    STATUS_OFF = 0
+
+    WORKSHOP_CODE = "WORKSHOP"
+
+    line_code = models.CharField("产线编码", max_length=50, unique=True)
+    line_name = models.CharField("产线名称", max_length=100)
+    status = models.PositiveSmallIntegerField("状态", default=STATUS_ON, help_text="1 启用 / 0 停用")
+    line_type = models.CharField("类型", max_length=10, choices=TYPE_CHOICES, default=TYPE_LINE)
+    #: 静态台账参数：没有它算不出计划产量与达成率（不是产量数据）
+    rated = models.PositiveIntegerField("额定产能(瓶/小时)", default=0)
+    product = models.CharField("品项", max_length=64, blank=True, default="")
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "production_line"
+        ordering = ["sort", "line_code"]
+        verbose_name = "产线"
+        verbose_name_plural = "产线"
+
+    def __str__(self) -> str:
+        return f"{self.line_code} {self.line_name}"
+
+    @property
+    def is_workshop(self) -> bool:
+        return self.line_type == self.TYPE_WORKSHOP
+
+
+class EnergyGateway(models.Model):
     """采集网关：串口服务器（Modbus RTU over TCP）或第三方数据平台（HTTP API）。"""
 
     KIND_MODBUS = "modbus_rtu_tcp"
@@ -35,33 +138,29 @@ class Gateway(models.Model):
         (KIND_HTTP, "HTTP API（第三方数据平台）"),
     ]
 
-    code = models.CharField("网关编号", max_length=32, unique=True)
-    name = models.CharField("网关名称", max_length=64)
-    kind = models.CharField("网关类型", max_length=20, choices=KIND_CHOICES)
-
-    host = models.CharField("IP", max_length=64, blank=True, default="")
-    port = models.PositiveIntegerField("端口", null=True, blank=True)
-    base_url = models.CharField("接口根地址", max_length=200, blank=True, default="")
-
-    timeout_ms = models.PositiveIntegerField("超时(ms)", default=3000)
-    interval_seconds = models.PositiveIntegerField("采样周期(秒)", default=60)
-    enabled = models.BooleanField("启用", default=True)
-    remark = models.CharField("备注", max_length=200, blank=True, default="")
-
     SOURCE_CONFIG = "config"
     SOURCE_ADMIN = "admin"
     SOURCE_CHOICES = [(SOURCE_CONFIG, "配置文件"), (SOURCE_ADMIN, "后台维护")]
 
+    code = models.CharField("网关编号", max_length=32, unique=True)
+    name = models.CharField("网关名称", max_length=64)
+    kind = models.CharField("网关类型", max_length=20, choices=KIND_CHOICES)
+    host = models.CharField("IP", max_length=64, blank=True, default="")
+    port = models.PositiveIntegerField("端口", null=True, blank=True)
+    base_url = models.CharField("接口根地址", max_length=200, blank=True, default="")
+    timeout_ms = models.PositiveIntegerField("超时(ms)", default=3000)
+    interval_seconds = models.PositiveIntegerField("采样周期(秒)", default=60)
+    enabled = models.BooleanField("启用", default=True)
+    remark = models.CharField("备注", max_length=200, blank=True, default="")
     source = models.CharField(
         "配置来源", max_length=10, choices=SOURCE_CHOICES, default=SOURCE_CONFIG,
         help_text="后台维护的记录不会被 seed_registry 覆盖，除非加 --force",
     )
-
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "eep_gateway"
+        db_table = "energy_gateway"
         ordering = ["code"]
         verbose_name = "采集网关"
         verbose_name_plural = "采集网关"
@@ -77,69 +176,42 @@ class Gateway(models.Model):
         return self.base_url
 
 
-class Line(models.Model):
-    """产线主数据。id 用 A1—A6，与前端大屏的路由 /#/line/A1 对应。"""
+class EnergyMeter(models.Model):
+    """计量点（仪表）—— 采集对象，一行一块表。
 
-    code = models.CharField("产线代码", max_length=8, unique=True)
-    name = models.CharField("产线名称", max_length=32)
-    rated = models.PositiveIntegerField("额定产能(瓶/小时)", default=0)
-    product = models.CharField("品项", max_length=64, blank=True, default="")
-    sort = models.PositiveSmallIntegerField("排序", default=0)
-    enabled = models.BooleanField("启用", default=True)
-
-    class Meta:
-        db_table = "eep_line"
-        ordering = ["sort", "code"]
-        verbose_name = "产线"
-        verbose_name_plural = "产线"
-
-    def __str__(self) -> str:
-        return f"{self.code} {self.name}"
-
-
-class Meter(models.Model):
-    """计量点：一块电表 / 一台流量计。
-
-    现场现状（2026-09-22 确认）：
-      · 电表：**每条线都有**，且一线到六线共 13 块（三线两块生产线表、五线含冰水机）。
-      · 水表 / 蒸汽表：**只有车间总表**，不拆分到线别（也就没有均摊问题）。
+    为什么必须有这张表：采集主体是**表**而不是产线。一条产线有 2—3 块表
+    （三线 3 块、五线 3 块），设备参数（网关 / 从站号 / 寄存器 / 倍率，
+    或 HTTP 取值路径）只有这里能放。这也是 `energy_raw` 的唯一键落在
+    `meter_id` 而不是 `line_id` 的原因（见设计文档 §一.2）。
     """
-
-    KIND_ELEC = "elec"
-    KIND_WATER = "water"
-    KIND_STEAM = "steam"
-    KIND_CHOICES = [
-        (KIND_ELEC, "电"),
-        (KIND_WATER, "水"),
-        (KIND_STEAM, "汽"),
-    ]
 
     SCOPE_LINE = "line"
     SCOPE_WORKSHOP = "workshop"
-    SCOPE_CHOICES = [
-        (SCOPE_LINE, "产线级"),
-        (SCOPE_WORKSHOP, "车间级（总表）"),
-    ]
+    SCOPE_CHOICES = [(SCOPE_LINE, "产线"), (SCOPE_WORKSHOP, "车间级")]
 
     ROLE_LINE = "line"
     ROLE_AUX = "aux"
     ROLE_TOTAL = "total"
-    ROLE_CHOICES = [
-        (ROLE_LINE, "生产线主表"),
-        (ROLE_AUX, "辅机（吹瓶机/冰水机等）"),
-        (ROLE_TOTAL, "车间总表"),
-    ]
+    ROLE_CHOICES = [(ROLE_LINE, "生产线"), (ROLE_AUX, "辅机"), (ROLE_TOTAL, "车间总表")]
+
+    SOURCE_CONFIG = "config"
+    SOURCE_ADMIN = "admin"
+    SOURCE_CHOICES = [(SOURCE_CONFIG, "配置文件"), (SOURCE_ADMIN, "后台维护")]
 
     code = models.CharField("计量点编号", max_length=32, unique=True)
     name = models.CharField("计量点名称", max_length=64)
-    kind = models.CharField("能源类型", max_length=10, choices=KIND_CHOICES)
+    energy_type = models.ForeignKey(
+        EnergyType, on_delete=models.PROTECT, related_name="meters", verbose_name="能源类型"
+    )
     scope = models.CharField("归属层级", max_length=10, choices=SCOPE_CHOICES, default=SCOPE_LINE)
     role = models.CharField("计量角色", max_length=10, choices=ROLE_CHOICES, default=ROLE_LINE)
-
     line = models.ForeignKey(
-        Line, null=True, blank=True, on_delete=models.SET_NULL, related_name="meters", verbose_name="所属产线"
+        ProductionLine, on_delete=models.PROTECT, related_name="meters", verbose_name="所属产线",
+        help_text="车间水/汽总表挂「车间哨兵行」（line_type=workshop），不分摊到线别",
     )
-    gateway = models.ForeignKey(Gateway, on_delete=models.PROTECT, related_name="meters", verbose_name="所属网关")
+    gateway = models.ForeignKey(
+        EnergyGateway, on_delete=models.PROTECT, related_name="meters", verbose_name="所属网关"
+    )
 
     # ── 串口服务器（Modbus）参数 ──
     slave = models.PositiveSmallIntegerField("从站号", null=True, blank=True)
@@ -149,8 +221,6 @@ class Meter(models.Model):
     word_order = models.CharField(
         "32 位字序", max_length=8, default="big", choices=[("big", "高字在前"), ("little", "低字在前")]
     )
-
-    # ── 台账信息（现场贴标签用，不影响采集）──
     asset_no = models.CharField("资产编号", max_length=64, blank=True, default="")
     install_date = models.DateField("安装日期", null=True, blank=True)
 
@@ -160,27 +230,20 @@ class Meter(models.Model):
     value_path = models.CharField("累计值取值路径", max_length=120, blank=True, default="")
     time_path = models.CharField("采集时间取值路径", max_length=120, blank=True, default="")
 
-    # ── 换算 ──
     scale = models.DecimalField("倍率", max_digits=12, decimal_places=4, default=1)
     unit = models.CharField("单位", max_length=16, default="kWh")
     max_hourly = models.DecimalField(
-        "小时用量上限", max_digits=18, decimal_places=3, null=True, blank=True,
-        help_text="超过该值判为异常尖峰（换表/断讯），不计入聚合。留空表示不判",
+        "单小时上限", max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="差值超过它判 spike、不计入合计（换表/断讯补传会产生尖峰）",
     )
-
     enabled = models.BooleanField("启用", default=True)
     remark = models.CharField("备注", max_length=200, blank=True, default="")
-
-    SOURCE_CONFIG = "config"
-    SOURCE_ADMIN = "admin"
-    SOURCE_CHOICES = [(SOURCE_CONFIG, "配置文件"), (SOURCE_ADMIN, "后台维护")]
-
     source = models.CharField(
         "配置来源", max_length=10, choices=SOURCE_CHOICES, default=SOURCE_CONFIG,
         help_text="后台维护的记录不会被 seed_registry 覆盖，除非加 --force",
     )
 
-    # ── 最近一次采集结果（冗余字段，供页面快速展示，真值仍在 Reading）──
+    # ── 最近一次采集结果（后台列表直接读，不用回表）──
     last_value = models.DecimalField("最近累计值", max_digits=18, decimal_places=3, null=True, blank=True)
     last_at = models.DateTimeField("最近采集时间", null=True, blank=True)
     last_ok = models.BooleanField("最近采集成功", default=False)
@@ -190,58 +253,72 @@ class Meter(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "eep_meter"
-        ordering = ["kind", "line__sort", "code"]
+        db_table = "energy_meter"
+        ordering = ["code"]
         verbose_name = "计量点"
         verbose_name_plural = "计量点"
-        indexes = [
-            models.Index(fields=["kind", "scope"]),
-            models.Index(fields=["enabled"]),
-        ]
 
     def __str__(self) -> str:
         return f"{self.code} {self.name}"
 
+    @property
+    def type_code(self) -> str:
+        """能源编码（ELECTRIC / WATER / STEAM），省去到处写 `meter.energy_type.type_code`。"""
+        return self.energy_type.type_code
 
-class Reading(models.Model):
-    """一次采样的**累计值**快照。
 
-    保留原始读数（而不是只留差值）是为了：出问题时能复查、换表能看出断点、
-    小时差值可以随时用新口径重算 —— 差值算错了只需重跑聚合，不用等现场重新采。
+class EnergyRaw(models.Model):
+    """原始数据表：**累计读数**（如 6,312,639.3 kWh），不是用量。
+
+    唯一键是 `(meter_id, collect_time)`，不是 `(line_id, energy_type_id, collect_time)`：
+      · 采集主体是表 —— 一条产线有多块表，按产线唯一就必须先求和、丢掉单表读数；
+      · 车间总表没有 line_id，而 MySQL 把多个 NULL 视为互不相同 → 唯一约束失效。
+    你要的「按产线 + 能源类型 + 时间查」由普通索引 `idx_raw_line_time` 覆盖。
     """
 
-    meter = models.ForeignKey(Meter, on_delete=models.CASCADE, related_name="readings", verbose_name="计量点")
-    at = models.DateTimeField("采样时间", db_index=True)
-    value = models.DecimalField("累计值", max_digits=18, decimal_places=3, null=True, blank=True)
+    meter = models.ForeignKey(
+        EnergyMeter, on_delete=models.CASCADE, related_name="readings", verbose_name="计量点"
+    )
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.PROTECT, related_name="readings", verbose_name="所属产线",
+        help_text="入库时的归属快照（历史归属不随产线调整而变）",
+    )
+    energy_type = models.ForeignKey(
+        EnergyType, on_delete=models.PROTECT, related_name="readings", verbose_name="能源类型"
+    )
+    collect_time = models.DateTimeField("采集时间", db_index=True, help_text="精确到小时，如 2026-09-24 10:00:00")
+    reading = models.DecimalField(
+        "累计读数", max_digits=18, decimal_places=4, null=True, blank=True,
+        help_text="采集失败时为 NULL —— 绝不能写 0，0 会被差值当成真实读数",
+    )
+    ok = models.BooleanField("采集成功", default=True)
     raw = models.CharField("原始报文/响应", max_length=200, blank=True, default="")
-    ok = models.BooleanField("成功", default=True)
     error = models.CharField("错误信息", max_length=200, blank=True, default="")
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField("入库时间", auto_now_add=True)
 
     class Meta:
-        db_table = "eep_reading"
+        db_table = "energy_raw"
+        ordering = ["-collect_time", "meter_id"]
         verbose_name = "原始读数"
         verbose_name_plural = "原始读数"
+        constraints = [
+            models.UniqueConstraint(fields=["meter", "collect_time"], name="uk_raw_meter_time"),
+        ]
         indexes = [
-            models.Index(fields=["meter", "-at"]),
-            models.Index(fields=["at"]),
+            models.Index(fields=["line", "energy_type", "collect_time"], name="idx_raw_line_time"),
+            models.Index(fields=["collect_time"], name="idx_raw_collect_time"),
         ]
 
     def __str__(self) -> str:
-        return f"{self.meter_id}@{self.at:%Y-%m-%d %H:%M} {self.value}"
+        return f"{self.meter_id}@{self.collect_time:%Y-%m-%d %H:%M}={self.reading}"
 
 
-class HourlyUsage(models.Model):
-    """小时用量 —— 交付给大屏的就是这张表。
+class EnergyHourly(models.Model):
+    """小时用量 —— **日 / 月 / 年汇总的唯一数据源**。
 
-    口径：`usage = 本小时末读数 − 上小时末读数`，两个端点读数都取「距整点最近的一次采样」。
-
-    quality 取值与含义：
-      ok       正常
-      partial  端点在整点附近没有采样（采集中断），差值区间跨度过大，仅供参考
-      missing  缺读数 → usage 为 null。**绝不补 0**（补 0 会在图上显示成「产量暴跌」）
-      reset    累计值回退 → 换表 / 表归零，差值无效，直接丢弃
-      spike    差值超过 max_hourly → 判为异常尖峰，保留但不计入聚合
+    为什么不直接用「日末读数 − 日初读数」：采集中断 5 小时时，后者照样给出一个数，
+    把缺的那段静默吞掉，界面上完全看不出异常（B-502）。逐小时算差值 + 质量标记，
+    缺的时段就是 `missing`，合计宁可空白也不给偏小值。
     """
 
     Q_OK = "ok"
@@ -253,49 +330,156 @@ class HourlyUsage(models.Model):
         (Q_OK, "正常"),
         (Q_PARTIAL, "端点偏离整点"),
         (Q_MISSING, "缺读数"),
-        (Q_RESET, "累计值回退（换表/归零）"),
+        (Q_RESET, "累计值回退"),
         (Q_SPIKE, "异常尖峰"),
     ]
-    #: 只有这两种质量的数据才允许进入产线 / 车间聚合
+    #: 只有这些质量才允许进入日 / 月 / 年合计
     TRUSTED = (Q_OK,)
 
-    meter = models.ForeignKey(Meter, on_delete=models.CASCADE, related_name="hourly", verbose_name="计量点")
-    date = models.DateField("日期")
-    hour = models.PositiveSmallIntegerField("小时")
-    usage = models.DecimalField("本小时用量", max_digits=18, decimal_places=3, null=True, blank=True)
-    unit = models.CharField("单位", max_length=16, default="kWh")
+    meter = models.ForeignKey(
+        EnergyMeter, on_delete=models.CASCADE, related_name="hourly", verbose_name="计量点"
+    )
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.PROTECT, related_name="hourly", verbose_name="所属产线",
+    )
+    energy_type = models.ForeignKey(
+        EnergyType, on_delete=models.PROTECT, related_name="hourly", verbose_name="能源类型"
+    )
+    stat_date = models.DateField("归属日期")
+    stat_hour = models.PositiveSmallIntegerField("归属小时")
+    consumption = models.DecimalField(
+        "本小时用量", max_digits=18, decimal_places=4, null=True, blank=True,
+        help_text="缺数 / 换表 / 尖峰时为 NULL —— 绝不补 0",
+    )
+    unit = models.CharField("单位", max_length=20, default="kWh")
     quality = models.CharField("数据质量", max_length=10, choices=QUALITY_CHOICES, default=Q_OK)
-
+    start_reading = models.DecimalField("起点累计值", max_digits=18, decimal_places=4, null=True, blank=True)
+    end_reading = models.DecimalField("终点累计值", max_digits=18, decimal_places=4, null=True, blank=True)
     start_at = models.DateTimeField("区间起点(读数时间)", null=True, blank=True)
     end_at = models.DateTimeField("区间终点(读数时间)", null=True, blank=True)
-    start_value = models.DecimalField("起点累计值", max_digits=18, decimal_places=3, null=True, blank=True)
-    end_value = models.DecimalField("终点累计值", max_digits=18, decimal_places=3, null=True, blank=True)
     note = models.CharField("说明", max_length=200, blank=True, default="")
-    computed_at = models.DateTimeField(auto_now=True)
+    computed_at = models.DateTimeField("计算时间", auto_now=True)
 
     class Meta:
-        db_table = "eep_hourly_usage"
+        db_table = "energy_hourly"
+        ordering = ["stat_date", "stat_hour", "meter_id"]
         verbose_name = "小时用量"
         verbose_name_plural = "小时用量"
-        constraints = [models.UniqueConstraint(fields=["meter", "date", "hour"], name="uniq_meter_hour")]
-        indexes = [models.Index(fields=["date", "hour"])]
+        constraints = [
+            models.UniqueConstraint(fields=["meter", "stat_date", "stat_hour"], name="uk_hourly"),
+        ]
+        indexes = [models.Index(fields=["stat_date", "stat_hour"], name="idx_hourly_period")]
 
     def __str__(self) -> str:
-        return f"{self.meter_id} {self.date} {self.hour:02d} {self.usage}{self.unit} [{self.quality}]"
+        return f"{self.meter_id} {self.stat_date} {self.stat_hour}时={self.consumption}"
 
 
-class HourlyProduction(models.Model):
-    """线别每时产量 —— 与 HourlyUsage 并列的第二条腿。
+class _PeriodSummaryBase(models.Model):
+    """日 / 月 / 年汇总的公共部分（抽象基类，不建表）。
 
-    为什么单独一张表、而不是塞进 HourlyUsage：
-      · 两者的数据源、采集频率、质量判定完全不同（电量来自电表差分，产量来自计数器/PLC/MES）；
-      · 产量往往需要人工修正（补报、作废），混在一起会把电量也改脏；
-      · `quality` 语义也不同（产量有「班报工按班摊到小时」这种估算态）。
+    ⚠ `consumption` 与 `unit_kwh` **必须可空**：该周期一条可信数据都没有时，
+      它是「未知」而不是 0。写成 NOT NULL + default 0，等于把「没采到」硬说成
+      「用了 0」，而 0 在这个语境里是「确实没用」—— 与现场理解正好相反。
 
-    口径：`output` 是**该小时实际产出**（瓶）。未上报时输出 null —— **绝不补 0**。
+    ⚠ `covered_*` / `expected_*` 是界面可信度的关键：没有它，
+      「今日 300 kWh」和「今日只统计到 2 小时共 300 kWh」在页面上长得一模一样，
+      后者会被读成「今天几乎没用电」（B-403 现场踩过）。
+    """
 
-    ⚠ 当前产量数据源未接入，本表只有 `ingest_production` 写入的 null 占位
-      （source=demo / quality=nodata），接口层据此识别「这不是真实产量」。
+    Q_OK = "ok"
+    Q_PARTIAL = "partial"
+    Q_MISSING = "missing"
+    QUALITY_CHOICES = [(Q_OK, "完整"), (Q_PARTIAL, "部分时段缺数"), (Q_MISSING, "无数据")]
+
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.CASCADE, related_name="%(class)s_set", verbose_name="产线"
+    )
+    energy_type = models.ForeignKey(
+        EnergyType, on_delete=models.PROTECT, related_name="%(class)s_set", verbose_name="能源类型"
+    )
+    consumption = models.DecimalField(
+        "消耗量", max_digits=18, decimal_places=4, null=True, blank=True
+    )
+    unit = models.CharField("单位", max_length=20, blank=True, default="")
+    covered_count = models.PositiveSmallIntegerField("已覆盖时段数", default=0)
+    expected_count = models.PositiveSmallIntegerField("应有时段数", default=0)
+    quality = models.CharField("数据质量", max_length=10, choices=QUALITY_CHOICES, default=Q_OK)
+    computed_at = models.DateTimeField("计算时间", auto_now=True)
+
+    class Meta:
+        abstract = True
+
+
+class EnergyDaily(_PeriodSummaryBase):
+    """日汇总：日 × 产线 × 能源类型。
+
+    为车间哨兵行（水 / 汽总表）也会落行；车间**电力**合计没有总表，
+    由 6 条产线之和得出（查询时算，不落行）。
+    """
+
+    stat_date = models.DateField("统计日期")
+    stat_year = models.SmallIntegerField("年", default=0, db_index=True)
+    stat_month = models.CharField("年月(YYYY-MM)", max_length=7, blank=True, default="")
+    start_reading = models.DecimalField("日初读数", max_digits=18, decimal_places=4, null=True, blank=True)
+    end_reading = models.DecimalField("日末读数", max_digits=18, decimal_places=4, null=True, blank=True)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "energy_daily"
+        ordering = ["-stat_date", "line_id"]
+        verbose_name = "日汇总"
+        verbose_name_plural = "日汇总"
+        constraints = [
+            models.UniqueConstraint(fields=["line", "energy_type", "stat_date"], name="uk_daily"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.stat_date} {self.line_id}/{self.energy_type_id}={self.consumption}"
+
+
+class EnergyMonthly(_PeriodSummaryBase):
+    """月汇总：月 × 产线 × 能源类型。由**日行累加**，保证「月 = 各日之和」。"""
+
+    stat_month = models.DateField("统计月份", help_text="存当月第一天，如 2026-09-01")
+    stat_year = models.SmallIntegerField("年", default=0, db_index=True)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "energy_monthly"
+        ordering = ["-stat_month", "line_id"]
+        verbose_name = "月汇总"
+        verbose_name_plural = "月汇总"
+        constraints = [
+            models.UniqueConstraint(fields=["line", "energy_type", "stat_month"], name="uk_monthly"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.stat_month:%Y-%m} {self.line_id}/{self.energy_type_id}={self.consumption}"
+
+
+class EnergyYearly(_PeriodSummaryBase):
+    """年汇总：年 × 产线 × 能源类型。同样由日行累加。"""
+
+    stat_year = models.SmallIntegerField("统计年份")
+
+    class Meta:
+        db_table = "energy_yearly"
+        ordering = ["-stat_year", "line_id"]
+        verbose_name = "年汇总"
+        verbose_name_plural = "年汇总"
+        constraints = [
+            models.UniqueConstraint(fields=["line", "energy_type", "stat_year"], name="uk_yearly"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.stat_year} {self.line_id}/{self.energy_type_id}={self.consumption}"
+
+
+class ProductionHourly(models.Model):
+    """小时产量（产量侧未接入，仅占位）。
+
+    产量**不是一种能源**，因此不放进 `energy_*` 汇总表；
+    单位电耗（kWh/千瓶）在查询时用 `energy_daily(ELECTRIC) ÷ 产量` 算，两边各自可空。
     """
 
     Q_OK = "ok"
@@ -303,12 +487,11 @@ class HourlyProduction(models.Model):
     Q_NODATA = "nodata"
     Q_EST = "estimated"
     QUALITY_CHOICES = [
-        (Q_OK, "正常上报"),
-        (Q_MISSING, "应报未报"),
-        (Q_NODATA, "数据源未接入（产量侧待改造）"),
-        (Q_EST, "估算（如班报工摊到小时）"),
+        (Q_OK, "正常"),
+        (Q_MISSING, "缺数"),
+        (Q_NODATA, "数据源未接入"),
+        (Q_EST, "估算"),
     ]
-    #: 只有正常与估算的产量才允许进入合计
     TRUSTED = (Q_OK, Q_EST)
 
     SOURCE_COUNTER = "counter"
@@ -321,14 +504,16 @@ class HourlyProduction(models.Model):
         (SOURCE_COUNTER, "灌装机计数器"),
         (SOURCE_PLC, "装箱机 PLC"),
         (SOURCE_MES, "MES 班次报工"),
-        (SOURCE_MANUAL, "人工录入"),
-        (SOURCE_DEMO, "演示占位（非真实产量）"),
-        (SOURCE_NONE, "无数据源"),
+        (SOURCE_MANUAL, "人工填报"),
+        (SOURCE_DEMO, "演示占位"),
+        (SOURCE_NONE, "未接入"),
     ]
 
-    line = models.ForeignKey(Line, on_delete=models.CASCADE, related_name="production", verbose_name="产线")
-    date = models.DateField("日期")
-    hour = models.PositiveSmallIntegerField("小时")
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.CASCADE, related_name="production", verbose_name="产线"
+    )
+    stat_date = models.DateField("日期")
+    stat_hour = models.PositiveSmallIntegerField("小时")
     output = models.DecimalField("本小时产量(瓶)", max_digits=18, decimal_places=1, null=True, blank=True)
     quality = models.CharField("数据质量", max_length=12, choices=QUALITY_CHOICES, default=Q_MISSING)
     source = models.CharField("数据来源", max_length=12, choices=SOURCE_CHOICES, default=SOURCE_NONE)
@@ -336,29 +521,27 @@ class HourlyProduction(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "eep_hourly_production"
+        db_table = "production_hourly"
+        ordering = ["stat_date", "stat_hour"]
         verbose_name = "小时产量"
         verbose_name_plural = "小时产量"
-        constraints = [models.UniqueConstraint(fields=["line", "date", "hour"], name="uniq_line_hour_prod")]
-        indexes = [models.Index(fields=["date", "hour"])]
+        constraints = [
+            models.UniqueConstraint(fields=["line", "stat_date", "stat_hour"], name="uk_production_hourly"),
+        ]
 
     def __str__(self) -> str:
-        return f"{self.line_id} {self.date} {self.hour:02d} {self.output}瓶 [{self.quality}]"
+        return f"{self.line_id} {self.stat_date} {self.stat_hour}时={self.output}"
 
 
-class PeriodSummary(models.Model):
-    """日 / 月 / 年总计（产线级与车间级）—— 大屏与后台共用的一张汇总表。
+class PeriodSummary:
+    """周期维度的常量容器 —— **注意：它不再是一张表**。
 
-    为什么要落表而不是每次现算：
-      · 年 / 月聚合要扫数十万行小时数据，每次刷新都现算会把接口拖慢；
-      · 大屏与后台必须拿到**完全相同**的数字，落表是唯一能保证两边一致的做法；
-      · 历史月份封账后不再变化，落表后可直接作为报表与审计依据。
+    v1.3.0 把原来的单表 `eep_period_summary`（一行同时含电/水/汽/产量）
+    拆成了按能源类型分行的三张表：`energy_daily` / `energy_monthly` / `energy_yearly`。
 
-    `period_key` 取值：
-      · dim = day    → '2026-09-22'
-      · dim = month  → '2026-09'
-      · dim = year   → '2026'
-    `line` 为空表示**车间级**（全部产线合计）。
+    之所以保留这个类名：维度常量（day/month/year、line/workshop、质量取值）
+    在整个工程里有六十多处引用，把它们集中放在这里，语义不变、引用不用改。
+    **查询与写入**请走 `services/summary.py`（`period_rows` 读、`summarize_*` 写）。
     """
 
     SCOPE_LINE = "line"
@@ -379,53 +562,12 @@ class PeriodSummary(models.Model):
         (Q_MISSING, "无数据"),
     ]
 
-    scope = models.CharField("统计层级", max_length=10, choices=SCOPE_CHOICES)
-    line = models.ForeignKey(
-        Line, null=True, blank=True, on_delete=models.CASCADE, related_name="summaries", verbose_name="产线"
-    )
-    dim = models.CharField("统计维度", max_length=8, choices=DIM_CHOICES)
-    period_key = models.CharField("周期标识", max_length=16)
 
-    start_date = models.DateField("起始日期")
-    end_date = models.DateField("结束日期")
-
-    # ⚠ 这四个字段**必须可空**：该周期一条可信数据都没有时，它是「未知」而不是 0。
-    #   写成 NOT NULL + default 0，就等于把「没采到」硬说成「用了 0」——
-    #   大屏与后台都会显示 0，而 0 在这个语境里是「确实没用电」，语义完全相反。
-    output = models.DecimalField("产量(瓶)", max_digits=20, decimal_places=1, null=True, blank=True)
-    kwh = models.DecimalField("用电量(kWh)", max_digits=20, decimal_places=3, null=True, blank=True)
-    water_t = models.DecimalField("用水量(t)", max_digits=16, decimal_places=3, null=True, blank=True)
-    steam_t = models.DecimalField("用汽量(t)", max_digits=16, decimal_places=3, null=True, blank=True)
-
-    plan_output = models.DecimalField("计划产量(瓶)", max_digits=20, decimal_places=1, default=0)
-    unit_kwh = models.DecimalField(
-        "单位电耗(kWh/千瓶)", max_digits=12, decimal_places=3, null=True, blank=True,
-        help_text="产量为 0 或未接入时为 null，**不要用 0 兜底**",
-    )
-
-    covered_hours = models.PositiveSmallIntegerField("已覆盖小时数", default=0)
-    quality = models.CharField("数据质量", max_length=10, choices=QUALITY_CHOICES, default=Q_OK)
-    computed_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "eep_period_summary"
-        verbose_name = "周期总计"
-        verbose_name_plural = "周期总计"
-        constraints = [
-            models.UniqueConstraint(fields=["scope", "line", "dim", "period_key"], name="uniq_period_summary")
-        ]
-        indexes = [models.Index(fields=["dim", "period_key"]), models.Index(fields=["scope", "dim"])]
-
-    def __str__(self) -> str:
-        who = self.line_id or "车间"
-        return f"{self.dim}:{self.period_key} {who} {self.output}瓶/{self.kwh}kWh [{self.quality}]"
-
-
-class CollectLog(models.Model):
+class EnergyCollectLog(models.Model):
     """每轮采集的日志：后台「采集日志」页与巡检脚本都读它。"""
 
     gateway = models.ForeignKey(
-        Gateway, null=True, blank=True, on_delete=models.SET_NULL, related_name="logs", verbose_name="网关"
+        EnergyGateway, on_delete=models.CASCADE, related_name="logs", verbose_name="网关"
     )
     started_at = models.DateTimeField("开始时间")
     finished_at = models.DateTimeField("结束时间", null=True, blank=True)
@@ -436,10 +578,10 @@ class CollectLog(models.Model):
     message = models.CharField("说明", max_length=500, blank=True, default="")
 
     class Meta:
-        db_table = "eep_collect_log"
+        db_table = "energy_collect_log"
+        ordering = ["-started_at"]
         verbose_name = "采集日志"
         verbose_name_plural = "采集日志"
-        indexes = [models.Index(fields=["-started_at"])]
 
     def __str__(self) -> str:
-        return f"{self.started_at:%Y-%m-%d %H:%M:%S} {self.ok_count}/{self.total}"
+        return f"{self.gateway_id} {self.started_at:%Y-%m-%d %H:%M} {self.ok_count}/{self.total}"
