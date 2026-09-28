@@ -7,7 +7,7 @@
 > | 13 路产线电表（4 台 485 串口服务器，Modbus RTU over TCP） | ✅ 实测 14/14 点位 1.4 秒采完 |
 > | 车间蒸汽总表（第三方平台 API） | ✅ 已接通 |
 > | 小时差值（每小时用了多少）＋ 异常过滤 | ✅ 含缺数 / 换表 / 尖峰 / 偏离整点四类处理 |
-> | 日 / 月 / 年周期总计（`energy_daily`·`monthly`·`yearly`，大屏与后台同源） | ✅ `summarize` 落表，整点自动刷新；⚠ v1.4.1 起窗口固定为**昨天 + 今天**（`summary.refresh_rollups()`）—— 昨天 23 点要等今天 00:04 的边界读数才算得出来，只刷今天会让**每一天都永远少最后一个小时**（B-523） |
+> | 日 / 月 / 年周期总计（`energy_daily`·`monthly`·`yearly`，大屏与后台同源） | ✅ `summarize --rollup` 每天 00:30 结算一次（窗口 = **昨天 + 今天** + 近 2 月 + 今年；昨天 23 点要等今天 00:04 的边界读数才算得出来，只刷今天会让每一天永远少最后一小时 —— B-523）。⚠ **当期（今天 / 本月 / 本年）不读汇总表**，由 `summary.is_open_period()` 分流后直接从小时表现算（v1.4.2）；采集任务不再每小时重刷汇总 |
 > | MySQL 存储 | ✅ 已建表入库（网关 IP/端口/从站号等仪表配置均在库，支持后台维护） |
 > | 能源数据只读接口 | ✅ `/api/energy/*`（与前端契约同构） |
 > | 后台配置接口 | ✅ v1.2.1 打通 `/api/admin/*`：网关 / 计量点**后台增删改 + 连接测试 + 试采**（写操作 `source=admin`，`seed_registry` 不覆盖） |
@@ -65,9 +65,9 @@ backend/
 │  ├─ models.py                 # Gateway / Line / Meter / Reading / HourlyUsage / HourlyProduction / PeriodSummary / CollectLog
 │  ├─ collectors/               # 采集器：base（重试/计时）· modbus_rtu · http_api
 │  ├─ services/                 # collect（编排）· aggregate（小时差值）· snapshot（组装接口）· summary（周期总计）· registry（登记表同步）
-│  ├─ management/commands/      # collect · collect_loop · aggregate · summarize · ingest_production · seed_registry · purge_readings
+│  ├─ management/commands/      # collect · collect_loop · aggregate · summarize（--rollup 每日结算）· ingest_production · seed_params · seed_registry · purge_readings
 │  ├─ api.py · urls.py          # 能源只读接口（/api/energy/*）+ 后台配置接口（/api/admin/*）
-│  ├─ tests.py                  # 44 个单元测试（差值口径 + 序列顺序与空值 + 字序 + JSON 取值）
+│  ├─ tests.py                  # 69 个单元测试（差值口径 + 序列顺序与空值 + 字序 + JSON 取值 + 大屏/后台逐格相等）
 │  └─ migrations/
 └─ docs/
    ├─ 采集说明.md                # ★ 现场取数方式、口径、部署、踩坑

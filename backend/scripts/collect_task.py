@@ -54,32 +54,37 @@ MAX_LOG_BYTES = 2 * 1024 * 1024
 DEFAULT_ARGS = ["collect", "--aggregate", "--if-due"]
 
 
-def _open_log():
-    """打开任务日志；超过上限先轮转。日志写不进去也不能让采集停摆，退回黑洞。"""
+def _open_log(log_file: Path = LOG_FILE):
+    """打开任务日志；超过上限先轮转。日志写不进去也不能让任务停摆，退回黑洞。"""
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
-            backup = LOG_FILE.with_suffix(".log.1")
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        if log_file.exists() and log_file.stat().st_size > MAX_LOG_BYTES:
+            backup = log_file.with_suffix(".log.1")
             backup.unlink(missing_ok=True)
-            LOG_FILE.rename(backup)
-        return open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+            log_file.rename(backup)
+        return open(log_file, "a", encoding="utf-8", buffering=1)
     except OSError:
         return open(os.devnull, "w", encoding="utf-8")
 
 
-def main() -> int:
+def run_task(args: list[str], *, log_file: Path = LOG_FILE, title: str = "采集任务") -> int:
+    """在 `pythonw.exe`（无控制台）下跑一条 manage.py 命令，并把全过程写进日志。
+
+    `daily-rollup-task.py` 复用这一份实现 —— 无控制台环境里 stdout 是 None 这个坑
+    只需要踩一次，别在每个入口脚本里各写一遍。
+    """
     # 计划任务的工作目录是 C:\Windows\System32，必须先切到工程目录
     os.chdir(BACKEND_DIR)
-    sys.path.insert(0, str(BACKEND_DIR))
+    if str(BACKEND_DIR) not in sys.path:
+        sys.path.insert(0, str(BACKEND_DIR))
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "eep.settings")
 
-    log = _open_log()
+    log = _open_log(log_file)
     sys.stdout = log
     sys.stderr = log
 
-    args = sys.argv[1:] or DEFAULT_ARGS
     started = datetime.now()
-    log.write(f"\n──── {started:%Y-%m-%d %H:%M:%S} 采集任务开始（{' '.join(args)}）────\n")
+    log.write(f"\n──── {started:%Y-%m-%d %H:%M:%S} {title}开始（{' '.join(args)}）────\n")
 
     try:
         from django.core.management import execute_from_command_line
@@ -103,6 +108,10 @@ def main() -> int:
         f"耗时 {(datetime.now() - started).total_seconds():.1f}s\n"
     )
     return 0
+
+
+def main() -> int:
+    return run_task(sys.argv[1:] or DEFAULT_ARGS)
 
 
 if __name__ == "__main__":

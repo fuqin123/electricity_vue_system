@@ -1000,3 +1000,105 @@ class YesterdayRollupTests(TestCase):
         self.assertEqual(row.consumption, Decimal("240.000"))
         self.assertEqual(row.covered_count, 24)
         self.assertEqual(row.quality, PeriodSummary.Q_OK)
+
+
+class OpenPeriodRollupTests(TestCase):
+    """v1.4.2：周期汇总改成每天结算一次之后的取数规则。
+
+    一句话：**已结束的周期读汇总表，进行中的周期（今天 / 本月 / 本年）从小时表现算**。
+    两头都要锁 —— 少第一条，00:30 的结算就白做；少第二条，大屏与后台的
+    「今日 / 本月」会整天不动（汇总表在当天早上就定格了），值班人员以为系统卡死。
+    """
+
+    PER = Decimal("10")
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.now = datetime.now().replace(minute=0, second=0, microsecond=0)
+        cls.today = cls.now.date()
+        cls.yesterday = cls.today - timedelta(days=1)
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-A1-01",
+            name="一线电表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=cls.line,
+            gateway=cls.gw,
+            unit="kWh",
+        )
+
+    def hourly(self, day: object, hours: range) -> None:
+        for h in hours:
+            EnergyHourly.objects.create(
+                meter=self.meter,
+                line=self.line,
+                energy_type=etype(),
+                stat_date=day,
+                stat_hour=h,
+                consumption=self.PER,
+                unit="kWh",
+                quality=EnergyHourly.Q_OK,
+            )
+
+    def daily_row(self, day: object, value: str, covered: int = 24) -> None:
+        EnergyDaily.objects.create(
+            line=self.line,
+            energy_type=etype(),
+            stat_date=day,
+            consumption=Decimal(value),
+            unit="kWh",
+            covered_count=covered,
+            expected_count=24,
+            quality=PeriodSummary.Q_OK,
+        )
+
+    def test_当期不读汇总表_汇总行再旧也不影响(self):
+        """今天的日行故意写成 999（模拟 00:30 结算后一整天没再刷）→ 当期必须给小时表的值。"""
+        done = range(self.now.hour)  # 已完成的小时
+        self.hourly(self.today, done)
+        self.daily_row(self.today, "999")
+
+        key = S.make_key(S.DIM_DAY, self.today)
+        row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], self.now)[key]
+        self.assertEqual(row.kwh, self.PER * len(done))
+        self.assertNotEqual(row.kwh, Decimal("999"))
+        # 进行中的那一小时还没有小时行 → 覆盖度如实小于应有
+        self.assertLess(row.covered_hours, row.expected_hours)
+
+    def test_已结束的周期读汇总表(self):
+        """昨天的行是给定的结算值 —— 现算会得到不同结果，用它证明「读的是表」。"""
+        self.hourly(self.yesterday, range(24))  # 240
+        self.daily_row(self.yesterday, "777")
+
+        key = S.make_key(S.DIM_DAY, self.yesterday)
+        row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], self.now)[key]
+        self.assertEqual(row.kwh, Decimal("777"))
+
+    def test_大屏与后台在当期同样相等(self):
+        """当期现算之后，大屏的「今天那一根」必须仍等于后台日粒度序列的同一格。"""
+        self.hourly(self.today, range(self.now.hour))
+        self.daily_row(self.today, "999")  # 谁读汇总表谁就错
+
+        big = build_line(self.line, self.now)["daily30"][-1]
+        rng = ranges.usage_range(
+            self.today, self.today, granularity="day", scope="all", now=self.now
+        )
+        admin = next(s["values"] for s in rng["series"] if s["key"] == "A1")[-1]
+        self.assertEqual(big["label"], f"{self.today:%m-%d}")
+        self.assertEqual(big["kwh"], admin)
+
+    def test_采集命令默认不再刷汇总(self):
+        """每天 00:30 的 `summarize --rollup` 才是结算入口；采集命令只出小时数。"""
+        opts = collect.Command().create_parser("x", "y").parse_args([])
+        self.assertFalse(opts.summarize)
+        self.assertFalse(hasattr(opts, "no_summary"))
+
+    def test_每日结算入口存在(self):
+        from apps.energy.management.commands import summarize as summarize_cmd
+
+        opts = summarize_cmd.Command().create_parser("x", "y").parse_args(["--rollup"])
+        self.assertTrue(opts.rollup)

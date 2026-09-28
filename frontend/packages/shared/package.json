@@ -1,6 +1,6 @@
 {
   "name": "@eep/shared",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "private": true,
   "description": "共享层：领域类型、设计令牌、mock 数据与 API SDK",
   "type": "module",

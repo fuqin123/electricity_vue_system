@@ -6,7 +6,7 @@
     python manage.py collect --dry-run          只读不写库（现场接线排障用）
     python manage.py collect --aggregate        采完顺手算最近 2 小时的小时差值
     python manage.py collect --aggregate --if-due       仅当本小时还没采过时才采（推荐配 cron）
-    python manage.py collect --aggregate --no-summary   采完不刷周期总计
+    python manage.py collect --aggregate --summarize    顺手把日/月/年汇总也刷一遍（调试 / 回填用）
 
 ★ 现场推荐用法（hourly 节奏）：计划任务每 5 分钟跑一次
       python manage.py collect --aggregate --if-due
@@ -15,9 +15,10 @@
   而万一某次因为机器重启 / 网络抖动没跑成，下一个 5 分钟会自动补上 ——
   比「每小时准点跑一次、错过就丢一小时」可靠得多。
 
-⚠ 建议保持 `--summarize` 默认开启：
-  大屏与后台的「年 / 月 / 日」KPI 都读 `eep_period_summary`，
-  采完不刷新汇总表，界面上的日月年数字就会落后于小时数据。
+⚠ 周期汇总**不在本命令的默认路径里**（v1.4.2 起）：日 / 月 / 年汇总改成每天结算一次
+  （`manage.py summarize --rollup`，建议配 00:30 的计划任务）。
+  当期（今天 / 本月 / 本年）的数字在界面上是**直接从小时表现算**的
+  （见 `summary.is_open_period`），所以按小时重刷汇总表只是白耗一次扫描。
 
 生产环境建议每 60 秒跑一次（Windows 计划任务 / Linux cron / APScheduler 均可），
 比常驻进程更抗崩溃：
@@ -47,7 +48,10 @@ class Command(BaseCommand):
         parser.add_argument("--aggregate", action="store_true", help="采完算最近 2 小时差值")
         parser.add_argument("--json", action="store_true", help="以 JSON 输出汇总（给脚本用）")
         parser.add_argument(
-            "--no-summary", action="store_true", help="不刷新日/月/年总计（默认会刷）"
+            "--summarize",
+            action="store_true",
+            help="采完顺手刷日/月/年总计。默认不刷 —— 汇总已由每天 00:30 的 "
+                 "`summarize --rollup` 结算，当期数字界面直接从小时表现算",
         )
         parser.add_argument(
             "--if-due",
@@ -85,9 +89,8 @@ class Command(BaseCommand):
             written = aggregate_recent(hours=2)
             self.stdout.write(f"小时差值：重算最近 2 小时，写入 {written} 条")
 
-        # 刷新周期总计（大屏与后台的日月年 KPI 都读它）
-        if not options["dry_run"] and not options["no_summary"]:
-            # ⚠ 窗口是「昨天 + 今天」而不是只有今天，原因见 `summary.refresh_rollups`（B-523）
+        # 周期总计默认不刷（v1.4.2）：由每天 00:30 的 `summarize --rollup` 结算
+        if options["summarize"] and not options["dry_run"]:
             written = S.refresh_rollups(datetime.now())
             self.stdout.write(f"周期总计：刷新昨天 + 今天 + 近 2 月 + 今年，共 {len(written)} 条")
 

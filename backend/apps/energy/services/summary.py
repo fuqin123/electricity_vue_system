@@ -291,7 +291,10 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
 
 
 def refresh_rollups(now: datetime | None = None) -> list[str]:
-    """刷新滚动窗口的周期总计：**昨天 + 今天** + 近 2 月 + 今年。
+    """**每天一次**的周期结算窗口：昨天 + 今天 + 近 2 月 + 今年。
+
+    入口是 `manage.py summarize --rollup`（建议配 00:30 的计划任务），
+    采集侧不再每小时刷（v1.4.2）。
 
     ⚠ 为什么必须带上昨天（B-523）：昨天 23 点的差值要等**今天 00:04** 采到
     跨日边界读数才算得出来，而那一刻 `now.date()` 已经是今天了。
@@ -377,6 +380,20 @@ def _workshop_scope_lines() -> list[ProductionLine]:
     return list(ProductionLine.objects.filter(line_type=ProductionLine.TYPE_LINE))
 
 
+def is_open_period(dim: str, key: str, now: datetime | None = None) -> bool:
+    """周期是否仍在进行中（即它包含 `now` 所在的那一天）。
+
+    ⚠ 进行中的周期**一律不读汇总表**（v1.4.2 口径）：日 / 月 / 年汇总改成
+    「每天 00:30 结算一次」之后，今天的日行、本月的月行在当天一整天都是旧的
+    （00:30 那一刻它几乎是空的）。若照旧「有行就读行」，大屏与后台的
+    「今日 / 本月 / 本年」会整天不动，值班人员只会以为系统卡死。
+    所以规则改成：**已结束的周期读汇总表，进行中的周期从小时表现算** ——
+    未来的小时在 `energy_hourly` 里本来就没有行，现算出来的天然就是「截至此刻」。
+    """
+    now = now or datetime.now()
+    return make_key(dim, now.date()) == key
+
+
 def period_rows(
     dim: str,
     scope: str,
@@ -384,7 +401,10 @@ def period_rows(
     keys: list[str],
     now: datetime | None = None,
 ) -> dict[str, PeriodRow]:
-    """批量取若干周期的通行视图（缺行的周期会现算补上）。"""
+    """批量取若干周期的通行视图（缺行的周期会现算补上）。
+
+    进行中的周期（见 `is_open_period`）永远现算，不读汇总表。
+    """
     now = now or datetime.now()
     model = _SUMMARY_MODEL[dim][0]
     period_field = _SUMMARY_MODEL[dim][1]
@@ -407,11 +427,17 @@ def period_rows(
 
     for key in keys:
         start, end = period_bounds(dim, key)
+        open_period = is_open_period(dim, key, now)
+        expected = _hours_in(start, end, now) if dim == DIM_DAY else _days_in(start, end, now)
 
         # ── 电力 ──
         if elec is None or not agg_lines:
             kwh, covered = None, 0
             quality = Q_MISSING
+        elif open_period:
+            # 当期：从小时表现算。已结束的周期才允许读汇总表（汇总表是每日结算的产物）
+            kwh, covered = _elec_metrics(agg_lines, start, end)
+            quality = _quality_from(covered, expected)
         else:
             if dim == DIM_DAY:
                 rows = EnergyDaily.objects.filter(
@@ -431,10 +457,6 @@ def period_rows(
                 covered = min(
                     [r.covered_count for r in rows if r.covered_count] or [0]
                 )
-            if dim == DIM_DAY:
-                expected = _hours_in(start, end, now)
-            else:
-                expected = _days_in(start, end, now)
             quality = _quality_from(covered, expected)
 
         # ── 水 / 汽（只有车间级有）──
@@ -444,17 +466,23 @@ def period_rows(
                 etype = types.get(code)
                 if etype is None:
                     continue
-                if dim == DIM_DAY:
+                if open_period:
+                    meter = EnergyMeter.objects.filter(
+                        line=workshop_line, energy_type=etype, enabled=True
+                    ).first()
+                    val = _one_type_metrics(meter, start, end)[0] if meter is not None else None
+                elif dim == DIM_DAY:
                     row = EnergyDaily.objects.filter(
                         line=workshop_line, energy_type=etype, stat_date=start
                     ).first()
+                    val = row.consumption if row else None
                 else:
                     row = model.objects.filter(
                         line=workshop_line,
                         energy_type=etype,
                         **{period_field: _period_value(dim, start)},
                     ).first()
-                val = row.consumption if row else None
+                    val = row.consumption if row else None
                 if holder == "water":
                     water = val
                 else:

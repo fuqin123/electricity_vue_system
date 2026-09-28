@@ -28,7 +28,6 @@ from apps.energy.models import PeriodSummary
 from apps.energy.services.aggregate import aggregate_hour
 from apps.energy.services.collect import collect_round
 from apps.energy.services import slots
-from apps.energy.services import summary as S
 from eep import conf
 
 logger = logging.getLogger(__name__)
@@ -104,8 +103,10 @@ class Command(BaseCommand):
         所以此刻能算出来的就是 HH−1 点。
         同时把再往前一小时也重算一遍 —— 上一轮若迟到或失败，顺手修掉，成本极低。
 
-        做完差值顺手刷周期总计：大屏与后台的日/月/年 KPI 都读它，
-        不刷的话界面上的日月年数字会一直停在上一次刷新。
+        这里**不刷日/月/年汇总**（v1.4.2 起）：汇总由每天 00:30 的
+        `summarize --rollup` 结算一次就够 —— 当期（今天 / 本月 / 本年）的数字
+        界面是直接从小时表现算的（见 `summary.is_open_period`），
+        每小时重刷汇总表只是白耗一次扫描。
         """
         now = datetime.now()
         prev = slots.hour_start(now) - timedelta(hours=1)
@@ -115,8 +116,3 @@ class Command(BaseCommand):
         earlier = prev - timedelta(hours=1)
         written += aggregate_hour(earlier.date(), earlier.hour)
         self.stdout.write(f"   └─ 小时差值：{key} 共 {written} 条")
-
-        # 与 `collect --aggregate` 共用同一个滚动窗口（昨天 + 今天 + 近 2 月 + 今年），
-        # 免得两条采集路径刷出两套数字（B-523）
-        rows = S.refresh_rollups(now)
-        self.stdout.write(f"   └─ 已刷新周期总计（{len(rows)} 条）")

@@ -1,12 +1,20 @@
-"""生成 / 刷新周期总计（日、月、年），落到 `eep_period_summary`。
+"""生成 / 刷新周期总计（日、月、年），落到 `energy_daily` / `energy_monthly` / `energy_yearly`。
 
-大屏与后台的「年 / 月 / 日」KPI 与趋势图都读这张表，所以**每次采集完成后应跑一次日汇总**，
-月 / 年可以在整点之后按较低频率跑（或由系统计划任务每小时跑一次 all）。
+★ 常态用法 = **每天结算一次**（v1.4.2 起，配 00:30 的计划任务）：
 
-用法：
+    python manage.py summarize --rollup
+
+  `--rollup` 走 `summary.refresh_rollups()` 这一个入口：昨天 + 今天 + 近 2 月 + 今年。
+  必须包含昨天，因为昨天 23 点的差值要等今天 00:04 采到跨日边界读数才算得出来
+  （只刷今天 = 每一天永远少最后一个小时，B-523）。
+  今天这一行照写，但它只是「结算到此刻」的快照：界面上的当期数字
+  一律从小时表现算（见 `summary.is_open_period`），不依赖这一行。
+
+  采集侧（`collect --aggregate` / `collect_loop`）**不再每小时刷汇总**。
+
+其它用法（手工回填 / 换算法后重跑）：
     python manage.py summarize                     # 近 2 天 + 近 13 个月 + 近 6 年
-    python manage.py summarize --dim day --days 7  # 只刷近 7 天的日总计
-    python manage.py summarize --dim all --days 30 --months 13 --years 6
+    python manage.py summarize --dim day --days 30 # 只重刷近 30 天的日总计
     python manage.py summarize --show              # 顺带打印结果
 """
 
@@ -28,10 +36,24 @@ class Command(BaseCommand):
         parser.add_argument("--days", type=int, default=2, help="刷最近多少天的日总计")
         parser.add_argument("--months", type=int, default=13, help="覆盖最近多少个月")
         parser.add_argument("--years", type=int, default=6, help="覆盖最近多少年")
+        parser.add_argument(
+            "--rollup",
+            action="store_true",
+            help="跑运维滚动窗口（昨天 + 今天 + 近 2 月 + 今年）—— 每天 00:30 的计划任务用这个",
+        )
         parser.add_argument("--show", action="store_true", help="打印生成结果")
 
     def handle(self, *args, **opts):
         now = datetime.now()
+
+        if opts["rollup"]:
+            # 每天一次的结算入口。窗口为什么含昨天，见 refresh_rollups 的说明（B-523）
+            written = S.refresh_rollups(now)
+            self.stdout.write(
+                self.style.SUCCESS(f"滚动窗口结算完成（昨天 + 今天 + 近 2 月 + 今年）：{len(written)} 条")
+            )
+            return
+
         dim = opts["dim"]
         touched: list[PeriodSummary] = []
 
