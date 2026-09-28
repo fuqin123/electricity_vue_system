@@ -87,11 +87,9 @@ class Command(BaseCommand):
 
         # 刷新周期总计（大屏与后台的日月年 KPI 都读它）
         if not options["dry_run"] and not options["no_summary"]:
-            now = datetime.now()
-            written = S.summarize_days(now.date(), now)
-            written += S.summarize_periods(S.DIM_MONTH, S.recent_months(2, now), now)
-            written += S.summarize_periods(S.DIM_YEAR, S.recent_years(1, now), now)
-            self.stdout.write(f"周期总计：刷新今天 + 近 2 月 + 今年，共 {len(written)} 条")
+            # ⚠ 窗口是「昨天 + 今天」而不是只有今天，原因见 `summary.refresh_rollups`（B-523）
+            written = S.refresh_rollups(datetime.now())
+            self.stdout.write(f"周期总计：刷新昨天 + 今天 + 近 2 月 + 今年，共 {len(written)} 条")
 
         # 有失败时返回非 0，方便计划任务判定
         if summary["fail"]:

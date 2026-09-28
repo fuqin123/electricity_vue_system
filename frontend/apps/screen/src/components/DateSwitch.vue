@@ -14,6 +14,8 @@ import { computed } from 'vue';
 const props = defineProps<{
   /** 当前日期 YYYY-MM-DD */
   modelValue: string;
+  /** 画面还是上一天的数据（快照在途）—— 必须标出来，否则数字与日期错位（B-525） */
+  busy?: boolean;
 }>();
 const emit = defineEmits<{ 'update:modelValue': [string] }>();
 
@@ -59,8 +61,12 @@ function onInput(e: Event) {
       ›
     </button>
     <span v-if="isHistory" class="date-switch__badge">
-      <button type="button" @click="emit('update:modelValue', today)">历史数据 · 回到今日</button>
+      <button type="button" @click="emit('update:modelValue', today)">
+        {{ busy ? '历史数据 · 正在取数' : '历史数据 · 回到今日' }}
+      </button>
     </span>
-    <span v-else class="date-switch__badge date-switch__badge--live">实时</span>
+    <span v-else class="date-switch__badge date-switch__badge--live">
+      {{ busy ? '切换中' : '实时' }}
+    </span>
   </div>
 </template>

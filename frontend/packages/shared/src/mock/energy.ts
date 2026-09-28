@@ -704,7 +704,9 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
     },
     targetUnitKwh: m.targetUnitKwh,
     alerts,
-    currentHour: curH
+    currentHour: curH,
+    // 演示数据永远是「今天进行中」，所以锚点与进行中的小时是同一个
+    ongoingHour: curH
   };
 
   return { now, workshop };

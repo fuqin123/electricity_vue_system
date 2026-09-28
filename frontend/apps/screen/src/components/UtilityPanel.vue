@@ -5,7 +5,7 @@
 import { computed } from 'vue';
 import ChartBox from './ChartBox.vue';
 import { utilitySparkOption } from '@/charts';
-import { hexA, int, rise, type WorkshopData } from '@eep/shared';
+import { dec1, hexA, int, rise, type WorkshopData } from '@eep/shared';
 
 const props = defineProps<{ ws: WorkshopData }>();
 
@@ -26,10 +26,10 @@ const sparkOption = computed(() => utilitySparkOption(props.ws.utility));
         class="dual-metric__item"
         :style="{ background: hexA(it.color, 0.09) }"
       >
-        <span>{{ it.name }}耗 · 今日累计</span>
+        <span>{{ it.name }}耗 · {{ props.ws.dayClosed ? '当日累计' : '今日累计' }}</span>
         <b>{{ int(it.d.today) }}<small>t</small></b>
         <em :style="{ color: (rise(it.d.today, it.d.yesterday) ?? 0) > 0 ? '#ec48bd' : '#35ed7e' }">
-          瞬时 {{ it.d.rateNow.toFixed(1) }} t/h · 较昨日
+          <template v-if="it.d.rateNow !== null">瞬时 {{ dec1(it.d.rateNow) }} t/h · </template>较昨日
           {{
             rise(it.d.today, it.d.yesterday) === null
               ? '--'

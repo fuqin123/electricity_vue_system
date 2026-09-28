@@ -148,7 +148,7 @@ export interface UtilityMetric {
   today: number | null;
   yesterday: number | null;
   /** 当前瞬时流量 t/h */
-  rateNow: number;
+  rateNow: number | null;
   unit: string;
   /** 24 小时趋势，未到时段为 null */
   trend: (number | null)[];
@@ -191,7 +191,17 @@ export interface WorkshopData {
   /** 单位电耗考核目标 kWh/千瓶（产量接入后才能标定） */
   targetUnitKwh: number;
   alerts: AlertItem[];
+  /** 排序与「第 N 点已出数」的锚点：查历史整日时为 23 */
   currentHour: number;
+  /**
+   * 真正「还没结束」的小时；查历史整日时为 null。
+   * ⚠ 「进行中」只能比对这一个字段（B-522，与 B-518 同源）——
+   *   拿 `currentHour` 当进行中，会让历史日的 23 点显示成「进行中」，
+   *   而那一格其实早按聚合表结算完了。
+   */
+  ongoingHour?: number | null;
+  /** 查看的是已经过完的一天 */
+  dayClosed?: boolean;
 }
 
 /** 大屏顶层快照 —— 后端接口需返回同构对象 */

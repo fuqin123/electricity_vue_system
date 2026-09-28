@@ -290,6 +290,27 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
     return written
 
 
+def refresh_rollups(now: datetime | None = None) -> list[str]:
+    """刷新滚动窗口的周期总计：**昨天 + 今天** + 近 2 月 + 今年。
+
+    ⚠ 为什么必须带上昨天（B-523）：昨天 23 点的差值要等**今天 00:04** 采到
+    跨日边界读数才算得出来，而那一刻 `now.date()` 已经是今天了。
+    以前只刷今天，每一天的日总计都永远停在 23 个小时上
+    （实测 09-25/26/27 覆盖数恒为 23，日合计 377.4 对不上小时表的 385.5），
+    月 / 年又是按日行累加的，于是三个尺度一起偏小 —— 而大屏读的正是汇总表，
+    后台读的是小时表，两边就永远差最后一小时。
+
+    返回写过的周期键列表（供命令打印条数）。
+    """
+    now = now or datetime.now()
+    written: list[str] = []
+    for d in (now.date() - timedelta(days=1), now.date()):
+        written += summarize_days(d, now)
+    written += summarize_periods(DIM_MONTH, recent_months(2, now), now)
+    written += summarize_periods(DIM_YEAR, recent_years(1, now), now)
+    return written
+
+
 def recent_days(count: int, now: datetime | None = None) -> list[date_cls]:
     """近 count 天（含今天），**时间正序**（末项 = 今天）。
 

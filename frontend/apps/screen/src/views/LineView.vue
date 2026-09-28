@@ -16,6 +16,7 @@ import { useRoute, useRouter } from 'vue-router';
 import {
   big,
   dataConfig,
+  dec1,
   int,
   pad2,
   PLAN_RATE,
@@ -48,7 +49,7 @@ const route = useRoute();
 const router = useRouter();
 const store = useEnergyStore();
 /** 趋势维度与总览共用同一份状态，来回切屏不会丢 */
-const { dim, selectedDate, isHistory } = storeToRefs(store);
+const { dim, selectedDate, isHistory, stale } = storeToRefs(store);
 
 const lineId = computed(() => String(route.params.lineId ?? 'A1').toUpperCase());
 
@@ -175,7 +176,12 @@ const kpiCards = computed<KpiCard[]>(() => {
     {
       tag: '时',
       color: '#f06fcb',
-      label: h?.partial ? '当前小时（进行中）' : '当前小时产量',
+      // 查历史整日时第 23 小时早已结算，不能写「当前小时」（B-522）
+      label: w.dayClosed
+        ? `${pad2(curH)} 时段产量`
+        : h?.partial
+          ? '当前小时（进行中）'
+          : '当前小时产量',
       value: { v: int(hOut), u: '瓶' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
@@ -300,7 +306,9 @@ const lineAlerts = computed<AlertItem[]>(() => {
 const trendOption = computed(() => (line.value ? lineTrendOption(line.value, dim.value) : null));
 const heatmapOption = computed(() => (line.value ? lineHeatmapOption(line.value) : null));
 const todayOption = computed(() =>
-  line.value && ws.value ? todayChartOption(line.value.hours, line.value.rated, ws.value.currentHour) : null
+  line.value && ws.value
+    ? todayChartOption(line.value.hours, line.value.rated, ws.value.ongoingHour ?? -1)
+    : null
 );
 
 const todayNote = computed(() => {
@@ -311,7 +319,7 @@ const todayNote = computed(() => {
   if (!prodOn) {
     const kpeak = done.reduce((a, x) => Math.max(a, x.kwh ?? 0), 0);
     const kavg = done.length ? done.reduce((a, x) => a + (x.kwh ?? 0), 0) / done.length : 0;
-    return `用电峰值 ${kpeak.toFixed(0)} · 均值 ${kavg.toFixed(1)} kWh`;
+    return `用电峰值 ${dec1(kpeak)} · 均值 ${kavg.toFixed(1)} kWh`;
   }
   const peak = done.reduce((a, x) => Math.max(a, x.output ?? 0), 0);
   const avg = done.length ? done.reduce((a, x) => a + (x.output ?? 0), 0) / done.length : 0;
@@ -344,7 +352,7 @@ function switchLine(id: string) {
         </div>
       </template>
       <template #status>
-        <DateSwitch :model-value="selectedDate" @update:model-value="store.setDate" />
+        <DateSwitch :model-value="selectedDate" :busy="stale" @update:model-value="store.setDate" />
         <span v-if="isHistory" class="chip chip--warn" title="历史数据不会再变化，已暂停自动刷新">
           <i />历史数据 · 已暂停刷新
         </span>
@@ -382,7 +390,7 @@ function switchLine(id: string) {
 
         <PanelBox title="本线小时明细" body-class="panel__body--col">
           <template #note><span class="panel__note">{{ tableNote }}</span></template>
-          <HourTable :line="line" :current-hour="ws.currentHour" />
+          <HourTable :line="line" :current-hour="ws.currentHour" :ongoing-hour="ws.ongoingHour" />
         </PanelBox>
 
         <PanelBox title="数据上报质量" height="158px">

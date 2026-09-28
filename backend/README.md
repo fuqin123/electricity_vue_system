@@ -7,7 +7,7 @@
 > | 13 路产线电表（4 台 485 串口服务器，Modbus RTU over TCP） | ✅ 实测 14/14 点位 1.4 秒采完 |
 > | 车间蒸汽总表（第三方平台 API） | ✅ 已接通 |
 > | 小时差值（每小时用了多少）＋ 异常过滤 | ✅ 含缺数 / 换表 / 尖峰 / 偏离整点四类处理 |
-> | 日 / 月 / 年周期总计（`eep_period_summary`，大屏与后台同源） | ✅ `summarize` 落表，整点自动刷新 |
+> | 日 / 月 / 年周期总计（`energy_daily`·`monthly`·`yearly`，大屏与后台同源） | ✅ `summarize` 落表，整点自动刷新；⚠ v1.4.1 起窗口固定为**昨天 + 今天**（`summary.refresh_rollups()`）—— 昨天 23 点要等今天 00:04 的边界读数才算得出来，只刷今天会让**每一天都永远少最后一个小时**（B-523） |
 > | MySQL 存储 | ✅ 已建表入库（网关 IP/端口/从站号等仪表配置均在库，支持后台维护） |
 > | 能源数据只读接口 | ✅ `/api/energy/*`（与前端契约同构） |
 > | 后台配置接口 | ✅ v1.2.1 打通 `/api/admin/*`：网关 / 计量点**后台增删改 + 连接测试 + 试采**（写操作 `source=admin`，`seed_registry` 不覆盖） |
@@ -109,7 +109,7 @@ python manage.py runserver 0.0.0.0:8000
 ```bash
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/api/energy/collect-summary
-python manage.py test apps.energy      # 44 个单元测试
+python manage.py test apps.energy      # 64 个单元测试
 ```
 
 ---

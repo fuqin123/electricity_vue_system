@@ -5,11 +5,14 @@
  * 同时统计应报 / 实收点数，供「数据上报质量」复用。
  */
 import { computed } from 'vue';
-import { HOUR_QUALITY_LABEL, int, pad2, rise, thresholds, type HourPoint, type LineData } from '@eep/shared';
+import { HOUR_QUALITY_LABEL, dec1, int, pad2, rise, thresholds, type HourPoint, type LineData } from '@eep/shared';
 
 const props = defineProps<{
   line: LineData;
+  /** 排序锚点：从这一小时往回排（历史整日 = 23） */
   currentHour: number;
+  /** 真正「还没结束」的小时；查历史整日传 null，此时**没有任何一格是进行中**（B-522） */
+  ongoingHour?: number | null;
 }>();
 
 interface Row {
@@ -29,15 +32,21 @@ interface Row {
 /**
  * 状态判定。
  *
- * ⚠ 「进行中」只能由「这个小时还没结束」推出（`h === currentHour`），**不能看 `partial`**。
+ * ⚠ 「进行中」只能由「这个小时还没结束」推出（`h === ongoingHour`），**不能看 `partial`**。
  *   `partial` 的真实含义是「本小时合计不完整」，已结束的整点也会因为有表缺数 /
  *   端点偏离整点 / 尖峰被排除而被标成 partial —— 那是**数据异常**。
  *   以前混用的后果：8 点那个异常小时到了 10 点还显示「进行中」，
  *   现场以为等一会儿就会补上，其实它永远不会再变了（B-518）。
+ *
+ * `ongoingHour = null` = 看的是已经过完的一天，此时**没有任何一格是进行中**（B-522）。
  */
-function statusOf(s: HourPoint, h: number, currentHour: number): { text: string; color: string; cls: string } {
+function statusOf(
+  s: HourPoint,
+  h: number,
+  ongoingHour: number | null
+): { text: string; color: string; cls: string } {
   if (s.future) return { text: '计划', color: 'var(--t5)', cls: 'is-future' };
-  if (h === currentHour) return { text: '进行中', color: 'var(--cyan)', cls: '' };
+  if (h === ongoingHour) return { text: '进行中', color: 'var(--cyan)', cls: '' };
   if (s.stopped) return { text: '停线', color: 'var(--magenta)', cls: '' };
   if (s.quality && s.quality !== 'ok') {
     return { text: HOUR_QUALITY_LABEL[s.quality] ?? '异常', color: 'var(--amber)', cls: 'is-missing' };
@@ -51,6 +60,13 @@ function statusOf(s: HourPoint, h: number, currentHour: number): { text: string;
 
 const rows = computed<Row[]>(() => {
   const { line, currentHour } = props;
+  /**
+   * 进行中的小时：**只有 `undefined`（调用方没传）才退回锚点**。
+   * 写成 `ongoingHour ?? currentHour` 会把明确传进来的 `null` 也当成没传 ——
+   * `null` 是「这一天已经过完，没有进行中的小时」，
+   * 退回锚点就等于让历史日的 23 点重新显示「进行中」（B-522 的原症状）。
+   */
+  const ongoing = props.ongoingHour === undefined ? currentHour : props.ongoingHour;
   const order: number[] = [];
   for (let a = currentHour; a >= 0; a--) order.push(a);
   for (let b = currentHour + 1; b <= 23; b++) order.push(b);
@@ -58,25 +74,20 @@ const rows = computed<Row[]>(() => {
   return order.map((h) => {
     const s = line.hours[h];
     const prev = h > 0 ? line.hours[h - 1] : null;
-    const { text: status, color: statusColor, cls } = statusOf(s, h, currentHour);
+    const { text: status, color: statusColor, cls } = statusOf(s, h, ongoing);
 
     const dlt =
       s.unitKwh !== null && prev && prev.unitKwh !== null && !s.partial && !s.stopped
         ? rise(s.unitKwh, prev.unitKwh)
         : null;
 
+    // 电量与后台同一口径：1 位小数（旧规则「≥20 取整」让两边每格都差 0.x，B-524）
+    const kwhText = s.future || s.kwh === null ? '--' : dec1(s.kwh);
     const warn = s.unitKwh !== null && s.unitKwh > thresholds.unitKwhHigh;
-    // 刚过整点时电量可能不足 20kWh，保留 1 位小数，避免与单位电耗对不上
-    const kwhText =
-      s.future || s.kwh === null
-        ? '--'
-        : s.kwh < 20
-          ? (Math.round(s.kwh * 10) / 10).toFixed(1)
-          : int(s.kwh);
 
     return {
       hour: h,
-      isCurrent: h === currentHour,
+      isCurrent: h === ongoing,
       outputText: s.future ? '--' : int(s.output),
       kwhText,
       unitText: s.unitKwh === null ? '--' : s.unitKwh.toFixed(2),

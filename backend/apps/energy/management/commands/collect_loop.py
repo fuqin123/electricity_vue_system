@@ -116,7 +116,7 @@ class Command(BaseCommand):
         written += aggregate_hour(earlier.date(), earlier.hour)
         self.stdout.write(f"   └─ 小时差值：{key} 共 {written} 条")
 
-        rows = S.summarize_days(prev.date(), now)
-        rows += S.summarize_periods(S.DIM_MONTH, S.recent_months(2, now), now)
-        rows += S.summarize_periods(S.DIM_YEAR, S.recent_years(1, now), now)
+        # 与 `collect --aggregate` 共用同一个滚动窗口（昨天 + 今天 + 近 2 月 + 今年），
+        # 免得两条采集路径刷出两套数字（B-523）
+        rows = S.refresh_rollups(now)
         self.stdout.write(f"   └─ 已刷新周期总计（{len(rows)} 条）")

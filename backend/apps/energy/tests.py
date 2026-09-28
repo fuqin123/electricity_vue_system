@@ -822,3 +822,181 @@ class DashboardCumulativeTests(TestCase):
         self.assertEqual(d["line"], "A1")
         self.assertTrue(all(v is None for v in d["energies"]["water"]["values"]))
         self.assertFalse(d["energies"]["steam"]["perLineAvailable"])
+
+
+class ClosedDaySnapshotTests(TestCase):
+    """v1.4.1（B-522）：查**已经过完的一天**时，大屏不能留一个「进行中」的小时。
+
+    起因：`_now_for(历史日)` 把 as-of 造成那天的 23:59:59，于是 `day == now.date()` 恒真，
+    第 23 小时被当成还没结束，改走实时窗口；而实时窗口当时只写了下界，
+    就把「那天 23:04 之后直到此刻」的全部读数减成一个数。
+    实测 09-27 一线 23 点显示 85 kWh（真值 8.1）、三线 3285 kWh（真值 343.1），
+    日累计跟着一起虚高 —— 大屏与后台于是既「对不上」又「23 点特别离谱」。
+    """
+
+    DAY = datetime(2026, 9, 27).date()
+    AS_OF = datetime(2026, 9, 27, 23, 59, 59)  # 大屏查历史日时接口构造的「现在」
+    REAL_NOW = datetime(2026, 9, 28, 9, 17)  # 真实的此刻（已是次日）
+    STEP = Decimal("10")
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        cls.workshop = ProductionLine.objects.create(
+            line_code="WS", line_name="车间", line_type=ProductionLine.TYPE_WORKSHOP
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+
+    def meter(self, code: str = "E-A1-01", kind: str = EnergyType.ELECTRIC) -> EnergyMeter:
+        return EnergyMeter.objects.create(
+            code=code,
+            name=f"测试表 {code}",
+            energy_type=etype(kind),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=self.line,
+            gateway=self.gw,
+            unit="kWh",
+        )
+
+    def seed_hourly_readings(self, meter: EnergyMeter, first: datetime, count: int) -> None:
+        """按现场节奏（每小时 :04 一条）灌读数，每小时恰好用量 = STEP。"""
+        for i in range(count):
+            EnergyRaw.objects.create(
+                meter=meter,
+                line=meter.line,
+                energy_type=meter.energy_type,
+                collect_time=first + timedelta(hours=i),
+                reading=Decimal("1000") + self.STEP * i,
+                ok=True,
+                raw="test",
+            )
+
+    def aggregate_day_27(self, meter: EnergyMeter) -> None:
+        for h in range(24):
+            aggregate_hour(self.DAY, h, meters=[meter])
+
+    def test_实时窗口不跨过小时边界(self):
+        """进行中的参考值只能在本小时内取数，不许一路读到明天。"""
+        m = self.meter()
+        # 09-28 09:04 / 09:34 两条 → 本小时已用 5；10:04 那条必须被排除
+        for i, (minute, value) in enumerate([(4, "1000"), (34, "1005"), (64, "1010")]):
+            EnergyRaw.objects.create(
+                meter=m,
+                line=m.line,
+                energy_type=m.energy_type,
+                collect_time=datetime(2026, 9, 28, 9, 0) + timedelta(minutes=minute),
+                reading=Decimal(value),
+                ok=True,
+                raw="test",
+            )
+        res = current_hour_usage(m, now=datetime(2026, 9, 28, 9, 40))
+        self.assertIsNotNone(res)
+        self.assertEqual(res["usage"], Decimal("5.000"))
+
+    def test_历史日不足两条读数时不给参考值(self):
+        """as-of=09-27 23:59:59 时本小时只有 23:04 一条 → None（旧实现会减到今天）。"""
+        m = self.meter()
+        self.seed_hourly_readings(m, datetime(2026, 9, 26, 22, 4), 36)
+        self.assertIsNone(current_hour_usage(m, now=self.AS_OF))
+
+    def test_历史日23点走聚合表(self):
+        m = self.meter()
+        self.seed_hourly_readings(m, datetime(2026, 9, 26, 23, 4), 26)
+        self.aggregate_day_27(m)
+
+        data = build_line(m.line, self.AS_OF, closed=True)
+        h23 = data["hours"][23]
+        self.assertEqual(h23["kwh"], 10.0)
+        self.assertEqual(h23["quality"], EnergyHourly.Q_OK)
+        self.assertFalse(h23.get("partial"))
+        # 24 小时全部计入，日累计 = 24 × 10
+        self.assertEqual(data["today"]["kwh"], 240.0)
+        self.assertEqual(data["today"]["kwhCoveredHours"], 24)
+
+    def test_快照显式声明没有进行中的小时(self):
+        m = self.meter()
+        snap = build_overview(self.AS_OF, closed=True)
+        self.assertIsNone(snap["workshop"]["ongoingHour"])
+        self.assertTrue(snap["workshop"]["dayClosed"])
+        # 锚点仍留在 23：界面按它排序、写「已完成 24 点」
+        self.assertEqual(snap["workshop"]["currentHour"], 23)
+
+    def test_实时快照的进行中小时就是当前小时(self):
+        m = self.meter()
+        snap = build_overview(self.REAL_NOW)
+        self.assertEqual(snap["workshop"]["ongoingHour"], self.REAL_NOW.hour)
+        self.assertIsNone(snap["workshop"].get("dayClosed"))
+
+    def test_大屏与后台逐格相等(self):
+        """同源同口径的硬保证：大屏每小时数字 == /api/energy/range 的线别序列。"""
+        m = self.meter()
+        self.seed_hourly_readings(m, datetime(2026, 9, 26, 23, 4), 26)
+        self.aggregate_day_27(m)
+
+        big = [h["kwh"] for h in build_line(m.line, self.AS_OF, closed=True)["hours"]]
+        rng = ranges.usage_range(
+            self.DAY,
+            self.DAY,
+            granularity="hour",
+            scope="all",
+            now=self.REAL_NOW,
+            start_at=datetime(2026, 9, 27, 0),
+            end_at=datetime(2026, 9, 27, 23),
+        )
+        admin = next(s["values"] for s in rng["series"] if s["key"] == "A1")
+        self.assertEqual(len(admin), 24)
+        self.assertEqual(big, admin)
+        self.assertEqual(rng["totals"]["kwh"], 240.0)
+
+
+class YesterdayRollupTests(TestCase):
+    """v1.4.1（B-523）：日总计必须包含第 23 小时。
+
+    昨天 23 点的差值要等**今天 00:04** 采到跨日边界读数才算得出来，
+    那一刻 `now.date()` 已经是今天了 —— 只刷今天的汇总，
+    每一天就永远少最后一个小时（现场实测覆盖数恒为 23，日合计 377.4 对不上小时表的 385.5），
+    而月 / 年是按日行累加的，三个尺度一起偏小。
+    """
+
+    YESTERDAY = datetime(2026, 9, 27).date()
+    NOW = datetime(2026, 9, 28, 0, 34)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+
+    def test_刷新滚动窗口会把昨天的第23小时算进日总计(self):
+        meter = EnergyMeter.objects.create(
+            code="E-A1-01",
+            name="一线电表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=self.line,
+            gateway=self.gw,
+            unit="kWh",
+        )
+        # 09-27 00:04 … 09-28 00:04 共 25 条，每小时恰好 10 kWh
+        for i in range(25):
+            EnergyRaw.objects.create(
+                meter=meter,
+                line=meter.line,
+                energy_type=meter.energy_type,
+                collect_time=datetime(2026, 9, 27, 0, 4) + timedelta(hours=i),
+                reading=Decimal("1000") + Decimal("10") * i,
+                ok=True,
+                raw="test",
+            )
+        for h in range(24):
+            aggregate_hour(self.YESTERDAY, h, meters=[meter])
+
+        S.refresh_rollups(self.NOW)
+
+        row = EnergyDaily.objects.get(stat_date=self.YESTERDAY, line=self.line, energy_type=etype())
+        self.assertEqual(row.consumption, Decimal("240.000"))
+        self.assertEqual(row.covered_count, 24)
+        self.assertEqual(row.quality, PeriodSummary.Q_OK)

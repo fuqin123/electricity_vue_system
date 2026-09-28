@@ -261,12 +261,23 @@ def current_hour_usage(meter: EnergyMeter, now: datetime | None = None) -> dict 
 
     采样不足两条时返回 usage=None，界面显示「待整点采集」——
     这比给一个错一小时的数要诚实得多。
+
+    ⚠ v1.4.1 修正（B-522）：窗口**必须有上界**。
+    原来只写 `collect_time__gte=hour_start`，在实时用法下相安无事（未来还没有读数），
+    可一旦 `now` 是** fabricated 的观测时刻**（大屏查历史日时 `_now_for()` 给的是
+    那天 23:59:59），这个开区间就把「该小时之后直到今天最新」的全部读数都算进来：
+    实测查 09-27 时，一线 23 点显示 85 kWh（真值 8.1）、三线显示 3285 kWh（真值 343.1）
+    —— 相当于把 10 个小时的用量塞进一格，还把这一格标成「进行中」。
+    数字大到没有人会怀疑它是补出来的，所以危害是把日累计和单耗一起带偏。
     """
     now = now or datetime.now()
     hour_start = datetime.combine(now.date(), time(now.hour))
+    hour_end = hour_start + timedelta(hours=1)
 
     in_hour = list(
-        EnergyRaw.objects.filter(meter=meter, ok=True, reading__isnull=False, collect_time__gte=hour_start).order_by("collect_time")
+        EnergyRaw.objects.filter(
+            meter=meter, ok=True, reading__isnull=False, collect_time__gte=hour_start, collect_time__lt=hour_end
+        ).order_by("collect_time")
     )
     if len(in_hour) < 2:
         # 0 条：整点后还没采到样；1 条：只有边界基线，还不够做差

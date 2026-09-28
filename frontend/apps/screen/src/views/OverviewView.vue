@@ -15,7 +15,9 @@ import { storeToRefs } from 'pinia';
 import {
   big,
   dataConfig,
+  dec1,
   int,
+  pad2,
   plantConfig,
   PLAN_RATE,
   PROFILE,
@@ -41,7 +43,7 @@ import SvgIcon from '@/components/SvgIcon.vue';
 import DateSwitch from '@/components/DateSwitch.vue';
 
 const store = useEnergyStore();
-const { dim, selectedDate, isHistory } = storeToRefs(store);
+const { dim, selectedDate, isHistory, stale } = storeToRefs(store);
 
 /** 产量数据源是否已接入（见 config.ts 的 dataConfig） */
 const prodOn = dataConfig.productionEnabled;
@@ -117,7 +119,8 @@ const kpiCards = computed<KpiCard[]>(() => {
     {
       tag: '时',
       color: '#f06fcb',
-      label: h?.partial ? '当前小时（进行中）' : '当前小时产量',
+      // 查历史整日时第 23 小时早已结算，不能写「当前小时」（B-522）
+      label: w.dayClosed ? `${pad2(curH)} 时段产量` : h?.partial ? '当前小时（进行中）' : '当前小时产量',
       value: { v: int(hOut), u: '瓶' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
@@ -141,12 +144,19 @@ const todayOption = computed(() =>
     ? todayChartOption(
         ws.value.hours,
         ws.value.lines.reduce((a, l) => a + l.rated, 0),
-        ws.value.currentHour
+        ws.value.ongoingHour ?? -1
       )
     : null
 );
 
 /* ── 今日分时备注 ─────────────────────────────────────── */
+/** 六线列表取的是锚点那一小时的数据：实时=本小时，历史整日=该日最后一小时（B-522） */
+const listNote = computed(() => {
+  const w = ws.value;
+  if (!w) return '--';
+  return w.dayClosed ? `${pad2(w.currentHour)} 时段 · 点击查看详情` : '本小时 · 点击查看详情';
+});
+
 const todayNote = computed(() => {
   const w = ws.value;
   if (!w) return '--';
@@ -155,7 +165,7 @@ const todayNote = computed(() => {
   if (!prodOn) {
     const kpeak = done.reduce((a, x) => Math.max(a, x.kwh ?? 0), 0);
     const kavg = done.length ? done.reduce((a, x) => a + (x.kwh ?? 0), 0) / done.length : 0;
-    return `用电峰值 ${kpeak.toFixed(0)} · 均值 ${kavg.toFixed(1)} kWh`;
+    return `用电峰值 ${dec1(kpeak)} · 均值 ${kavg.toFixed(1)} kWh`;
   }
   const peak = done.reduce((a, x) => Math.max(a, x.output ?? 0), 0);
   const avg = done.length ? done.reduce((a, x) => a + (x.output ?? 0), 0) / done.length : 0;
@@ -174,7 +184,7 @@ const todayNote = computed(() => {
         </div>
       </template>
       <template #status>
-        <DateSwitch :model-value="selectedDate" @update:model-value="store.setDate" />
+        <DateSwitch :model-value="selectedDate" :busy="stale" @update:model-value="store.setDate" />
         <button class="link-admin" type="button" @click="store.refresh()">
           <span style="width: 12px; height: 12px; display: inline-flex"><SvgIcon name="refresh" /></span>
           立即刷新
@@ -248,7 +258,7 @@ const todayNote = computed(() => {
 
         <PanelBox
           title="六条产线实时数据"
-          note="本小时 · 点击查看详情"
+          :note="listNote"
           height="var(--l2)"
           body-class="panel__body--list"
         >

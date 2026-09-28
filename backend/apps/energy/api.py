@@ -134,6 +134,18 @@ def _now_for(day: date_cls) -> datetime:
     return datetime.combine(day, time(0, 0, 0))
 
 
+def _is_closed(day: date_cls) -> bool:
+    """这一天是否**已经整日结束** —— 只能问调用方要，不能从 `_now_for` 反推（B-522）。
+
+    `_now_for(历史日)` 给的是那天 23:59:59，于是 `day == now.date()` 恒真，
+    快照层就把第 23 小时当成「还没结束」，改用实时窗口取数；
+    而实时窗口一度还没有时间上界，把那天 23:04 之后到此刻的全部读数减成一个数：
+    实测查 09-27 时一线 23 点 = 85 kWh（真值 8.1）、三线 = 3285 kWh（真值 343.1），
+    界面还给它打上「进行中」，日累计随之整体虚高。
+    """
+    return day < datetime.now().date()
+
+
 def _body(request: HttpRequest) -> dict:
     if not request.body:
         return {}
@@ -347,9 +359,13 @@ def _gateway_last_heartbeat() -> dict:
 
 @require_GET
 def overview(request: HttpRequest) -> JsonResponse:
-    """大屏总览。结构与 `types.ts` 的 EnergySnapshot 对齐。"""
+    """大屏总览。结构与 `types.ts` 的 EnergySnapshot 对齐。
+
+    `?date=` 是**已经过完的一天**时必须带 `closed=True`（见 `_is_closed`）：
+    否则该日 23 点会被当成「进行中」的实时窗口，数字大一个数量级。
+    """
     day = _query_date(request)
-    return json_ok(build_overview(_now_for(day)))
+    return json_ok(build_overview(_now_for(day), closed=_is_closed(day)))
 
 
 @require_GET
@@ -358,7 +374,7 @@ def line_detail(request: HttpRequest, code: str) -> JsonResponse:
     if line is None:
         return json_err(f"产线不存在：{code}", 404)
     day = _query_date(request)
-    return json_ok(build_line(line, _now_for(day)))
+    return json_ok(build_line(line, _now_for(day), closed=_is_closed(day)))
 
 
 @require_GET
