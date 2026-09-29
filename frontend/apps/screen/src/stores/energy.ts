@@ -6,10 +6,9 @@ import { dataConfig, energyApi, type EnergySnapshot, type LineData, type TrendDi
  * 本地日期字符串 YYYY-MM-DD。
  * ⚠ 不能用 `toISOString().slice(0,10)` —— 那是 UTC，东八区在早上 8 点前会得到「昨天」。
  */
-function isoToday(): string {
-  const d = new Date();
+function isoToday(now: Date = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 }
 
 /**
@@ -26,6 +25,18 @@ export const useEnergyStore = defineStore('energy', () => {
   const refreshedAt = ref<Date | null>(null);
   /** 当前查看的日期（YYYY-MM-DD）；等于今天就按实时处理 */
   const selectedDate = ref<string>(isoToday());
+  /**
+   * 「今天」—— 必须是**响应式**的，不能写成 `computed(() => isoToday())`。
+   *
+   * B-527：原来 `selectedDate` 只在 store 创建时取一次当天日期，而 `isHistory`
+   * 里那句 `isoToday()` 没有任何响应式依赖，Vue 把 computed 缓存后就再也不算。
+   * 于是跨零点后 `selectedDate` 仍是昨天 → 接口把昨天当「已经过完的一天」整日返回
+   * → 大屏的趋势图永远停在昨天，**只有手动刷新浏览器才会翻到今天**。
+   * 现在是：定时器每轮先 `syncToday()`，日期一变就把没被用户钉住的视图推到新的一天。
+   */
+  const today = ref<string>(isoToday());
+  /** 用户是否显式选过日期。钉住历史日期时跨零点**不该**被强行拉回今天 */
+  const userPicked = ref(false);
 
   let timer: number | null = null;
   /**
@@ -53,7 +64,24 @@ export const useEnergyStore = defineStore('energy', () => {
    * 历史日期下**必须停掉自动刷新**：历史数据不会再变，
    * 每 30 秒重跑一遍只是白耗接口，还会让人误以为在看实时数据。
    */
-  const isHistory = computed(() => selectedDate.value !== isoToday());
+  const isHistory = computed(() => selectedDate.value !== today.value);
+
+  /**
+   * 重新求值「今天」，并在跨零点后把视图推到新的一天。返回是否翻了页。
+   *
+   * 只在「用户没有显式选过日期」时翻页：夜里两点值班的人回看昨天，
+   * 不该被零点静默拽回今天 —— 那会被当成数据突然跳了一下。
+   */
+  function syncToday(): boolean {
+    const next = isoToday();
+    if (next === today.value) return false;
+    today.value = next;
+    if (!userPicked.value && selectedDate.value !== next) {
+      selectedDate.value = next;
+      return true;
+    }
+    return false;
+  }
   /**
    * 数据来源：'api' 真实接口 / 'mock' 演示数据。
    * ⚠ 后端不可达时会降级为演示数据 —— 界面必须显示这个事实，
@@ -96,10 +124,14 @@ export const useEnergyStore = defineStore('energy', () => {
     void refresh();
     if (timer !== null) window.clearInterval(timer);
     // 刷新间隔下限保护，避免配置误填导致接口被打爆。
-    // 定时器常驻，但历史模式下直接跳过（见 isHistory 的说明）——
+    // 定时器常驻，但历史模式下不重取（见 isHistory 的说明）——
     // 比反复创建/销毁定时器更不容易出错。
     timer = window.setInterval(() => {
-      if (isHistory.value) return;
+      // 每一轮先对一次表：跨零点时这里会把视图推到新的一天（B-527）。
+      // 顺序不能颠倒 —— 先判 isHistory 再同步，历史模式就永远进不到这一句，
+      // 大屏会一直停在昨天（正是这次反馈的现象）。
+      const rolled = syncToday();
+      if (isHistory.value && !rolled) return;
       void refresh();
     }, Math.max(dataConfig.refreshMs, 5000));
   }
@@ -121,15 +153,17 @@ export const useEnergyStore = defineStore('energy', () => {
 
   /** 切换查看日期；传空串或今天即回到实时 */
   function setDate(date: string): void {
-    const next = date || isoToday();
+    syncToday(); // 先对齐「今天」，否则零点后选今天会被判成历史并停住
+    const next = date || today.value;
+    userPicked.value = next !== today.value;
     if (next === selectedDate.value) return;
     selectedDate.value = next;
     void refresh();
   }
 
-  /** 回到今天（恢复实时刷新） */
+  /** 回到今天（恢复实时刷新，并解除「钉住历史」） */
   function backToToday(): void {
-    setDate(isoToday());
+    setDate(today.value);
   }
 
   return {
@@ -144,12 +178,15 @@ export const useEnergyStore = defineStore('energy', () => {
     refreshedAt,
     ready,
     selectedDate,
+    today,
+    userPicked,
     snapshotDate,
     stale,
     isHistory,
     source,
     notice,
     degraded,
+    syncToday,
     refresh,
     start,
     stop,

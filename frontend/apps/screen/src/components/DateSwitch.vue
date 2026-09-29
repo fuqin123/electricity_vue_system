@@ -14,6 +14,12 @@ import { computed } from 'vue';
 const props = defineProps<{
   /** 当前日期 YYYY-MM-DD */
   modelValue: string;
+  /**
+   * 「今天」由上层传进来（store 里的反应式值）。
+   * ⚠ 不要在这里写 `computed(() => fmt(new Date()))`：`new Date()` 不是响应式依赖，
+   * computed 求值一次就永久缓存 —— 跨零点后徽标还写着旧日期、`:max` 也锁在旧的一天（B-527）。
+   */
+  today: string;
   /** 画面还是上一天的数据（快照在途）—— 必须标出来，否则数字与日期错位（B-525） */
   busy?: boolean;
 }>();
@@ -27,15 +33,13 @@ function fmt(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** 今天（每次求值都取系统时间，跨零点后自动更新） */
-const today = computed(() => fmt(new Date()));
-const isHistory = computed(() => props.modelValue !== today.value);
+const isHistory = computed(() => props.modelValue !== props.today);
 
 function shift(days: number) {
   const [y, m, d] = props.modelValue.split('-').map(Number);
   const next = fmt(new Date(y, m - 1, d + days));
   // 不允许翻到未来：未来日期没有任何数据，翻过去只会看到一片空
-  if (next > today.value) return;
+  if (next > props.today) return;
   emit('update:modelValue', next);
 }
 

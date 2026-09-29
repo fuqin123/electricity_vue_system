@@ -1078,6 +1078,31 @@ class OpenPeriodRollupTests(TestCase):
         row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], self.now)[key]
         self.assertEqual(row.kwh, Decimal("777"))
 
+    def test_昨天的行没结算完整时退回现算(self):
+        """00:00—00:30 的窗口：昨天的日行还是前天写的残缺值 → 必须现算，不能空一晚。
+
+        `EEP-Rollup` 没注册或跑失败时也是靠这条兜住：数字仍然正确，只是多扫一次小时表。
+        """
+        before_midnight = datetime.now().replace(hour=0, minute=12, second=0, microsecond=0)
+        y = before_midnight.date() - timedelta(days=1)
+        self.hourly(y, range(24))  # 240
+        self.daily_row(y, "100", covered=10)  # 前天 00:30 那次结算的残缺值
+
+        key = S.make_key(S.DIM_DAY, y)
+        row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], before_midnight)[key]
+        self.assertEqual(row.kwh, self.PER * 24)
+        self.assertNotEqual(row.kwh, Decimal("100"))
+
+    def test_更早的周期即使残缺也不回退(self):
+        """回退只对今天 / 昨天开放 —— 更早的行按结算值交付，避免长序列反复扫小时表。"""
+        long_ago = self.now.date() - timedelta(days=3)
+        self.hourly(long_ago, range(24))  # 240
+        self.daily_row(long_ago, "777", covered=10)
+
+        key = S.make_key(S.DIM_DAY, long_ago)
+        row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], self.now)[key]
+        self.assertEqual(row.kwh, Decimal("777"))
+
     def test_大屏与后台在当期同样相等(self):
         """当期现算之后，大屏的「今天那一根」必须仍等于后台日粒度序列的同一格。"""
         self.hourly(self.today, range(self.now.hour))

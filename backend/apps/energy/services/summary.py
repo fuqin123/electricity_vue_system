@@ -380,6 +380,22 @@ def _workshop_scope_lines() -> list[ProductionLine]:
     return list(ProductionLine.objects.filter(line_type=ProductionLine.TYPE_LINE))
 
 
+def _day_not_settled(dim: str, start: date_cls, now: datetime) -> bool:
+    """这个日级周期是否属于「可能还没被每日结算写完整」的那两天（今天 / 昨天）。
+
+    每天 00:30 才结算昨天，所以 **00:00—00:30 这段时间里昨天的日行还是前天 00:30
+    写下的残缺值**（大屏刚跨零点翻页，「昨天那一根」就会先空一晚）。
+    只对今天与昨天开放「行不完整就现算」的回退，更早的周期一律读表 ——
+    回退一次要扫小时表，把它限制在两个周期内，`daily30` 这种长序列的成本才不会涨。
+
+    另一层用处：`EEP-Rollup` 计划任务没注册或跑失败时，这里是**退化成现算**
+    （数字仍然正确，只是多扫一次小时表），而不是给界面一个残缺的旧值。
+    """
+    if dim != DIM_DAY:
+        return False
+    return start >= now.date() - timedelta(days=1)
+
+
 def is_open_period(dim: str, key: str, now: datetime | None = None) -> bool:
     """周期是否仍在进行中（即它包含 `now` 所在的那一天）。
 
@@ -429,8 +445,12 @@ def period_rows(
         start, end = period_bounds(dim, key)
         open_period = is_open_period(dim, key, now)
         expected = _hours_in(start, end, now) if dim == DIM_DAY else _days_in(start, end, now)
+        # 每日结算（00:30）还没把「昨天」写完整的那段时间里，昨天也按当期现算 ——
+        # 否则大屏零点后「昨天那一根」会先空一晚（见 _day_not_settled 的说明）
+        unsettled_yesterday = _day_not_settled(dim, start, now)
 
         # ── 电力 ──
+        live_fallback = False
         if elec is None or not agg_lines:
             kwh, covered = None, 0
             quality = Q_MISSING
@@ -457,6 +477,10 @@ def period_rows(
                 covered = min(
                     [r.covered_count for r in rows if r.covered_count] or [0]
                 )
+            # 昨天 / 今天还没被每日结算写完整 → 退回小时表现算（见 _day_not_settled）
+            live_fallback = unsettled_yesterday and covered < expected
+            if live_fallback:
+                kwh, covered = _elec_metrics(agg_lines, start, end)
             quality = _quality_from(covered, expected)
 
         # ── 水 / 汽（只有车间级有）──
@@ -466,7 +490,7 @@ def period_rows(
                 etype = types.get(code)
                 if etype is None:
                     continue
-                if open_period:
+                if open_period or live_fallback:
                     meter = EnergyMeter.objects.filter(
                         line=workshop_line, energy_type=etype, enabled=True
                     ).first()

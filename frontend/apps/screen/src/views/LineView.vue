@@ -49,7 +49,7 @@ const route = useRoute();
 const router = useRouter();
 const store = useEnergyStore();
 /** 趋势维度与总览共用同一份状态，来回切屏不会丢 */
-const { dim, selectedDate, isHistory, stale } = storeToRefs(store);
+const { dim, selectedDate, today, isHistory, stale } = storeToRefs(store);
 
 const lineId = computed(() => String(route.params.lineId ?? 'A1').toUpperCase());
 
@@ -352,7 +352,7 @@ function switchLine(id: string) {
         </div>
       </template>
       <template #status>
-        <DateSwitch :model-value="selectedDate" :busy="stale" @update:model-value="store.setDate" />
+        <DateSwitch :model-value="selectedDate" :today="today" :busy="stale" @update:model-value="store.setDate" />
         <span v-if="isHistory" class="chip chip--warn" title="历史数据不会再变化，已暂停自动刷新">
           <i />历史数据 · 已暂停刷新
         </span>

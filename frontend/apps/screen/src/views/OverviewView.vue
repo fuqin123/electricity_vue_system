@@ -43,7 +43,7 @@ import SvgIcon from '@/components/SvgIcon.vue';
 import DateSwitch from '@/components/DateSwitch.vue';
 
 const store = useEnergyStore();
-const { dim, selectedDate, isHistory, stale } = storeToRefs(store);
+const { dim, selectedDate, today, isHistory, stale } = storeToRefs(store);
 
 /** 产量数据源是否已接入（见 config.ts 的 dataConfig） */
 const prodOn = dataConfig.productionEnabled;
@@ -184,7 +184,7 @@ const todayNote = computed(() => {
         </div>
       </template>
       <template #status>
-        <DateSwitch :model-value="selectedDate" :busy="stale" @update:model-value="store.setDate" />
+        <DateSwitch :model-value="selectedDate" :today="today" :busy="stale" @update:model-value="store.setDate" />
         <button class="link-admin" type="button" @click="store.refresh()">
           <span style="width: 12px; height: 12px; display: inline-flex"><SvgIcon name="refresh" /></span>
           立即刷新
