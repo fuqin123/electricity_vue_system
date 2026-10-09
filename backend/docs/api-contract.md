@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.4.4 ｜ 最后更新：2026-10-09
+> 版本：v1.5.0 ｜ 最后更新：2026-10-09
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -70,6 +70,61 @@
    图表与图例都读这一份（B-514 的教训：除数写在图表、单位写在模板，两边会漂）。
 
 ---
+
+## 〇·补五、v1.5.0 新增接口：读取当前值（**只读，不落库**）
+
+### `POST /api/admin/meters/{id}/current` ★ 读取某个计量点的当前值
+
+请求体（可空；两个字段都可省，省略即用后端配置）：
+
+```jsonc
+{
+  "timeoutMs": 800,     // 单次读写超时，后端裁剪到 200—10000ms
+  "retryTimes": 2       // 失败后的额外重试次数，裁剪到 0—5（总尝试 = retryTimes + 1）
+}
+```
+
+响应（`MeterCurrentResult`，前端类型同名）：
+
+```jsonc
+{
+  "meterId": 4, "meter": "E-A4-01", "name": "四线 生产线电表",
+  "category": "电", "lineCode": "A4",
+  "gatewayCode": "GW-TASHI", "gatewayName": "一期配电房塔石",
+  "protocol": "Modbus RTU over TCP",
+  "address": "10.112.66.133:8890 / 从站 11 / 寄存器 1000×2",
+  "unit": "kWh", "factor": 0.1, "enabled": true,
+
+  "ok": true,
+  "value": 639024.4,                 // 读不到是 null，**不是 0**
+  "raw": "slave=11 addr=1000 regs=0061 81e4",
+  "error": "",
+  "extra": { "raw_int": 6390244, "slave": 11, "register": 1000 },
+  "attempts": 1,                     // 本次实际尝试次数（>1 说明靠重试拿到了值）
+  "at": "2026-10-09 15:58:40",
+  "durationMs": 541,
+
+  "timeoutMs": 800, "retryTimes": 2, // 本次**生效**的参数（可能来自请求覆盖或后端默认）
+  "persisted": false,                // 恒为 false
+  "note": "本次读取只发往现场设备一次，不写数据库、不写任何日志，也不更新点位的最近读数"
+}
+```
+
+**调用方必须知道的四条：**
+
+1. **不落库。** 不写 `energy_raw`、不更新 `energy_meter` 的
+   `last_value / last_at / last_ok / last_error`、不写采集日志。
+   `last_*` 是链路健康信号（列表页的「在线 / 离线 / 故障」就靠它），
+   「看一眼当前值」不能把它刷成刚刚成功，否则断讯的表会被人工「治好」。
+2. **与 `POST /api/admin/meters/{id}/test` 的分工**：那是「试采」，会更新 `last_*`，
+   用于调参后确认配置；本接口用于**只看一眼、不留痕**。需要留痕就用试采，别改这里的语义。
+3. **失败**（网络不通 / 从站号写错 / 寄存器地址写错）一律返回 **HTTP 200 + `ok:false`**，
+   失败原因在 `error` 里 —— 这是排障接口，不该把 500 抛给界面。
+   点位不存在才是 404。
+4. **停用的点位也允许读取**：响应里 `enabled:false` 提示调用方。
+   手动读取不受启用状态限制（排障本来就要读停用的表），但后台采集任务不会采它。
+
+超时预算 = `timeoutMs × (1 + retryTimes)`，最坏 10000 × 6 = 60s，与采集侧口径一致。
 
 ## 〇·补四、v1.4.4 行为变更（两处，都影响「看到什么」）
 
@@ -634,6 +689,8 @@ Authorization: Bearer <token>
 | :--- | :--- | :--- |
 | GET | `/api/admin/lines` | `LineMaster` |
 | GET | `/api/admin/meters` | `MeterPoint` |
+| POST | `/api/admin/meters/{id}/test` | `MeterTestResult`（试采，**会更新**点位最近读数） |
+| POST | `/api/admin/meters/{id}/current` | `MeterCurrentResult`（读取当前值，**只读不落库**，见 〇·补五） |
 | GET | `/api/admin/gateways` | `Gateway[]`（不分页） |
 | GET | `/api/admin/quality` | `DataQualityRow[]`（不分页） |
 

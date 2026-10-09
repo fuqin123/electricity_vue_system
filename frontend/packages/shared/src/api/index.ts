@@ -414,7 +414,7 @@ export const adminApi = {
     await request(`/api/admin/meters/${id}`, { method: 'DELETE' });
   },
 
-  /** 试采一次：返回**真实读数**与原始报文，现场调参用 */
+  /** 试采一次：返回**真实读数**与原始报文，现场调参用。⚠ 会更新该点位的最近读数 */
   async testMeter(id: number): Promise<MeterTestResult> {
     if (!useApi('admin.meters')) {
       return delay({
@@ -427,6 +427,42 @@ export const adminApi = {
       });
     }
     return request<MeterTestResult>(`/api/admin/meters/${id}/test`, { method: 'POST' });
+  },
+
+  /**
+   * ★ 读取某个计量点的**当前值**（v1.4.4 新增）。
+   *
+   * 与 `testMeter` 的区别只有一条，但很关键：**这个接口一处都不落库** ——
+   * 不写 `energy_raw`、不更新点位的 `last_value / last_at / last_ok`。
+   * 现场排障时随手看一眼当前读数，不应该把「最近读数」刷成刚刚成功，
+   * 否则断讯的表在列表里显示成在线，事后分不清是链路恢复了还是有人点过按钮。
+   *
+   * @param opts.timeoutMs  单次读写超时（留空用网关配置）；后端裁剪到 200—10000ms
+   * @param opts.retryTimes 失败后的额外重试次数（留空用 collect.retry_times）；0—5
+   */
+  async readMeterCurrent(id: number, opts: { timeoutMs?: number; retryTimes?: number } = {}): Promise<MeterCurrentResult> {
+    if (!useApi('admin.meters')) {
+      return delay({
+        meterId: id,
+        meter: '',
+        name: '',
+        ok: false,
+        value: null,
+        raw: '',
+        error: '演示模式：未连接真实网关',
+        unit: '',
+        at: '',
+        durationMs: 0,
+        attempts: 0,
+        timeoutMs: opts.timeoutMs ?? 1500,
+        retryTimes: opts.retryTimes ?? 1,
+        persisted: false
+      });
+    }
+    return request<MeterCurrentResult>(`/api/admin/meters/${id}/current`, {
+      method: 'POST',
+      body: JSON.stringify(opts)
+    });
   },
 
   async getQuality(): Promise<DataQualityRow[]> {
@@ -631,6 +667,51 @@ export interface GatewayTestResult {
   detail: string;
   durationMs: number;
   items: MeterTestResult[];
+}
+
+/**
+ * 「读取当前值」结果（`POST /api/admin/meters/{id}/current`）。
+ *
+ * ⚠ `persisted` 恒为 `false`：本次读取不写数据库、不写日志、不更新点位最近读数。
+ *   界面必须把这一点显式写给使用者看 —— 这是它与「试采」唯一的区别，
+ *   也是最容易被误用的一条（随手一点就把断讯表的 `last_ok` 刷成在线）。
+ */
+export interface MeterCurrentResult {
+  meterId: number;
+  meter: string;
+  name: string;
+  /** 能源类型中文名，如「电」 */
+  category?: string;
+  lineCode?: string;
+  gatewayCode?: string;
+  gatewayName?: string;
+  protocol?: string;
+  /** 怎么读到的：地址 / 从站 / 寄存器（或接口地址） */
+  address?: string;
+  unit: string;
+  /** 倍率（原始寄存器 × 倍率 = 读数） */
+  factor?: number;
+  /** 该点位是否处于启用状态（停用的表也允许读取，便于排障） */
+  enabled?: boolean;
+  ok: boolean;
+  /** 当前累计读数；读取失败为 null（**不是 0**） */
+  value: number | null;
+  raw: string;
+  error: string;
+  /** API 类网关的额外字段（瞬时流量 / 温度 / 压力等） */
+  extra?: Record<string, unknown>;
+  /** 本次实际尝试了几次（>1 说明靠重试拿到了值） */
+  attempts: number;
+  /** 服务端读取时刻 `YYYY-MM-DD HH:mm:ss` */
+  at: string;
+  durationMs: number;
+  /** 本次生效的单次读写超时 */
+  timeoutMs: number;
+  /** 本次生效的额外重试次数（总尝试 = retryTimes + 1） */
+  retryTimes: number;
+  /** 恒为 false：本次读取不留痕 */
+  persisted: boolean;
+  note?: string;
 }
 
 /* ══════════════════════════════════════════════════════════════

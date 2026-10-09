@@ -21,7 +21,8 @@
     POST        /api/admin/gateways/{id}/test        连接测试
     GET/POST    /api/admin/meters          计量点列表 / 新增
     PUT/DELETE  /api/admin/meters/{id}     修改 / 删除
-    POST        /api/admin/meters/{id}/test          试采一次（**返回真实读数**）
+    POST        /api/admin/meters/{id}/test          试采一次（**返回真实读数**，会更新最近读数）
+    POST        /api/admin/meters/{id}/current       ★ 读取当前值（只读，**一处都不落库**）
     GET         /api/admin/collect-logs    采集日志（后台分页结构）
     GET         /api/admin/quality         数据质量（按产线）
 
@@ -281,6 +282,23 @@ def gateway_json(g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None)
     }
 
 
+def meter_address(m: EnergyMeter) -> str:
+    """计量点的「怎么读到它」摘要：地址 / 从站 / 寄存器（或接口地址）。
+
+    列表页与「读取当前值」弹窗共用，避免两处各拼一遍导致看到的地址不一致。
+    """
+    parts = []
+    if m.gateway.host:
+        parts.append(f"{m.gateway.host}:{m.gateway.port}" if m.gateway.port else m.gateway.host)
+    if m.gateway.base_url:
+        parts.append(m.gateway.base_url)
+    if m.slave is not None:
+        parts.append(f"从站 {m.slave}")
+    if m.register is not None:
+        parts.append(f"寄存器 {m.register}×{m.registers}")
+    return " / ".join(parts) or "—"
+
+
 def meter_json(m: EnergyMeter, *, today_usage=None, today_hours: int = 0) -> dict:
     """计量点 → 前端结构。既供列表展示，也供后台表单回填（字段一一对应）。"""
     if not m.enabled:
@@ -292,16 +310,6 @@ def meter_json(m: EnergyMeter, *, today_usage=None, today_hours: int = 0) -> dic
     else:
         status = "offline"
 
-    addr_parts = []
-    if m.gateway.host:
-        addr_parts.append(f"{m.gateway.host}:{m.gateway.port}" if m.gateway.port else m.gateway.host)
-    if m.gateway.base_url:
-        addr_parts.append(m.gateway.base_url)
-    if m.slave is not None:
-        addr_parts.append(f"从站 {m.slave}")
-    if m.register is not None:
-        addr_parts.append(f"寄存器 {m.register}×{m.registers}")
-
     return {
         # ── 列表展示 ──
         "id": m.id,
@@ -310,7 +318,7 @@ def meter_json(m: EnergyMeter, *, today_usage=None, today_hours: int = 0) -> dic
         "category": m.energy_type.type_name,
         "lineCode": m.line.line_code if m.line else "—",
         "protocol": PROTOCOL.get(m.gateway.kind, m.gateway.kind),
-        "address": " / ".join(addr_parts) or "—",
+        "address": meter_address(m),
         "unit": m.unit,
         "factor": float(m.scale),
         "status": status,
@@ -1317,12 +1325,141 @@ def admin_meter_test(request: HttpRequest, pk: int) -> JsonResponse:
     return json_ok({**item, "durationMs": result["durationMs"], "unit": unit, "detail": detail})
 
 
-def _try_read(gateway: EnergyGateway, meters: list[EnergyMeter]) -> dict:
-    """共用的试读实现：一次连接读多个点位，返回逐点结果。"""
+@require_http_methods(["POST"])
+@csrf_exempt
+def admin_meter_current(request: HttpRequest, pk: int) -> JsonResponse:
+    """★ 读取某个计量点的**当前值**（v1.4.4 新增）。
+
+    与「试采」(`/test`) 的区别**只有一条，但很关键**：
+
+    | | `/test` 试采 | `/current` 读取当前值 |
+    | :--- | :--- | :--- |
+    | 落库 | ✍ 会写 `last_value / last_at / last_ok / last_error` | ❌ **一处都不写** |
+    | 停用的点位 | 拒绝（409） | 允许（手动排障更需要读停用表） |
+    | 用途 | 调参后确认配置对不对 | 只想看一眼现在的数，不留痕 |
+
+    为什么要有「不落库」这一档：`last_value / last_at / last_ok` 是采集链路的健康信号，
+    「仪表读数查询」页的排障完全依赖它。如果随手点一下就把 `last_ok` 刷成 `True`、
+    `last_at` 刷成此刻，**断讯表会被人工操作「治好」**，之后谁也说不清是链路恢复了
+    还是有人点过按钮。所以这个接口设计成纯读：不出现在 `energy_raw`、不碰 `energy_meter`、
+    不写任何日志表，返回体里带 `persisted=false` 明示这一点。
+
+    超时与重试（与采集同一套实现 `_try_read` → `BaseCollector.read_one_with_retry`）：
+      · `timeoutMs`  单次读写超时，默认取网关配置（`energy_gateway.timeout_ms`），再退回 1500
+      · `retryTimes` 失败后的额外重试次数，默认取 `collect.retry_times`
+      · 两个都可以在请求体里覆盖（现场排障要试「是偶发还是必现」），但有上下限裁剪，
+        避免一个请求把 Web 工作进程占住：单次超时 200—10000ms、重试 0—5 次。
+    超时预算 = `timeoutMs × (1 + retryTimes)`，最坏 10s × 6 = 60s，与采集侧的口径一致。
+    """
+    m = EnergyMeter.objects.select_related("gateway", "energy_type", "line").filter(pk=pk).first()
+    if m is None:
+        return json_err("计量点不存在", 404)
+
+    try:
+        body = _body(request)
+    except ValueError as exc:
+        return json_err(str(exc))
+
+    def _clamp(raw, default: int, lo: int, hi: int) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(value, hi))
+
+    default_timeout = int(m.gateway.timeout_ms or conf.get("collect.timeout_ms", 1500) or 1500)
+    default_retry = int(conf.get("collect.retry_times", 1) or 0)
+    timeout_ms = _clamp(body.get("timeoutMs"), default_timeout, 200, 10000)
+    retry_times = _clamp(body.get("retryTimes"), default_retry, 0, 5)
+
+    try:
+        result = _try_read(m.gateway, [m], timeout_ms=timeout_ms, retry_times=retry_times)
+    except Exception as exc:  # noqa: BLE001 —— 排障接口不能把 500 抛给前端
+        logger.exception("读取当前值失败：%s", m.code)
+        return json_ok(
+            {
+                "meterId": m.id,
+                "meter": m.code,
+                "name": m.name,
+                "ok": False,
+                "value": None,
+                "raw": "",
+                "error": f"{type(exc).__name__}: {exc}",
+                "unit": m.unit,
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "durationMs": 0,
+                "attempts": 0,
+                "timeoutMs": timeout_ms,
+                "retryTimes": retry_times,
+                "persisted": False,
+            }
+        )
+
+    item = result["items"][0]
+    return json_ok(
+        {
+            # ── 这个点位是谁、怎么读到的 ──
+            "meterId": m.id,
+            "meter": m.code,
+            "name": m.name,
+            "category": m.energy_type.type_name,
+            "lineCode": m.line.line_code if m.line else "—",
+            "gatewayCode": m.gateway.code,
+            "gatewayName": m.gateway.name,
+            "protocol": PROTOCOL.get(m.gateway.kind, m.gateway.kind),
+            "address": meter_address(m),
+            "unit": m.unit,
+            "factor": float(m.scale),
+            "enabled": m.enabled,
+            # ── 这一次读到的结果 ──
+            "ok": item["ok"],
+            "value": item["value"],
+            "raw": item["raw"],
+            "error": item["error"],
+            "extra": item.get("extra") or {},
+            "attempts": item.get("attempts", 0),
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "durationMs": result["durationMs"],
+            # ── 超时与重试参数（让界面能如实写出「按什么条件读的」）──
+            "timeoutMs": timeout_ms,
+            "retryTimes": retry_times,
+            # ── 明确声明：本次读取不留痕 ──
+            "persisted": False,
+            "note": "本次读取只发往现场设备一次，不写数据库、不写任何日志，也不更新点位的最近读数",
+        }
+    )
+
+
+def _try_read(
+    gateway: EnergyGateway,
+    meters: list[EnergyMeter],
+    *,
+    timeout_ms: int | None = None,
+    retry_times: int | None = None,
+    retry_backoff: float | None = None,
+) -> dict:
+    """共用的试读实现：一次连接读多个点位，返回逐点结果。**只读，不落库。**
+
+    超时与重试：
+      · `timeout_ms`    单次读写超时；空则用网关自己配的，再空则 1500ms
+      · `retry_times`   失败后的**额外**尝试次数（总尝试 = retry_times + 1，
+                        由 `BaseCollector._read_with_retry` 统一执行）
+      · `retry_backoff` 两次尝试之间的等待秒数
+
+    三者留空时保持历史行为（1500ms / 1 次 / 0.2s），所以既有的「测试连接」「试采」
+    调用点不受影响；后台「读取当前值」可以按需覆盖。
+    超时预算 = timeout_ms ×（1 + retry_times），调用方给的值要在**单次 HTTP 请求**
+    能承受的范围内（见 admin_meter_current 的上下限裁剪）。
+    """
     import time
 
     t0 = time.monotonic()
-    collector = build_collector(gateway, timeout_ms=gateway.timeout_ms or 1500, retry_times=1, retry_backoff=0.2)
+    collector = build_collector(
+        gateway,
+        timeout_ms=timeout_ms or gateway.timeout_ms or 1500,
+        retry_times=1 if retry_times is None else retry_times,
+        retry_backoff=0.2 if retry_backoff is None else retry_backoff,
+    )
     items: list[dict] = []
     try:
         err = collector.prepare()
@@ -1342,7 +1479,8 @@ def _try_read(gateway: EnergyGateway, meters: list[EnergyMeter]) -> dict:
                 ],
             }
         for m in meters:
-            res = collector.read_one(m)
+            # ⚠ 走 read_one_with_retry：直调 read_one 会绕开重试（v1.4.4 前就是这么写的）
+            res = collector.read_one_with_retry(m)
             items.append(
                 {
                     "meter": m.code,
@@ -1351,6 +1489,7 @@ def _try_read(gateway: EnergyGateway, meters: list[EnergyMeter]) -> dict:
                     "value": float(res.value) if res.value is not None else None,
                     "raw": res.raw,
                     "error": res.error,
+                    "attempts": res.attempts,
                     "extra": res.extra or {},
                 }
             )

@@ -7,13 +7,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest import mock
 
 from django.test import Client, RequestFactory, TestCase
 
-from apps.energy.collectors.base import get_path
+from apps.energy.collectors.base import BaseCollector, CollectResult, get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
 from apps.energy.management.commands import collect
 from apps.energy import api
@@ -1278,3 +1279,246 @@ class GatewayHeartbeatTests(TestCase):
             fail_count=0,
         )
         self.assertNotIn(self.gw.id, api._online_gateway_ids())
+
+
+class ScriptedCollector(BaseCollector):
+    """脚本化采集器：按预设序列返回成功 / 失败，用来验证重试**真的发生了**。
+
+    故意继承 `BaseCollector` 而不是 mock 掉整条读流程，是为了让
+    `_read_with_retry` 那段真实逻辑参与测试 —— 之前 `_try_read` 直接调 `read_one`，
+    把 `retry_times` 静默吞掉（参数传了、重试没发生），mock 掉反而看不出来。
+    """
+
+    def __init__(self, gateway, script, **kwargs):
+        super().__init__(gateway, **kwargs)
+        self.script = list(script) or [True]
+        self.calls = 0
+
+    def prepare(self) -> str:
+        return ""
+
+    def read_one(self, meter) -> CollectResult:
+        ok = self.script[min(self.calls, len(self.script) - 1)]
+        self.calls += 1
+        if ok:
+            return CollectResult(ok=True, value=Decimal("123.4"), raw="slave=8 addr=1000 regs=04d2")
+        return CollectResult(ok=False, error="脚本指定失败")
+
+
+def scripted_factory(script, captured: dict):
+    """造一个替换 `api.build_collector` 的工厂，顺手记下传进来的超时/重试参数。"""
+
+    def factory(gateway, *, timeout_ms=3000, retry_times=2, retry_backoff=0.5):
+        captured.update(timeout_ms=timeout_ms, retry_times=retry_times, retry_backoff=retry_backoff)
+        return ScriptedCollector(
+            gateway, script, timeout_ms=timeout_ms, retry_times=retry_times, retry_backoff=retry_backoff
+        )
+
+    return factory
+
+
+class MeterCurrentTests(TestCase):
+    """v1.4.4 新增：读取当前值 `POST /api/admin/meters/{id}/current`。
+
+    这个接口存在的唯一理由是**不落库**。`last_value / last_at / last_ok` 是采集链路的
+    健康信号，「仪表读数查询」页排障完全依赖它；随手看一眼当前读数不能把它刷成
+    「刚刚成功」—— 否则断讯的表在列表里显示在线，之后谁也说不清是链路恢复了
+    还是有人点过按钮。所以下面的断言里，**「什么都没写」和「读数正确」一样重要**。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A7", line_name="七线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-CUR",
+            name="读取测试网关",
+            kind=EnergyGateway.KIND_MODBUS,
+            host="127.0.0.1",
+            port=7,
+            timeout_ms=1200,
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-CUR-01",
+            name="读取测试表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=cls.line,
+            gateway=cls.gw,
+            slave=8,
+            register=1000,
+            registers=2,
+            unit="kWh",
+        )
+
+    def setUp(self):
+        self.captured: dict = {}
+
+    def post(self, payload=None, pk=None):
+        body = json.dumps({} if payload is None else payload)
+        return Client().post(
+            f"/api/admin/meters/{self.meter.id if pk is None else pk}/current",
+            data=body,
+            content_type="application/json",
+        )
+
+    # ── 读数本身 ───────────────────────────────────────────
+    def test_返回当前读数与原始报文(self):
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([True], self.captured)):
+            res = self.post()
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["value"], 123.4)
+        self.assertEqual(body["raw"], "slave=8 addr=1000 regs=04d2")
+        self.assertEqual(body["unit"], "kWh")
+        self.assertEqual(body["meter"], "E-CUR-01")
+        self.assertEqual(body["gatewayCode"], "GW-CUR")
+        self.assertIn("从站 8", body["address"])
+        self.assertGreaterEqual(body["durationMs"], 0)
+
+    def test_失败时如实给错误而不是500(self):
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([False], self.captured)):
+            res = self.post()
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertFalse(body["ok"])
+        self.assertIsNone(body["value"])
+        self.assertEqual(body["error"], "脚本指定失败")
+
+    def test_采集器抛异常也返回200并写清原因(self):
+        boom = mock.Mock(side_effect=RuntimeError("设备爆炸了"))
+        with mock.patch.object(api, "build_collector", boom):
+            res = self.post()
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("RuntimeError", body["error"])
+        self.assertIn("设备爆炸了", body["error"])
+
+    # ── 不落库（本接口的核心承诺）──────────────────────────
+    def test_读取当前值不写任何表字段(self):
+        self.meter.last_value = Decimal("100.0")
+        self.meter.last_at = datetime(2026, 10, 9, 15, 4, 0)
+        self.meter.last_ok = True
+        self.meter.last_error = ""
+        self.meter.save(update_fields=["last_value", "last_at", "last_ok", "last_error"])
+        before = EnergyMeter.objects.get(pk=self.meter.pk)
+        snapshot = (before.last_value, before.last_at, before.last_ok, before.last_error, before.updated_at)
+        raw_before = EnergyRaw.objects.count()
+        logs_before = EnergyCollectLog.objects.count()
+
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([True], self.captured)):
+            res = self.post()
+
+        self.assertTrue(res.json()["ok"])
+        self.assertFalse(res.json()["persisted"])
+
+        after = EnergyMeter.objects.get(pk=self.meter.pk)
+        self.assertEqual(
+            (after.last_value, after.last_at, after.last_ok, after.last_error, after.updated_at),
+            snapshot,
+            "读取当前值不得更新点位的最近读数 / 最近状态",
+        )
+        self.assertEqual(EnergyRaw.objects.count(), raw_before, "读取当前值不得写入 energy_raw")
+        self.assertEqual(EnergyCollectLog.objects.count(), logs_before, "读取当前值不得写采集日志")
+
+    def test_读取失败同样不落库(self):
+        """失败也不能把 last_ok 改成 False / last_error 写上 —— 那同样是留痕。"""
+        self.meter.last_ok = True
+        self.meter.last_error = ""
+        self.meter.save(update_fields=["last_ok", "last_error"])
+
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([False], self.captured)):
+            self.post()
+
+        after = EnergyMeter.objects.get(pk=self.meter.pk)
+        self.assertTrue(after.last_ok)
+        self.assertEqual(after.last_error, "")
+
+    # ── 超时与重试 ─────────────────────────────────────────
+    def test_失败会按retryTimes重试并最终成功(self):
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([False, True], self.captured)):
+            res = self.post({"retryTimes": 1})
+        body = res.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["attempts"], 2, "第一次失败后应重试一次再成功")
+
+    def test_重试用尽才报失败(self):
+        factory_calls: list[ScriptedCollector] = []
+
+        def factory(gateway, *, timeout_ms=3000, retry_times=2, retry_backoff=0.5):
+            inst = ScriptedCollector(
+                gateway, [False], timeout_ms=timeout_ms, retry_times=retry_times, retry_backoff=retry_backoff
+            )
+            factory_calls.append(inst)
+            return inst
+
+        with mock.patch.object(api, "build_collector", side_effect=factory):
+            res = self.post({"retryTimes": 2})
+
+        body = res.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["attempts"], 3, "retryTimes=2 → 总共尝试 3 次")
+        self.assertEqual(factory_calls[0].calls, 3)
+
+    def test_未指定时用网关超时与配置重试次数(self):
+        with mock.patch.object(conf, "get", side_effect=lambda k, d=None: 3 if k == "collect.retry_times" else d):
+            with mock.patch.object(api, "build_collector", side_effect=scripted_factory([True], self.captured)):
+                res = self.post()
+        # 网关自己配了 1200ms，优先于全局默认
+        self.assertEqual(self.captured["timeout_ms"], 1200)
+        self.assertEqual(self.captured["retry_times"], 3)
+        self.assertEqual(res.json()["timeoutMs"], 1200)
+        self.assertEqual(res.json()["retryTimes"], 3)
+
+    def test_请求给的值会被裁剪到安全区间(self):
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([True], self.captured)):
+            res = self.post({"timeoutMs": 99999, "retryTimes": 99})
+        body = res.json()
+        # 最坏耗时 = 超时 ×(1+重试) 必须留在一次 HTTP 请求能承受的范围内
+        self.assertEqual(body["timeoutMs"], 10000)
+        self.assertEqual(body["retryTimes"], 5)
+        self.assertEqual(self.captured["timeout_ms"], 10000)
+        self.assertEqual(self.captured["retry_times"], 5)
+
+    def test_非法数值退回默认而不是500(self):
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([True], self.captured)):
+            res = self.post({"timeoutMs": "abc", "retryTimes": None})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.captured["timeout_ms"], 1200)
+
+    # ── 其它 ───────────────────────────────────────────────
+    def test_停用的点位也允许读取(self):
+        """停用表往往正是要排障的那块，读一眼不该被拦住（不落库所以没有副作用）。"""
+        meter = EnergyMeter.objects.create(
+            code="E-CUR-OFF",
+            name="停用测试表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=self.line,
+            gateway=self.gw,
+            slave=9,
+            register=1000,
+            unit="kWh",
+            enabled=False,
+        )
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([True], self.captured)):
+            res = self.post(pk=meter.id)
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.json()["enabled"])
+        self.assertTrue(res.json()["ok"])
+
+    def test_计量点不存在返回404(self):
+        res = self.post(pk=999999)
+        self.assertEqual(res.status_code, 404)
+
+    def test_试采路径同样走了重试(self):
+        """`_try_read` 曾经直接调 `read_one`，把重试静默吞掉（v1.4.4 修）。
+
+        这里锁住「测试连接 / 试采」共用的那条路径：传了 retry_times 就必须真的重试。
+        """
+        with mock.patch.object(api, "build_collector", side_effect=scripted_factory([False, True], self.captured)):
+            result = api._try_read(self.gw, [self.meter], timeout_ms=900, retry_times=1)
+        self.assertTrue(result["items"][0]["ok"])
+        self.assertEqual(result["items"][0]["attempts"], 2)
+        self.assertEqual(self.captured["timeout_ms"], 900)

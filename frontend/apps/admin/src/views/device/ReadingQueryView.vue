@@ -11,10 +11,21 @@
  *
  * ⚠ 采集失败的行 `reading` 是 **null**（界面显示 `--`），不是 0 ——
  *   0 会被差值当成真实读数，进而算出一个假的用量（B-502 的源头就在这张表）。
+ *
+ * v1.4.4 新增：每行一个「读取当前值」按钮 —— 直接向现场设备要一次当前读数，
+ * 结果只在一个弹窗里展示，**不写数据库、不写日志、不更新点位的最近读数**
+ * （与「计量点位 → 试采」的区别就在这里，见 `adminApi.readMeterCurrent` 的说明）。
  */
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
-import { adminApi, type Gateway, type MeterPoint, type MeterReading, type ReadingQuery } from '@eep/shared';
+import {
+  adminApi,
+  type Gateway,
+  type MeterCurrentResult,
+  type MeterPoint,
+  type MeterReading,
+  type ReadingQuery
+} from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
@@ -108,6 +119,62 @@ function readingText(v: number | null): string {
   return v === null || v === undefined ? '--' : v.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
 }
 
+/* ── 读取当前值（不落库）───────────────────────────────── */
+/**
+ * 弹窗里显示的是**刚从设备读回来**的一次读数，与上面的历史读数表无关：
+ * 它不出现在 `energy_raw`，也不改点位的 `last_value / last_at / last_ok`。
+ *
+ * 为什么要这样设计：`last_ok / last_at` 是采集链路的健康信号，本页的排障完全依赖它。
+ * 如果「看一眼当前值」顺手把点位刷成刚刚成功，断讯的表就会显示在线，
+ * 之后谁也说不清是链路恢复了还是有人点过按钮。
+ */
+const probe = reactive({
+  visible: false,
+  loading: false,
+  meterId: 0,
+  label: '',
+  /** 超时 / 重试：留空用网关与采集配置里的值，可在弹窗里临时调，用来分辨「偶发还是必现」 */
+  timeoutMs: null as number | null,
+  retryTimes: null as number | null,
+  result: null as MeterCurrentResult | null
+});
+
+/** 打开弹窗并立刻读一次；`again=true` 表示在同一弹窗里再读一次 */
+async function readCurrent(row?: MeterReading, again = false) {
+  if (row) {
+    probe.meterId = row.meterId;
+    probe.label = `${row.meter} ${row.meterName}`;
+    probe.timeoutMs = null;
+    probe.retryTimes = null;
+    probe.result = null;
+    probe.visible = true;
+  }
+  if (!probe.meterId) return;
+  probe.loading = true;
+  try {
+    probe.result = await adminApi.readMeterCurrent(probe.meterId, {
+      timeoutMs: probe.timeoutMs ?? undefined,
+      retryTimes: probe.retryTimes ?? undefined
+    });
+    if (!again) ElMessage.success('已从设备读取当前值（未落库）');
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+    probe.result = null;
+  } finally {
+    probe.loading = false;
+  }
+}
+
+/** 弹窗里展示的读数（大字） */
+const probeValueText = computed(() => {
+  const r = probe.result;
+  if (!r) return '--';
+  return r.value === null ? '--' : r.value.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+});
+
+/** API 类网关会带回瞬时流量 / 温度 / 压力等，排障时有据可查 */
+const probeExtra = computed(() => Object.entries(probe.result?.extra ?? {}));
+
 /* ── 导出 ─────────────────────────────────────────────── */
 function exportCsv() {
   if (!lastPage.value.length) {
@@ -162,6 +229,15 @@ function exportCsv() {
       class="mb-16"
       title="这里看的是原始累计读数"
       description="与「能源计量 → 用量查询」的分工：那边是差分后的用量，这边是读数本身。排查倍率、字序、断讯从这页开始。采集失败的行读数为空（--），不会写 0。"
+    />
+
+    <el-alert
+      type="success"
+      :closable="false"
+      show-icon
+      class="mb-16"
+      title="「读取当前值」= 现场实读一次，不留痕"
+      description="每行的按钮会直接向现场设备要一次当前读数，结果只在这个弹窗里展示：不写数据库、不写日志、也不更新点位的「最近读数 / 最近状态」。所以它不会把断讯的表「治好」——历史读数与采集日志仍由后台采集任务负责。"
     />
 
     <el-card shadow="never" class="mb-16">
@@ -225,6 +301,7 @@ function exportCsv() {
       keyword-placeholder="按仪表编码 / 名称检索"
       :page-size="50"
       :max-height="480"
+      :op-width="120"
     >
       <template #col-reading="{ row }">
         <span :class="{ 'is-missing': row.reading === null }">{{ readingText(row.reading) }}</span>
@@ -235,12 +312,107 @@ function exportCsv() {
       <template #col-raw="{ row }">
         <span class="t-mono raw">{{ row.ok ? row.raw || '—' : row.error || row.raw || '—' }}</span>
       </template>
+      <template #op="{ row }">
+        <el-button link type="primary" :loading="probe.loading && probe.meterId === row.meterId" @click="readCurrent(row)">
+          读取当前值
+        </el-button>
+      </template>
       <template #toolbar>
         <el-button size="small" plain @click="exportCsv">
           <el-icon><Download /></el-icon>&nbsp;导出当前页
         </el-button>
       </template>
     </TablePage>
+
+    <!-- ══════ 读取当前值（不落库）══════ -->
+    <el-dialog v-model="probe.visible" width="720px" :title="`读取当前值 · ${probe.label}`">
+      <div class="probe__bar">
+        <span class="probe__label">超时</span>
+        <el-input-number v-model="probe.timeoutMs" :min="200" :max="10000" :step="100" controls-position="right" style="width: 130px" />
+        <span class="probe__unit">ms</span>
+        <span class="probe__label">重试</span>
+        <el-input-number v-model="probe.retryTimes" :min="0" :max="5" controls-position="right" style="width: 110px" />
+        <span class="probe__unit">次</span>
+        <el-tooltip content="留空表示用网关配置的超时与采集配置的重试次数；改完点「再读一次」即生效" placement="top">
+          <span class="probe__hint">留空 = 用后端配置</span>
+        </el-tooltip>
+        <el-button type="primary" size="small" :loading="probe.loading" @click="readCurrent(undefined, true)">再读一次</el-button>
+      </div>
+
+      <el-skeleton v-if="probe.loading && !probe.result" :rows="5" animated />
+
+      <template v-else-if="probe.result">
+        <el-alert
+          :type="probe.result.ok ? 'success' : 'error'"
+          :closable="false"
+          show-icon
+          class="mb-16"
+          :title="probe.result.ok ? '读取成功' : '读取失败'"
+          :description="
+            probe.result.ok
+              ? `本次尝试 ${probe.result.attempts} 次，耗时 ${probe.result.durationMs} ms`
+              : probe.result.error || '未知错误'
+          "
+        />
+
+        <el-alert
+          v-if="probe.result.enabled === false"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="mb-16"
+          title="该点位当前是「停用」状态"
+          description="手动读取不受启用状态限制（排障本来就要读停用的表）。但后台采集任务不会采它，因此上面的历史读数里不会有它的新数据。"
+        />
+
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="当前读数">
+            <span class="probe__value" :class="{ 'is-missing': probe.result.value === null }">{{ probeValueText }}</span>
+            <span class="probe__unit">{{ probe.result.unit || '' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="读取时刻">{{ probe.result.at }}</el-descriptions-item>
+          <el-descriptions-item label="仪表">{{ probe.result.meter }} {{ probe.result.name }}</el-descriptions-item>
+          <el-descriptions-item label="能源 / 归属">
+            {{ probe.result.category || '—' }} · {{ probe.result.lineCode || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="网关">
+            {{ probe.result.gatewayCode }} {{ probe.result.gatewayName }}
+          </el-descriptions-item>
+          <el-descriptions-item label="协议">{{ probe.result.protocol || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="读取方式" :span="2">
+            <span class="t-mono">{{ probe.result.address || '—' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="倍率">{{ probe.result.factor ?? '—' }}</el-descriptions-item>
+          <el-descriptions-item label="耗时 / 尝试">
+            {{ probe.result.durationMs }} ms / {{ probe.result.attempts }} 次
+          </el-descriptions-item>
+          <el-descriptions-item label="超时 / 重试" :span="2">
+            {{ probe.result.timeoutMs }} ms ×（1 + {{ probe.result.retryTimes }} 次重试）＝ 最长约
+            {{ probe.result.timeoutMs * (1 + probe.result.retryTimes) }} ms
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <div v-if="probeExtra.length" class="probe__extra">
+          <div class="probe__extra-title">设备同帧带回的其它字段</div>
+          <div v-for="[k, v] in probeExtra" :key="k" class="probe__extra-row">
+            <span class="probe__extra-key t-mono">{{ k }}</span>
+            <span class="t-mono">{{ v }}</span>
+          </div>
+        </div>
+
+        <div class="probe__raw">
+          <div class="probe__raw-title">{{ probe.result.ok ? '原始报文 / 响应' : '错误信息' }}</div>
+          <pre class="probe__raw-body t-mono">{{ probe.result.ok ? probe.result.raw || '—' : probe.result.error || '—' }}</pre>
+        </div>
+      </template>
+
+      <template #footer>
+        <span class="probe__footer-note">
+          本次读取不写数据库、不写日志，也不更新点位的最近读数（persisted={{ probe.result?.persisted ?? false }}）
+        </span>
+        <el-button @click="probe.visible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -266,5 +438,76 @@ function exportCsv() {
 .raw {
   font-size: 12px;
   color: var(--el-text-color-secondary);
+}
+
+/* ── 读取当前值弹窗 ───────────────────────────────────── */
+.probe__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.probe__label {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+.probe__unit {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.probe__hint {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  margin-left: auto;
+}
+.probe__value {
+  font-family: var(--el-font-family-mono, monospace);
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--yl-primary);
+  margin-right: 6px;
+}
+.probe__extra {
+  margin-top: 16px;
+}
+.probe__extra-title,
+.probe__raw-title {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 6px;
+}
+.probe__extra-row {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  line-height: 20px;
+}
+.probe__extra-key {
+  color: var(--el-text-color-placeholder);
+  min-width: 120px;
+}
+.probe__raw {
+  margin-top: 16px;
+}
+.probe__raw-body {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--yl-surface-container);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--el-text-color-regular);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.probe__footer-note {
+  float: left;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 32px;
 }
 </style>

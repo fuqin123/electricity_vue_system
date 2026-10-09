@@ -58,6 +58,15 @@ class BaseCollector:
         """一次读失败后的钩子：串口服务器是共享总线，出错后重连比硬重试更稳。"""
 
     # ── 基类统一流程 ────────────────────────────────────────
+    def read_one_with_retry(self, meter) -> CollectResult:
+        """单点读取并按 `retry_times` 重试。
+
+        ⚠ 后台的「测试连接 / 试采 / 读取当前值」必须走这里，**不要直接调 `read_one`**：
+          直接调会把 `retry_times` 悄悄吞掉（参数传了、重试没发生），
+          表现为「偶发一次读失败就报失败」，而现场以为是链路问题（v1.4.4 修）。
+        """
+        return self._read_with_retry(meter)
+
     def read_all(self, meters) -> dict[str, CollectResult]:
         out: dict[str, CollectResult] = {}
         meters = list(meters)

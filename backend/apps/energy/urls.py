@@ -45,6 +45,8 @@ _ADMIN_ROUTES = [
     ("meters", api.admin_meters, "admin-meters"),
     ("meters/<int:pk>", api.admin_meter_detail, "admin-meter-detail"),
     ("meters/<int:pk>/test", api.admin_meter_test, "admin-meter-test"),
+    # 读取当前值：只读、不落库（与 /test 的区别见 api.admin_meter_current 的说明）
+    ("meters/<int:pk>/current", api.admin_meter_current, "admin-meter-current"),
 ]
 
 #: 后台配置组（挂在 /api/admin/ 下）
