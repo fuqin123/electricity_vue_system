@@ -185,7 +185,7 @@ export const dataConfig = {
     meters:   '/api/energy/meters',
     collectSummary: '/api/energy/collect-summary'
   },
-  refreshMs: 30000
+  refreshMs: 60000
 };
 ```
 

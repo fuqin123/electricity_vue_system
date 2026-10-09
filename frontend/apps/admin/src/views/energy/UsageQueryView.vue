@@ -41,42 +41,59 @@ const scope = ref<Scope>('all');
 const lineCode = ref('A1');
 /** 勾选要看的能源曲线。默认三条都看（车间口径下水汽本来就有数） */
 const energies = ref<EnergyKey[]>(['electric', 'water', 'steam']);
-/** 默认「今日 00:00 → 当前整点」—— 起止相同会只剩一个桶，别写成 hourAt(0) */
-const range = ref<[string, string]>([dayStart(), hourNow()]);
+/**
+ * 默认「今天 00:00 → 最后一个已结算整点」。
+ * ⚠ 终点不能取「现在」：当前小时还没结算（见 closedHour 的说明），
+ *   取现在会多出一个恒为空的时段并被当成缺数。
+ */
+const range = ref<[string, string]>([fmtHour(anchorDayStart()), fmtHour(closedHour())]);
 const loading = ref(false);
 const data = ref<UsageRangeResult & { fromHour?: string; toHour?: string } | null>(null);
+/** 界面提示用：当前可查到的最新时段（= 最后一个已结算整点，见 closedHour） */
+const latestBucket = ref(fmtHour(closedHour()));
 
 /**
- * 本地时间字符串（`YYYY-MM-DD HH:mm`）。
- * ⚠ 不能用 `toISOString`：那是 UTC，东八区早上 8 点前会得到「昨天」（B-508 那条教训）。
+ * 整点文本 `YYYY-MM-DD HH:00` —— 本页端点一律取整点。
+ * ⚠ 不能用 `toISOString` 来拼：那是 UTC，东八区早上 8 点前会得到「昨天」（B-508 那条教训）。
  */
-function fmt(d: Date): string {
+function fmtHour(d: Date): string {
   const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-function hourNow(): string {
-  return fmt(new Date());
-}
-function hourAt(hoursAgo: number): string {
-  const d = new Date();
-  d.setHours(d.getHours() - hoursAgo);
-  return fmt(d);
-}
-function dayStart(): string {
-  const d = new Date();
-  return fmt(new Date(d.getFullYear(), d.getMonth(), d.getDate()));
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:00`;
 }
 
-const QUICK: { label: string; from: () => string; gran: Granularity }[] = [
-  { label: '近 6 小时', from: () => hourAt(6), gran: 'hour' },
-  { label: '今日', from: () => dayStart(), gran: 'hour' },
-  { label: '近 3 日', from: () => hourAt(72), gran: 'hour' },
-  { label: '近 30 日', from: () => hourAt(720), gran: 'day' },
-  { label: '近 12 个月', from: () => hourAt(24 * 366), gran: 'month' }
+/**
+ * 最后一个**已结算**的整点。
+ *
+ * 小时用量的定义是 `usage(H) = read(H+1:00) − read(H:00)` —— 要等下一个整点
+ * 采到端点读数才算得出来。所以「现在」所在的这个小时**永远查不到**：
+ * 15 点时最大可查时段是 14 点。
+ *
+ * ⚠ 若把「现在」直接当区间终点（15:18），接口会多返回一个恒为空的 15 点时段，
+ *   既在图上多一根空柱，又被「缺数」统计当成采集异常 —— 现场看到的就是
+ *   「共 16 个时段，其中 1 个时段缺数」，而那一个时段本来就不该出现（v1.4.4 修复）。
+ */
+function closedHour(): Date {
+  const d = new Date();
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() - 1);
+  return d;
+}
+/** 已结算小时所在那天的 00:00；跨零点（00:xx）时自动退到昨天，避免区间起点跑到终点后面 */
+function anchorDayStart(): Date {
+  const c = closedHour();
+  return new Date(c.getFullYear(), c.getMonth(), c.getDate());
+}
+
+const QUICK: { label: string; from: () => Date; gran: Granularity }[] = [
+  { label: '近 6 小时', from: () => new Date(closedHour().getTime() - 6 * 3600000), gran: 'hour' },
+  { label: '今日', from: () => anchorDayStart(), gran: 'hour' },
+  { label: '近 3 日', from: () => new Date(closedHour().getTime() - 72 * 3600000), gran: 'hour' },
+  { label: '近 30 日', from: () => new Date(closedHour().getTime() - 720 * 3600000), gran: 'day' },
+  { label: '近 12 个月', from: () => new Date(closedHour().getTime() - 24 * 366 * 3600000), gran: 'month' }
 ];
 
 function applyQuick(q: (typeof QUICK)[number]) {
-  range.value = [q.from(), hourNow()];
+  range.value = [fmtHour(q.from()), fmtHour(closedHour())];
   granularity.value = q.gran;
   void load();
 }
@@ -95,6 +112,8 @@ async function load() {
     ElMessage.warning('请选择起止时间');
     return;
   }
+  // 每次都重算一次提示（页面跨零点放着不动时，那句「可查最新时段」不能停在昨天）
+  latestBucket.value = fmtHour(closedHour());
   loading.value = true;
   try {
     data.value = await energyApi.getRange({
@@ -265,6 +284,12 @@ function exportCsv() {
               {{ q.label }}
             </el-button>
           </el-button-group>
+          <el-tooltip
+            content="小时用量 = 下个整点读数 − 本整点读数，要等整点过后采到端点才算得出，所以当前这个小时还查不到"
+            placement="top"
+          >
+            <span class="query__hint">小时用量整点结算 · 可查最新时段 {{ latestBucket }}</span>
+          </el-tooltip>
         </div>
 
         <div class="query__row">
@@ -341,7 +366,7 @@ function exportCsv() {
       show-icon
       class="mb-16"
       :title="`共 ${data?.bucketCount} 个时段，其中 ${missingRows} 个时段缺数（显示为 --）`"
-      description="缺数表示该时段内并非所有电表都能算出可信差值（采集未覆盖或累计值回退）。缺数不补 0 —— 补 0 会被误读成「这段时间没用电」。"
+      description="缺数表示该时段内并非所有电表都能算出可信差值（采集未覆盖或累计值回退）。缺数不补 0 —— 补 0 会被误读成「这段时间没用电」。进行中的当前小时尚未结算，不列入时段数。"
     />
 
     <el-alert

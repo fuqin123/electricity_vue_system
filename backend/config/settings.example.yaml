@@ -68,6 +68,11 @@ collect:
   # 每小时节奏下最新读数最旧也就约 1 小时前，给 2 小时足够宽松；
   # 没有这条，采集整体停掉时界面不会有任何提示（各点位 last_ok 仍是上次的 True）。
   stale_alert_hours: 2
+  # 网关「离线」判定阈值（分钟）。留空 = 按采集节奏自动取：
+  # hourly → 90 分钟（1 个周期 + 30 分钟宽限）；minute → max(5 分钟, 3 × interval_seconds)。
+  # ⚠ 不要按「分钟级」直觉填 5：hourly 节奏下心跳间隔本来就是 1 小时，
+  #   填 5 会让全部网关在近乎所有时间显示离线（v1.4.4 修复过的现场问题）。
+  # gateway_offline_minutes: 90
   filter:
     reset_threshold_ratio: 0.5
 

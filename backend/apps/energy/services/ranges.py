@@ -123,11 +123,21 @@ def _hour_labels(
     *,
     start_at: datetime | None = None,
     end_at: datetime | None = None,
+    closed_only: bool = False,
 ) -> list[tuple[date_cls, int]]:
     """生成 [起点, 终点] 之间的全部（日期, 小时）桶，末日截止到当前小时。
 
     `start_at` / `end_at` 给定时按**整点闭区间**裁剪（v1.4.0 的「年月日时 → 年月日时」筛选），
     不给时沿用旧的「整日」行为，保证大屏与既有调用方口径不变。
+
+    `closed_only=True` 时**排除正在走的这一个小时**（`hour < now.hour`）。
+
+    ⚠ 为什么需要它：本表的小时桶语义是「H 这一小时用了多少」，而
+      `usage(H) = read(H+1:00) − read(H:00)`，要等下一个整点采到端点读数才成立。
+      而 `energy_hourly` 也只写已结束的小时（聚合在整点后跑）。
+      所以把「现在」所在的这个小时放进桶里，得到的一定是空值 —— 它会在用量查询页
+      表现成「共 N 个时段，其中 1 个时段缺数」，让人以为采集漏了一个小时（v1.4.4 修复）。
+      15 点时最大可查的时段是 14 点。
     """
     out: list[tuple[date_cls, int]] = []
     d = start
@@ -135,6 +145,8 @@ def _hour_labels(
         last_hour = now.hour if d == now.date() else 23
         if d == now.date() and now.hour == 0:
             last_hour = 0
+        if closed_only and d == now.date():
+            last_hour = now.hour - 1  # 当前小时尚未结算 → 不生成桶
         if end_at is not None and d == end_at.date():
             last_hour = min(last_hour, end_at.hour)
         first_hour = 0
@@ -288,6 +300,10 @@ def usage_range(
     :param granularity: 'hour' | 'day' | 'month'
     :param start_at / end_at: 精确到小时的端点（v1.4.0）。只影响 hour 粒度 ——
         day / month 的桶本身就是整天/整月，端点会被规范到所属周期边界。
+
+    ⚠ hour 粒度**只到最后一个已结算整点**：区间终点落在当前小时时，当前小时不入桶
+      （15 点时最大可查 14 点）。当前小时的用量在下个整点采到端点前无定义，
+      放进来只会得到一个恒为空的时段并被当成「采集缺数」（v1.4.4）。
     """
     now = now or datetime.now()
     if granularity == "hour":
@@ -308,7 +324,8 @@ def usage_range(
     target_lines = _lines_scope(line_code) if want_lines else []
 
     if granularity == "hour":
-        buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at)
+        # closed_only：只到最后一个已结算整点 —— 正在走的这一小时算不出用量（见 _hour_labels）
+        buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at, closed_only=True)
         labels = [f"{d:%m-%d} {h:02d}" for d, h in buckets]
         wmat = None
         if want_workshop:

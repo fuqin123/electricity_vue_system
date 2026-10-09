@@ -16,7 +16,7 @@ import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
-import { hourAgo, nowHourText, usageQuickSpans, useEnergyUsage, type UsageRow } from '@/utils/energyUsage';
+import { closedHourText, usageQuickSpans, usageQuickStart, useEnergyUsage, type UsageRow } from '@/utils/energyUsage';
 import { notImplemented } from '@/utils/pending';
 
 const props = defineProps<{ energy: 'water' | 'steam' }>();
@@ -40,7 +40,8 @@ const isSteam = computed(() => props.energy === 'steam');
 const QUICK = usageQuickSpans();
 
 function applyQuick(hours: number, gran: 'hour' | 'day' | 'month') {
-  range.value = [hourAgo(hours), nowHourText()];
+  // 终点取「最后一个已结算整点」：小时用量要等整点过后才算得出（v1.4.4）
+  range.value = [usageQuickStart(hours), closedHourText()];
   granularity.value = gran;
   void load();
 }

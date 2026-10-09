@@ -8,6 +8,12 @@
  *  ③ 三张**按能源分**的累计趋势图（电为主图、水/汽为辅），每张含累计用量 / 累计产量 / 累计单耗；
  *  ④ 原「今日用量统计」删除，改为**区间累计用量**显示。
  *
+ * v1.4.4 改版要点（现场反馈的版式问题）：
+ *  ① 顶部 KPI 去掉「采集网关在线」一行卡片 —— 1920 宽下 7 张正好排满一行，
+ *     第 8 张会单独换行；网关在线与否属于设备台账信息，去「设备与采集 → 采集网关」看；
+ *  ② 修「下方两列底边不齐」：并排卡片误吃全局 `.card + .card` 的纵向外边距
+ *     （见样式区 `.grid-2 > .card + .card`）。
+ *
  * ⚠ 产量与部分单价尚未接入，所以「累计产量 / 累计单耗 / 单箱变动费用」现在**必然为空**。
  *   这是如实留空，不是坏了：界面必须把 cost.blockers 的原因显示出来，
  *   也绝不拿电量反推产量凑一个数（ADR-013 / B-406 同一条铁律）。
@@ -297,13 +303,6 @@ const costNote = computed(() => {
         foot="含严重与重要告警，需人工确认"
       />
       <StatCard
-        label="采集网关在线"
-        :value="`${kpi?.onlineGateways ?? 0} / ${kpi?.totalGateways ?? 0}`"
-        color="#2a814b"
-        :loading="loading"
-        :foot="`离线 ${(kpi?.totalGateways ?? 0) - (kpi?.onlineGateways ?? 0)} 台，需排查链路`"
-      />
-      <StatCard
         label="数据上报完整率"
         :value="(kpi?.dataQualityRate ?? 0).toFixed(1)"
         unit="%"
@@ -400,6 +399,14 @@ const costNote = computed(() => {
   gap: 16px;
   margin-top: 16px;
 }
+
+/**
+ * ⚠ 并排的两张卡不能吃全局 `.card + .card { margin-top: 16px }`（index.scss）。
+ *   那条规则是给「同一列里上下堆叠」准备的；在 grid 里第二张卡与第一张是**左右**相邻，
+ *   照样命中相邻兄弟选择器，于是整体下沉 16px、高度又少 16px ——
+ *   表现就是「汽累计用量 / 最新告警」的上下边和左侧对不齐（v1.4.4 修复）。
+ */
+.grid-2 > .card + .card { margin-top: 0; }
 
 .card + .card { margin-top: 16px; }
 .mt-16 { margin-top: 16px; }

@@ -1,6 +1,6 @@
 {
   "name": "energy-efficiency-platform-frontend",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "private": true,
   "description": "能源产效管理系统 · 前端工程（数据中心大屏 + 后台管理系统，pnpm monorepo）",
   "engines": {

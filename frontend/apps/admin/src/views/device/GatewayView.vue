@@ -3,7 +3,9 @@
  * GatewayView —— 采集网关（IP、端口、协议的配置入口）
  *
  * 网关离线会直接造成整片数据缺失，因此这一页是大屏「数据上报质量」异常的排查起点：
- *   · 先看状态与最后心跳 —— 心跳超过 5 分钟即显示离线；
+ *   · 先看状态与最后心跳 —— 心跳超过**一个采集周期**（现场为小时级，阈值默认 90 分钟）
+ *     即显示离线。⚠ 阈值必须跟采集节奏走：按分钟级直觉设 5 分钟会让全部网关
+ *     在近乎所有时间显示离线（v1.4.4 修过的现场问题，见后端 gateway_offline_after）；
  *   · 点「测试连接」—— 对旗下每个点位试读一次，返回真实读数，
  *     一次性区分「网络不通」「从站号写错」「寄存器地址写错」三种情况。
  *
@@ -24,19 +26,28 @@ const banner = useSourceBanner('admin.gateways');
 const list = ref<Gateway[]>([]);
 const loading = ref(true);
 const status = ref('');
-/* ⚠ 不能用 InstanceType<typeof TablePage>：TablePage 是泛型 SFC，
-   推导出的类型不是构造签名，vue-tsc 会报「does not satisfy the constraint」。
-   这里按需要用到的方法声明结构类型即可。 */
-const tableRef = ref<{ reload: (resetPage?: boolean) => void } | null>(null);
+/** 列表是否已取回；配合 seq 让 TablePage 在取数完成后重新取一次（见 extraQuery） */
+const ready = ref(false);
+const seq = ref(0);
+
+/**
+ * ⚠ TablePage 只在「挂载」与「extraQuery 变化」时取数，而本页数据是异步来的：
+ *   首屏 TablePage 先挂载并取了一次数（那时 list 还是空的），等接口回来
+ *   list 已经填好、表格却不会再取 —— 现场看到的就是「网关必须刷新才显示」（B-519 同款）。
+ *   把「就绪 / 状态筛选 / 取数批次」一起并入 extraQuery，数据变了表格自己会跟上。
+ */
+const extraQuery = computed(() => ({ ready: ready.value, status: status.value, seq: seq.value }));
 
 async function refresh() {
   loading.value = true;
   try {
     list.value = await adminApi.getGateways();
+    ready.value = true;
   } catch (e) {
     ElMessage.error((e as Error).message);
   } finally {
     loading.value = false;
+    seq.value += 1;
   }
 }
 void refresh();
@@ -242,17 +253,17 @@ async function doTest(g: Gateway) {
       />
       <StatCard
         label="离线判定"
-        value="心跳 > 5 分钟"
+        value="心跳 > 1 个采集周期"
         color="#d7312a"
         :loading="loading"
-        foot="超过即判离线，大屏会提示采集异常"
+        foot="现场按小时采集，阈值默认 90 分钟（可配 collect.gateway_offline_minutes）"
       />
     </div>
 
     <TablePage
-      ref="tableRef"
       :columns="columns"
       :fetch="fetchGateways"
+      :extra-query="extraQuery"
       keyword-placeholder="网关编号 / 名称 / 地址"
       :op-width="210"
       :max-height="460"

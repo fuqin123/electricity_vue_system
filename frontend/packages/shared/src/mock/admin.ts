@@ -128,7 +128,7 @@ export function mockParams(): SysParam[] {
     { id: 4, key: 'collect.interval', name: '采集周期', value: '60', unit: 's', group: '采集策略', remark: '整点聚合前的原始采样周期' },
     { id: 5, key: 'collect.retry', name: '失败重试次数', value: '3', unit: '次', group: '采集策略', remark: '外部调用异常时的重试上限，建议配合退避策略' },
     { id: 6, key: 'collect.timeout', name: '单次采集超时', value: '5000', unit: 'ms', group: '采集策略', remark: 'Modbus 读写超时' },
-    { id: 7, key: 'screen.refreshMs', name: '大屏刷新间隔', value: '30000', unit: 'ms', group: '大屏参数', remark: '低于 5000ms 会被下限保护' },
+    { id: 7, key: 'screen.refreshMs', name: '大屏刷新间隔', value: '60000', unit: 'ms', group: '大屏参数', remark: '低于 6000ms 会被下限保护' },
     { id: 8, key: 'log.retentionDays', name: '本地日志保留天数', value: '30', unit: '天', group: '运维策略', remark: '按大小滚动，超期自动清理' },
     { id: 9, key: 'alarm.notify.channels', name: '告警通知渠道', value: 'mail,wecom', unit: '—', group: '告警通知', remark: '邮件 / 企业微信，逗号分隔' }
   ];

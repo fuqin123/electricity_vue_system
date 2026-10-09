@@ -133,7 +133,7 @@ export const useEnergyStore = defineStore('energy', () => {
       const rolled = syncToday();
       if (isHistory.value && !rolled) return;
       void refresh();
-    }, Math.max(dataConfig.refreshMs, 5000));
+    }, Math.max(dataConfig.refreshMs, 6000));
   }
 
   function stop(): void {

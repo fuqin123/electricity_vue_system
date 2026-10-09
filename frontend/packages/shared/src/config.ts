@@ -144,7 +144,7 @@ export const dataConfig = {
   },
 
   /** 大屏自动刷新间隔 ms */
-  refreshMs: 30000,
+  refreshMs: 60000,
 
   /**
    * 产量数据源是否已接入 —— **当前为 false**。

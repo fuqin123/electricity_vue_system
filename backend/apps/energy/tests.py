@@ -16,8 +16,10 @@ from django.test import Client, RequestFactory, TestCase
 from apps.energy.collectors.base import get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
 from apps.energy.management.commands import collect
+from apps.energy import api
 from apps.energy.models import (
     EnergyGateway,
+    EnergyCollectLog,
     EnergyHourly,
     EnergyMeter,
     EnergyDaily,
@@ -32,6 +34,7 @@ from apps.energy.services import ranges, slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
 from apps.energy.services.snapshot import build_line, build_overview
+from eep import conf
 
 DAY = datetime(2026, 9, 22).date()
 
@@ -692,6 +695,77 @@ class HourRangeTests(TestCase):
         )
         self.assertEqual([h for _d, h in buckets], [0, 1, 2, 3])
 
+    # ── v1.4.4：进行中的当前小时不入桶 ────────────────────────
+
+    def test_进行中的当前小时不入桶(self):
+        """15 点时最大可查时段是 14 点。
+
+        小时用量 = 下个整点读数 − 本整点读数，当前小时要到下个整点才算得出。
+        若把它放进桶里，得到的必然是一个恒空时段，用量查询页会把它读成
+        「共 16 个时段，其中 1 个时段缺数」—— 现场据此以为采集漏了一小时。
+        """
+        buckets = ranges._hour_labels(
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24, 15, 20),
+            start_at=datetime(2026, 9, 24, 0),
+            end_at=datetime(2026, 9, 24, 15),
+            closed_only=True,
+        )
+        hours = [h for _d, h in buckets]
+        self.assertEqual(hours[-1], 14)
+        self.assertNotIn(15, hours)
+        self.assertEqual(len(hours), 15)
+
+    def test_未开closed_only时行为不变(self):
+        """默认仍含当前小时 —— 数据中心那条「本小时起」的口径不能被动到。"""
+        buckets = ranges._hour_labels(
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24, 15, 20),
+            start_at=datetime(2026, 9, 24, 0),
+            end_at=datetime(2026, 9, 24, 15),
+        )
+        self.assertEqual([h for _d, h in buckets][-1], 15)
+
+    def test_零点刚过当天没有已结算小时(self):
+        """00:xx 时当天一个已结束的小时都没有，桶必须是空的而不是硬塞一个 0 点。"""
+        buckets = ranges._hour_labels(
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24).date(),
+            datetime(2026, 9, 24, 0, 30),
+            start_at=datetime(2026, 9, 24, 0),
+            end_at=datetime(2026, 9, 24, 0),
+            closed_only=True,
+        )
+        self.assertEqual(buckets, [])
+
+    def test_已过完的日子不受closed_only影响(self):
+        buckets = ranges._hour_labels(
+            datetime(2026, 9, 23).date(),
+            datetime(2026, 9, 23).date(),
+            datetime(2026, 9, 24, 15, 20),
+            closed_only=True,
+        )
+        self.assertEqual(len(buckets), 24)
+
+    def test_用量区间接口不再带出当前小时(self):
+        """端到端：查「今天 00:00 → 现在（15:20）」，最后一个时段必须是 14 点。"""
+        day = datetime(2026, 9, 24).date()
+        res = ranges.usage_range(
+            day,
+            day,
+            granularity="hour",
+            scope="workshop",
+            now=datetime(2026, 9, 24, 15, 20),
+            start_at=datetime(2026, 9, 24, 0),
+            end_at=datetime(2026, 9, 24, 15),
+        )
+        self.assertEqual(res["bucketCount"], 15)
+        self.assertEqual(res["labels"][-1], "09-24 14")
+        # 没有可信数据时质量是 partial/missing（不是 ok），但**不能**出现 future/缺一个多出来的空桶
+        self.assertEqual(len(res["quality"]), 15)
+
 
 class DashboardCumulativeTests(TestCase):
     """v1.4.0 数据中心：累计序列与单箱变动费用的缺数口径。
@@ -1127,3 +1201,80 @@ class OpenPeriodRollupTests(TestCase):
 
         opts = summarize_cmd.Command().create_parser("x", "y").parse_args(["--rollup"])
         self.assertTrue(opts.rollup)
+
+
+class GatewayHeartbeatTests(TestCase):
+    """v1.4.4：网关「离线」判定必须跟着采集节奏走。
+
+    现场事故：采集节奏是每小时一次（整点后 offset 秒采），心跳间隔天然就是 60 分钟，
+    而判定写死 5 分钟 —— 于是网关列表在约 92% 的时间里显示「离线」，
+    同一时刻计量点位却全部「在线」（点位判的是 `last_ok`，与心跳无关）。
+    更糟的是数据中心那张卡用另一套口径（有过任意一条采集日志即在线），
+    同一个「在线网关」两处给出不同答案。
+    """
+
+    def setUp(self):
+        self.gw = EnergyGateway.objects.create(
+            code="GW-HB",
+            name="心跳测试网关",
+            kind=EnergyGateway.KIND_MODBUS,
+            host="10.0.0.1",
+            port=8891,
+            enabled=True,
+            interval_seconds=60,
+        )
+
+    def test_阈值按hourly节奏自适应(self):
+        """未配置时：hourly → 90 分钟（一个采集周期 + 30 分钟宽限）。"""
+        with mock.patch.object(conf, "get", return_value=None):
+            self.assertEqual(api.gateway_offline_after(), timedelta(minutes=90))
+
+    def test_阈值可被配置覆盖(self):
+        def fake_get(key, default=None):
+            return 45 if key == "collect.gateway_offline_minutes" else default
+
+        with mock.patch.object(conf, "get", side_effect=fake_get):
+            self.assertEqual(api.gateway_offline_after(), timedelta(minutes=45))
+
+    def test_心跳在一个采集周期内算在线(self):
+        """最后心跳 15:04、现在 15:20（差 16 分钟）→ 在线。
+
+        这正是现场那次误判：5 分钟阈值把它判成离线，而链路其实是好的。
+        """
+        with mock.patch.object(api, "datetime") as dt:
+            dt.now.return_value = datetime(2026, 10, 9, 15, 20)
+            obj = api.gateway_json(self.gw, last_heartbeat=datetime(2026, 10, 9, 15, 4))
+        self.assertEqual(obj["status"], "online")
+        self.assertEqual(obj["lastHeartbeat"], "2026-10-09 15:04:00")
+
+    def test_心跳超过阈值算离线(self):
+        with mock.patch.object(api, "datetime") as dt:
+            dt.now.return_value = datetime(2026, 10, 9, 17, 30)
+            obj = api.gateway_json(self.gw, last_heartbeat=datetime(2026, 10, 9, 15, 4))
+        self.assertEqual(obj["status"], "offline")
+
+    def test_从没有过心跳算离线(self):
+        obj = api.gateway_json(self.gw, last_heartbeat=None)
+        self.assertEqual(obj["status"], "offline")
+        self.assertEqual(obj["lastHeartbeat"], "")
+
+    def test_数据中心与网关列表用同一个在线集合(self):
+        """同一指标只能有一个来源：避免「卡片说 5/5、列表全离线」这类自相矛盾。"""
+        EnergyCollectLog.objects.create(
+            gateway=self.gw,
+            started_at=datetime.now() - timedelta(minutes=16),
+            total=1,
+            ok_count=1,
+            fail_count=0,
+        )
+        self.assertIn(self.gw.id, api._online_gateway_ids())
+
+        EnergyCollectLog.objects.all().delete()
+        EnergyCollectLog.objects.create(
+            gateway=self.gw,
+            started_at=datetime.now() - timedelta(hours=5),
+            total=1,
+            ok_count=1,
+            fail_count=0,
+        )
+        self.assertNotIn(self.gw.id, api._online_gateway_ids())

@@ -37,10 +37,46 @@ function fmt(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/**
+ * 最后一个**已结算**的整点。
+ *
+ * 小时用量的定义是 `usage(H) = read(H+1:00) − read(H:00)` —— 要等下一个整点采到端点
+ * 读数才算得出来，所以「现在」所在的这个小时**永远查不到**：15 点时最大可查 14 点。
+ *
+ * ⚠ 把「现在」当区间终点会让接口多返回一个恒为空的时段，并把它算进「缺数」
+ *   （现场表现为「共 16 个时段，其中 1 个时段缺数」，其实那格本不该出现）。v1.4.4 修复。
+ *
+ * 注意：**只适用于小时用量的页面**（用量查询 / 电 / 水 / 汽）。
+ * 「仪表读数查询」查的是 energy_raw 原始读数，实时都有，终点仍应取「现在」。
+ */
+export function closedHour(): Date {
+  const d = new Date();
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() - 1);
+  return d;
+}
+
+/** 已结算小时所在那天的 00:00；跨零点时自动退到昨天，避免区间起点跑到终点后面 */
+function anchorDayStart(): Date {
+  const c = closedHour();
+  return new Date(c.getFullYear(), c.getMonth(), c.getDate());
+}
+
+/** 快捷区间的起点：0 表示「当天 00:00」（以已结算小时所在那天为准） */
+export function usageQuickStart(hours: number): string {
+  if (hours <= 0) return fmt(anchorDayStart());
+  return fmt(new Date(closedHour().getTime() - hours * 3600000));
+}
+
+/** 小时用量页面的区间终点：一律取最后一个已结算整点 */
+export function closedHourText(): string {
+  return fmt(closedHour());
+}
+
 export function useEnergyUsage(energy: UsageEnergy) {
   const meta = META[energy];
 
-  const range = ref<[string, string]>([fmt(new Date(new Date().setHours(0, 0, 0, 0))), fmt(new Date())]);
+  const range = ref<[string, string]>([usageQuickStart(0), closedHourText()]);
   const granularity = ref<UsageGranularity>('hour');
   /** 空串 = 车间合计；否则为产线编码（只有电支持按线） */
   const lineCode = ref('');
@@ -175,6 +211,12 @@ export function usageQuickSpans(): { label: string; hours: number; gran: UsageGr
   ];
 }
 
+/**
+ * 以下两个仅供「仪表读数查询」使用 —— 它查的是 `energy_raw` 原始累计读数，
+ * 任何时刻都有最新值，所以区间终点取「现在」是对的。
+ * ⚠ 小时用量的页面（用量查询 / 电 / 水 / 汽）不要用它们，改用 `usageQuickStart` +
+ *   `closedHourText`，否则会多出一个恒为空的当前小时（见 closedHour 的说明）。
+ */
 export function hourAgo(hours: number): string {
   const d = new Date();
   d.setHours(d.getHours() - hours);

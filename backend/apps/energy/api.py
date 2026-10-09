@@ -48,6 +48,8 @@ from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
 
+from eep import conf
+
 from .collectors import build_collector
 from .models import (
     EnergyYearly,
@@ -213,8 +215,51 @@ def _workshop_line() -> ProductionLine:
 PROTOCOL = {EnergyGateway.KIND_MODBUS: "Modbus RTU over TCP", EnergyGateway.KIND_HTTP: "HTTP API"}
 
 
+def gateway_offline_after() -> timedelta:
+    """网关心跳多久没动就算离线。
+
+    ⚠ 这个阈值**必须跟采集节奏走**，不能写死 5 分钟。
+      现场节奏是 `hourly`（每小时整点后 offset 秒采一次），心跳间隔天然就是一个小时；
+      用 5 分钟判定会让网关在约 92% 的时间里显示「离线」——
+      实测：最后心跳 10-09 15:04，当时 15:20，计量点位全部在线，
+      但网关列表一片「离线」（v1.4.4 修复）。
+
+    取「一个采样周期 + 宽限」：
+      · hourly → 90 分钟（60 分钟周期 + 30 分钟宽限，容忍计划任务晚点/重试）
+      · minute → max(5 分钟, 3 × interval_seconds)
+    需要收紧/放宽时配 `collect.gateway_offline_minutes`（分钟，优先级最高）。
+    """
+    override = conf.get("collect.gateway_offline_minutes")
+    if override:
+        return timedelta(minutes=max(1, int(override)))
+    if slots.cadence() == slots.CADENCE_HOURLY:
+        return timedelta(minutes=90)
+    return timedelta(seconds=max(300, slots.minute_interval_seconds() * 3))
+
+
+def _gateway_last_heartbeat() -> dict:
+    """用采集日志的最近一次开始时间当作网关心跳。"""
+    return {
+        row["gateway_id"]: row["last"]
+        for row in EnergyCollectLog.objects.exclude(gateway=None)
+        .values("gateway_id")
+        .annotate(last=Max("started_at"))
+    }
+
+
+def _online_gateway_ids(now: datetime | None = None) -> set[int]:
+    """心脏还在跳的网关 id 集合（与列表页 `gateway_json` 同一套判定）。
+
+    ⚠ 曾经这里只判「有过任意一条采集日志」（即永远在线），而列表页判 5 分钟 ——
+      同一个「在线网关」在数据中心与网关页给出两个答案。统一到本函数（v1.4.4）。
+    """
+    now = now or datetime.now()
+    limit = gateway_offline_after()
+    return {gid for gid, ts in _gateway_last_heartbeat().items() if ts and (now - ts) < limit}
+
+
 def gateway_json(g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None) -> dict:
-    online = bool(last_heartbeat and (datetime.now() - last_heartbeat) < timedelta(minutes=5))
+    online = bool(last_heartbeat and (datetime.now() - last_heartbeat) < gateway_offline_after())
     return {
         "id": g.id,
         "code": g.code,
@@ -339,16 +384,6 @@ def _meter_today_usage() -> dict:
         for row in EnergyHourly.objects.filter(stat_date=today, quality__in=EnergyHourly.TRUSTED)
         .values("meter_id")
         .annotate(total=Sum("consumption"), hours=Count("id"))
-    }
-
-
-def _gateway_last_heartbeat() -> dict:
-    """用采集日志的最近一次开始时间当作网关心跳。"""
-    return {
-        row["gateway_id"]: row["last"]
-        for row in EnergyCollectLog.objects.exclude(gateway=None)
-        .values("gateway_id")
-        .annotate(last=Max("started_at"))
     }
 
 
@@ -877,6 +912,7 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
     usage = _meter_today_usage()
     expect = EnergyMeter.objects.filter(enabled=True, energy_type__type_code=EnergyType.ELECTRIC).count() * (now.hour + 1)
     received = sum(a.get("hours", 0) for a in usage.values())
+    online_ids = _online_gateway_ids(now)
 
     monthly12 = [
         {"label": p["label"], "output": p["output"], "kwh": p["kwh"] or 0, "unitKwh": p["unitKwh"]}
@@ -890,11 +926,12 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
                 "todayKwh": ws["today"]["kwh"] or 0,
                 "unitKwh": ws["today"]["unitKwh"],
                 "activeAlarms": len([a for a in ws["alerts"] if a["level"] == "err"]),
+                # 与 /api/admin/gateways 列表页**同一套判定**（心跳超时阈值按采集节奏取）
                 "onlineGateways": len(
                     [
                         g
                         for g in EnergyGateway.objects.filter(enabled=True)
-                        if (EnergyCollectLog.objects.filter(gateway=g).order_by("-started_at").first())
+                        if g.id in online_ids
                     ]
                 ),
                 "totalGateways": EnergyGateway.objects.filter(enabled=True).count(),
