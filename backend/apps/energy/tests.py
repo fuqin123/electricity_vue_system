@@ -1226,9 +1226,28 @@ class GatewayHeartbeatTests(TestCase):
         )
 
     def test_阈值按hourly节奏自适应(self):
-        """未配置时：hourly → 90 分钟（一个采集周期 + 30 分钟宽限）。"""
-        with mock.patch.object(conf, "get", return_value=None):
-            self.assertEqual(api.gateway_offline_after(), timedelta(minutes=90))
+        """未配置时：hourly → (整点偏移 + 60 分钟) × 1.5，保底 90 分钟。
+
+        v1.5.1 起真实一跳按 offset 算：平均 60 分钟、最坏 61 分钟（3660s），
+        阈值必须**大于**最坏一跳，否则正经跑着的网关会周期性闪「离线」。
+        """
+        def fake_get(key, default=None):
+            return 60 if key == "collect.hourly_offset_seconds" else default
+
+        with mock.patch.object(conf, "get", side_effect=fake_get):
+            limit = api.gateway_offline_after()
+        # (60s 偏移 + 3600s) / 60 = 61 分钟 → ×1.5 = 91.5 分钟（int 截断后 91 分钟）
+        self.assertEqual(limit, timedelta(minutes=91))
+        self.assertGreater(limit.total_seconds(), 3600 + 60, "阈值必须大于最坏一跳")
+
+    def test_偏移变大时阈值跟着放宽(self):
+        """offset 调大 → 一跳变长 → 阈值也要跟着放宽，不然又会误判离线。"""
+        def fake_get(key, default=None):
+            return 600 if key == "collect.hourly_offset_seconds" else default
+
+        with mock.patch.object(conf, "get", side_effect=fake_get):
+            limit = api.gateway_offline_after()
+        self.assertGreater(limit.total_seconds(), 3600 + 600)
 
     def test_阈值可被配置覆盖(self):
         def fake_get(key, default=None):
@@ -1279,6 +1298,120 @@ class GatewayHeartbeatTests(TestCase):
             fail_count=0,
         )
         self.assertNotIn(self.gw.id, api._online_gateway_ids())
+
+
+class NewGatewayOnlineTests(TestCase):
+    """v1.5.1（B-537）：刚配好的网关「测试连接成功」却一直显示离线。
+
+    现场现象：新增「一期弱电房274-D」（`GW-LORA-1`），点「测试连接」逐点读取成功，
+    但网关列表的状态仍是「离线」、最后心跳空白，最长要等约一小时才变过来 ——
+    现场自然会反复怀疑设备 / 配置。
+
+    根因：网关在线只看**采集日志**（`EnergyCollectLog`），而那是**整轮**采集才写的，
+    节奏是 hourly。新网关在下一轮整点采集之前没有任何日志 → 判离线。
+    可这一时刻点位试采分明是成功的（报文都收回来了），网关**确实**是通的。
+
+    修复：把「点位读取成功」也当成网关级心跳，两个信号取并集。
+
+    ⚠ 但**不能**拿 `last_at` 当心跳 —— 试采**失败**也会写它
+      （`admin_meter_test` 的失败分支），那等于「一次失败反而证明网关在线」。
+      所以只认 `last_ok=True` 的 `last_at`。下面 `test_试采失败不证明在线` 锁住这条。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A9", line_name="九线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-NEW-ONLINE",
+            name="新装网关",
+            kind=EnergyGateway.KIND_MODBUS,
+            host="10.0.0.9",
+            port=8888,
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-NEW-01",
+            name="新装表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=cls.line,
+            gateway=cls.gw,
+            slave=11,
+            register=0,
+            enabled=True,
+        )
+
+    def _status(self):
+        hb = api._gateway_heartbeats().get(self.gw.id)
+        return api.gateway_json(self.gw, point_count=1, last_heartbeat=hb)["status"]
+
+    def _mark_ok(self, at=None):
+        self.meter.last_at = at or datetime.now()
+        self.meter.last_ok = True
+        self.meter.last_error = ""
+        self.meter.save(update_fields=["last_at", "last_ok", "last_error"])
+
+    # ── 核心：新网关的在线判定 ─────────────────────────────
+    def test_新网关无任何信号时算离线(self):
+        """刚建好、还没试采过 → 没有证据说它通，只能显示离线。"""
+        self.assertEqual(self._status(), "offline")
+
+    def test_试采成功后立即可见在线而不必等整轮采集(self):
+        """这条就是现场反馈的场景：没有任何采集日志，但点位试采成功。"""
+        self.assertEqual(EnergyCollectLog.objects.filter(gateway=self.gw).count(), 0)
+        self._mark_ok()
+        self.assertEqual(self._status(), "online")
+
+    def test_在线集合也包含这类新网关(self):
+        """数据中心那张「在线网关」卡片必须与列表页一致（不能一个在线一个离线）。"""
+        self._mark_ok()
+        self.assertIn(self.gw.id, api._online_gateway_ids())
+
+    def test_试采失败不证明在线(self):
+        """试采失败也会写 `last_at`，不能因此判在线 —— 那是把「读不到」当成「通」。
+
+        正是这条区分了「点位级心跳必须带 `last_ok` 条件」，而不是直接取 `Max(last_at)`。
+        """
+        self.meter.last_at = datetime.now()
+        self.meter.last_ok = False
+        self.meter.last_error = "无响应"
+        self.meter.save(update_fields=["last_at", "last_ok", "last_error"])
+        self.assertEqual(self._status(), "offline")
+        self.assertNotIn(self.gw.id, api._online_gateway_ids())
+
+    def test_停用点位不算数(self):
+        """停用点位不参与采集，它的历史成功不该长期把网关「撑」成在线。"""
+        self._mark_ok()
+        self.assertEqual(self._status(), "online")
+        self.meter.enabled = False
+        self.meter.save(update_fields=["enabled"])
+        self.assertEqual(self._status(), "offline")
+
+    def test_上次成功超过阈值仍算离线(self):
+        """并集只解决「谁更新」，不放松时限：太久没成功照样离线。"""
+        self._mark_ok(at=datetime.now() - timedelta(hours=3))
+        self.assertEqual(self._status(), "offline")
+
+    def test_采集日志比点位更新时取采集日志(self):
+        """两个信号取较新者，任一方新鲜都算在线。"""
+        self._mark_ok(at=datetime.now() - timedelta(hours=3))  # 点位陈旧
+        EnergyCollectLog.objects.create(
+            gateway=self.gw,
+            started_at=datetime.now() - timedelta(minutes=5),  # 采集日志新鲜
+            total=1,
+            ok_count=1,
+            fail_count=0,
+        )
+        self.assertEqual(self._status(), "online")
+
+    def test_网关列表接口直接反映在线(self):
+        """走真实接口：这是现场点开页面看到的那条数据。"""
+        self._mark_ok()
+        res = Client().get("/api/admin/gateways")
+        self.assertEqual(res.status_code, 200)
+        row = next(r for r in res.json() if r["code"] == "GW-NEW-ONLINE")
+        self.assertEqual(row["status"], "online")
+        self.assertTrue(row["lastHeartbeat"], "心跳不该是空白")
+
 
 
 class ScriptedCollector(BaseCollector):

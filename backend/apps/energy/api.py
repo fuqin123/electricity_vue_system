@@ -229,7 +229,7 @@ def _workshop_line() -> ProductionLine:
 PROTOCOL = {EnergyGateway.KIND_MODBUS: "Modbus RTU over TCP", EnergyGateway.KIND_HTTP: "HTTP API"}
 
 
-def gateway_offline_after() -> timedelta:
+def gateway_offline_after(interval_seconds: int | None = None) -> timedelta:
     """网关心跳多久没动就算离线。
 
     ⚠ 这个阈值**必须跟采集节奏走**，不能写死 5 分钟。
@@ -239,16 +239,23 @@ def gateway_offline_after() -> timedelta:
       但网关列表一片「离线」（v1.4.4 修复）。
 
     取「一个采样周期 + 宽限」：
-      · hourly → 90 分钟（60 分钟周期 + 30 分钟宽限，容忍计划任务晚点/重试）
+      · hourly → (整点偏移 + 60 分钟) × 1.5、保底 90 分钟
+        （真实一跳最长是「上轮刚过 offset」到「下轮 offset 后不久」≈ offset + 60min；
+          再给 1.5 倍宽限，容忍计划任务晚点/重试）
       · minute → max(5 分钟, 3 × interval_seconds)
     需要收紧/放宽时配 `collect.gateway_offline_minutes`（分钟，优先级最高）。
+
+    `interval_seconds` 传单台网关自己的采样周期；不传时按全局节奏算
+    （v1.5.1 起网关可逐台配置周期，用全局值判会让「慢网关」被误判离线）。
     """
     override = conf.get("collect.gateway_offline_minutes")
     if override:
         return timedelta(minutes=max(1, int(override)))
     if slots.cadence() == slots.CADENCE_HOURLY:
-        return timedelta(minutes=90)
-    return timedelta(seconds=max(300, slots.minute_interval_seconds() * 3))
+        offset = int(conf.get("collect.hourly_offset_seconds", 60) or 0)
+        return timedelta(minutes=max(90, int((offset + 3600) / 60 * 1.5)))
+    seconds = interval_seconds or slots.minute_interval_seconds()
+    return timedelta(seconds=max(300, seconds * 3))
 
 
 def _gateway_last_heartbeat() -> dict:
@@ -261,6 +268,41 @@ def _gateway_last_heartbeat() -> dict:
     }
 
 
+def _gateway_meter_heartbeat() -> dict:
+    """**点位级**心跳：该网关下最近一次「读取成功」的时刻。
+
+    ⚠ 为什么网关在线不能只看采集日志（B-537）：
+      采集日志是**整轮**采集才写的，节奏是 hourly —— 一个刚在后台配好、
+      点「测试连接 / 试采」验证通过的新网关，要等下一轮整点采集才会有日志，
+      在此之前网关页一律显示「离线」（最长约 60 分钟）。
+      现场看到的就是「测试连接明明成功了，状态还是离线」，难免反复怀疑设备。
+
+      而点位试采成功会写 `last_ok=True` + `last_at` —— 这一刻网关**确实**是通的
+      （报文都收回来了），没有理由是「离线」。两个信号取**并集**即可。
+
+    只认 `last_ok=True` 的 `last_at`，不能直接拿 `last_at` 当心跳：
+      试采**失败**也会写 `last_at`（见 `admin_meter_test`），拿它当心跳等于
+      「一次失败反而证明网关在线」。`last_at` 只在采集成功那一支被写成设备时刻，
+      但为了不看字段语义的变化，这里仍显式要求 `last_ok=True` 兜一层。
+    """
+    return {
+        row["gateway_id"]: row["last"]
+        for row in EnergyMeter.objects.filter(last_ok=True, enabled=True)
+        .exclude(last_at=None)
+        .values("gateway_id")
+        .annotate(last=Max("last_at"))
+    }
+
+
+def _gateway_heartbeats() -> dict:
+    """网关级 + 点位级心跳取较新者（见 `_gateway_meter_heartbeat` 的说明）。"""
+    beats = _gateway_last_heartbeat()
+    for gid, ts in _gateway_meter_heartbeat().items():
+        if ts and (gid not in beats or beats[gid] is None or ts > beats[gid]):
+            beats[gid] = ts
+    return beats
+
+
 def _online_gateway_ids(now: datetime | None = None) -> set[int]:
     """心脏还在跳的网关 id 集合（与列表页 `gateway_json` 同一套判定）。
 
@@ -269,11 +311,12 @@ def _online_gateway_ids(now: datetime | None = None) -> set[int]:
     """
     now = now or datetime.now()
     limit = gateway_offline_after()
-    return {gid for gid, ts in _gateway_last_heartbeat().items() if ts and (now - ts) < limit}
+    return {gid for gid, ts in _gateway_heartbeats().items() if ts and (now - ts) < limit}
 
 
 def gateway_json(g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None) -> dict:
-    online = bool(last_heartbeat and (datetime.now() - last_heartbeat) < gateway_offline_after())
+    limit = gateway_offline_after(getattr(g, "interval_seconds", None))
+    online = bool(last_heartbeat and (datetime.now() - last_heartbeat) < limit)
     return {
         "id": g.id,
         "code": g.code,
@@ -1116,7 +1159,7 @@ def assert_alias_covers_frontend() -> list[str]:
 @csrf_exempt
 def admin_gateways(request: HttpRequest) -> JsonResponse:
     if request.method == "GET":
-        hb = _gateway_last_heartbeat()
+        hb = _gateway_heartbeats()
         counts = {
             row["gateway_id"]: row["n"]
             for row in EnergyMeter.objects.values("gateway_id").annotate(n=Count("id"))
