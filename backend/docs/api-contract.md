@@ -71,6 +71,33 @@
 
 ---
 
+## 〇·补六、v1.5.1 字段命名约定 ★ 改字段名必读
+
+**接口层对「认不出来的字段」是静默丢弃的**（`_apply()` 拿字段名在模型白名单里找不到就跳过），
+不报错、不告警、照样返回 200/201。现场只能看到「那一格是空的」，或者更糟 ——
+字段被**默认值顶掉**（B-535：网关 `ip` 丢失；同源的 `factor` 丢失使倍率恒为 1）。
+
+因此下面这两条别名表是**必须与前端契约逐字对齐**的，改字段名要三处一起改
+（前端提交名 / 别名表 / 模型字段名）：
+
+| 前端提交（`types.ts`） | 模型字段 | 说明 |
+| :--- | :--- | :--- |
+| 网关 `ip` | `host` | ⚠ 名字不同，**必须走别名**。漏了它 IP 写不进去 |
+| 网关 `baseUrl` / `timeoutMs` / `intervalSeconds` | `base_url` / `timeout_ms` / `interval_seconds` | camelCase → snake_case |
+| 计量点 `factor` | `scale` | ⚠ 名字不同，**必须走别名**。漏了它倍率被默认值 1 顶掉 |
+| 计量点 `funcCode` / `wordOrder` / `urlPath` / `valuePath` / `timePath` / `maxHourly` / `assetNo` / `installDate` | 对应 snake_case | 同上 |
+| 计量点 `kind` / `scope` / `role` / `lineCode` / `gatewayId` | 由 `_save_meter` 直接读 `data` | 不走 `_apply`，但**改名字要同时改 `_save_meter`** |
+
+**机器可查的兜底**：`api.assert_alias_covers_frontend()` 会把前端契约里所有字段
+逐个对一遍别名表，`AppConfig.ready()` 在应用启动时调用 —— 有漂移就直接写进启动日志。
+新增前端字段后，`FRONTEND_GATEWAY_KEYS` / `FRONTEND_METER_KEYS` 也要同步补上。
+
+**可空字段的空值**：表单没填时前端给的是空串 `""`，跨层必须转成 `NULL` 再入库
+（`DateField` 遇到 `""` 会抛 `ValidationError`；数值字段会被当成非法值）。
+接口层对这类校验失败一律返回 **400 + 逐字段原因**，不漏成 500（B-536）。
+
+---
+
 ## 〇·补五、v1.5.0 新增接口：读取当前值（**只读，不落库**）
 
 ### `POST /api/admin/meters/{id}/current` ★ 读取某个计量点的当前值

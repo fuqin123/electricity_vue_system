@@ -42,6 +42,7 @@ from datetime import date as date_cls
 from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import Count, Max, Sum
 from django.http import HttpRequest, JsonResponse
@@ -179,6 +180,18 @@ def _dec(raw, default=None):
         return Decimal(str(raw))
     except (InvalidOperation, ValueError):
         return default
+
+
+def _flatten_validation(exc: DjangoValidationError) -> dict[str, str]:
+    """把 Django 的 ValidationError 拍平成 {字段: 说明}。
+
+    `exc.message_dict` 只在错误是「按字段报的」时才有；纯字符串错误（如
+    `ValidationError("xxx")`）没有它，直接访问会抛 AttributeError —— 那就把
+    一个 400 变成 500 了。这里两条路径都兜住。
+    """
+    if hasattr(exc, "message_dict"):
+        return {k: "；".join(v) for k, v in exc.message_dict.items()}
+    return {"__all__": "；".join(exc.messages)}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1032,7 +1045,16 @@ def admin_collect_logs(request: HttpRequest) -> JsonResponse:
 
 GATEWAY_FIELDS = ("code", "name", "kind", "host", "port", "base_url", "timeout_ms", "interval_seconds", "enabled", "remark")
 #: 前端字段名 → 模型字段名（前端统一 camelCase）
+#:
+#: ⚠ **漏登记一个别名不会报错，只会静默丢字段。**（v1.5.1 修的 B-535）
+#:   前端 `GatewayView.vue` 提交的是 `ip`（因为它展示的那一列就叫「地址 IP」），
+#:   而模型字段名是 `host`；`_apply()` 拿 `ip` 在 `GATEWAY_FIELDS` 里找不到，
+#:   直接跳过 —— 于是新增网关时 **IP 写不进去、端口却正常**（端口前后端同名）。
+#:   现场表现是「IP 那一格永远是空的」，换谁都以为是设备没填对，
+#:   实际上是接口把值扔了。改字段名时务必同时改这里，`_assert_alias_covers_frontend()`
+#:   会在应用启动时把这类漂移喊出来。
 GATEWAY_ALIAS = {
+    "ip": "host",
     "baseUrl": "base_url",
     "timeoutMs": "timeout_ms",
     "intervalSeconds": "interval_seconds",
@@ -1046,6 +1068,48 @@ def _apply(data: dict, allowed: tuple, alias: dict) -> dict:
         if field in allowed:
             out[field] = v
     return out
+
+
+#: 前端契约里会往网关 / 计量点提交的全部字段名（camelCase 与同名混用）。
+#: 与 `frontend/packages/shared/src/types.ts` 的 Gateway / MeterPoint 对齐。
+#: ⚠ 前端加字段时这里也要加 —— 下面的 `assert_alias_covers_frontend()` 靠它兜底。
+FRONTEND_GATEWAY_KEYS = (
+    "code", "name", "kind", "ip", "port", "baseUrl", "timeoutMs", "intervalSeconds",
+    "enabled", "remark",
+)
+FRONTEND_METER_KEYS = (
+    "code", "name", "kind", "scope", "role", "lineCode", "gatewayId",
+    "slave", "register", "registers", "funcCode", "wordOrder", "urlPath", "params",
+    "valuePath", "timePath", "factor", "unit", "maxHourly", "enabled", "remark",
+    "assetNo", "installDate",
+)
+
+
+def assert_alias_covers_frontend() -> list[str]:
+    """自检：前端会提交的字段，是否都能落到某个模型字段上。
+
+    ⚠ 为什么需要它：`_apply()` 对**认不出来的字段是静默跳过的**，不报错、不告警 ——
+      前端写 `ip`、模型叫 `host`，漏登记别名就会把值整个扔进垃圾桶，
+      而响应照样 201、端口因为前后端同名反而正常，现场只看到「IP 那格是空的」（B-535）。
+      这类「字段名漂移」靠人眼 review 挡不住，因此在这里显式对一遍。
+
+    返回认不出的字段名列表（空列表 = 契约完好）。应用启动时调用一次，把漂移喊进日志。
+    """
+    missing: list[str] = []
+    # 网关：别名 + 同名 都能落到 GATEWAY_FIELDS 才算登记完整
+    for key in FRONTEND_GATEWAY_KEYS:
+        mapped = GATEWAY_ALIAS.get(key, key)
+        if key != "kind" and mapped not in GATEWAY_FIELDS:
+            missing.append(f"gateway.{key} → {mapped}")
+    # 计量点：同上。scope/role 等由 _save_meter 直接读 data，不走 _apply，故豁免。
+    DIRECT_READ = {"kind", "gatewayId", "lineCode"}
+    for key in FRONTEND_METER_KEYS:
+        if key in DIRECT_READ:
+            continue
+        mapped = METER_ALIAS.get(key, key)
+        if mapped not in METER_FIELDS:
+            missing.append(f"meter.{key} → {mapped}")
+    return missing
 
 
 @require_http_methods(["GET", "POST"])
@@ -1144,6 +1208,10 @@ METER_FIELDS = (
     "max_hourly", "enabled", "remark", "asset_no", "install_date",
 )
 METER_ALIAS = {
+    # ⚠ 前端契约里叫 factor（那一列的表头就是「倍率」），模型字段叫 scale。
+    #   漏了这一行，新增 / 编辑点位时**倍率会被静默改成默认值 1**（与 B-535 同源）。
+    #   这个比 IP 更隐蔽：界面照常保存成功，只是电表读数从此差一个量级。
+    "factor": "scale",
     "funcCode": "func_code",
     "wordOrder": "word_order",
     "urlPath": "url_path",
@@ -1260,7 +1328,7 @@ def _save_meter(m: EnergyMeter | None, data: dict) -> EnergyMeter:
         m.line = _workshop_line()
 
     # 校准数值字段：前端可能传字符串
-    for f in ("slave", "register", "registers", "func_code", "port"):
+    for f in ("slave", "register", "registers", "func_code"):
         if hasattr(m, f):
             v = getattr(m, f)
             if isinstance(v, str):
@@ -1270,6 +1338,17 @@ def _save_meter(m: EnergyMeter | None, data: dict) -> EnergyMeter:
         m.scale = _dec(m.scale, Decimal("1"))
     if isinstance(m.max_hourly, str):
         m.max_hourly = _dec(m.max_hourly)
+
+    # 可空日期：表单里没填时给的是空串，而 Django 的 DateField
+    # 「什么都接受就是不接受 ""」—— 空串会直接抛 ValidationError（HTTP 500）。
+    # 前端新增点位时 `installDate` 默认就是 ""，所以**任何**点位都会撞上，
+    # 与 scope/role 无关；现场只看到「加车间总表/辅机报 500」。
+    # 空串的语义是「没填」→ 归一为 None（可空字段），而不是一个非法日期。
+    if m.install_date is not None and not isinstance(m.install_date, date_cls):
+        raw = str(m.install_date).strip()
+        m.install_date = parse_date(raw) if raw else None
+        if raw and m.install_date is None:
+            raise ValueError(f"安装日期格式不对：{raw!r}，应为 YYYY-MM-DD")
 
     # 采集方式与必填项校验：串口类必须有从站号与寄存器，否则采不了
     if m.gateway.kind == EnergyGateway.KIND_MODBUS:
@@ -1281,7 +1360,13 @@ def _save_meter(m: EnergyMeter | None, data: dict) -> EnergyMeter:
         raise ValueError("HTTP API 类型的点位必须填接口路径")
 
     m.source = EnergyMeter.SOURCE_ADMIN  # 后台改过 → 归后台维护
-    m.save()
+    try:
+        m.save()
+    except DjangoValidationError as exc:
+        # 模型层校验失败（非法日期 / 超长 / 越界）不能变成 500：
+        # 前端把它当网络故障，现场拿不到「到底哪一格填错了」。
+        messages = "；".join(f"{k}: {v}" for k, v in _flatten_validation(exc).items())
+        raise ValueError(f"字段校验未通过 —— {messages}") from exc
     return m
 
 

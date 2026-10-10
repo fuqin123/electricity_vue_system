@@ -1522,3 +1522,231 @@ class MeterCurrentTests(TestCase):
         self.assertTrue(result["items"][0]["ok"])
         self.assertEqual(result["items"][0]["attempts"], 2)
         self.assertEqual(self.captured["timeout_ms"], 900)
+
+
+class GatewayFieldContractTests(TestCase):
+    """v1.5.1（B-535）：网关字段名前后端不一致，IP 被**静默丢弃**。
+
+    现场现象：后台新增串口服务器网关，**端口写进去了、IP 那一格永远是空的**。
+    根因是前端提交 `ip`（那一列就叫「IP 地址」），而模型字段叫 `host`，
+    别名表 `GATEWAY_ALIAS` 漏了 `ip → host`；`_apply()` 对认不出的字段
+    **不报错、不告警，直接跳过** —— 接口照样返回 201，所以现场只会以为
+    「是不是我 IP 填错了」，而实际上值在接口层就被扔了。
+
+    这组测试锁住两件事：
+      ① `ip` 必须能落进 `host`（写入路径）；
+      ② 前端能提交的每个字段都必须有去处（防止下一次字段名漂移再静默丢）。
+    """
+
+    def setUp(self):
+        self.client = Client()
+
+    def post(self, payload):
+        return self.client.post(
+            "/api/admin/gateways", data=json.dumps(payload), content_type="application/json"
+        )
+
+    def base_payload(self, **over):
+        payload = {
+            "code": "GW-CONTRACT",
+            "name": "契约测试网关",
+            "kind": EnergyGateway.KIND_MODBUS,
+            "ip": "10.9.9.9",
+            "port": 8899,
+            "baseUrl": "",
+            "timeoutMs": 1500,
+            "intervalSeconds": 60,
+            "enabled": True,
+            "remark": "",
+        }
+        payload.update(over)
+        return payload
+
+    # ── 写入路径 ───────────────────────────────────────────
+    def test_新增网关的ip能落库(self):
+        """这条断言直接对应现场现象：曾经 ip 进库后是空串。"""
+        res = self.post(self.base_payload())
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["ip"], "10.9.9.9")
+        self.assertEqual(EnergyGateway.objects.get(code="GW-CONTRACT").host, "10.9.9.9")
+
+    def test_新增网关的endpoint由ip与端口拼出(self):
+        """端点是日志与「测试连接」用的地址，IP 丢了它就成了「:8899」。"""
+        res = self.post(self.base_payload())
+        self.assertEqual(res.json()["endpoint"], "10.9.9.9:8899")
+
+    def test_修改网关时ip同样生效(self):
+        gw = EnergyGateway.objects.create(
+            code="GW-CONTRACT", name="契约测试网关", kind=EnergyGateway.KIND_MODBUS,
+            host="1.1.1.1", port=1,
+        )
+        res = self.client.put(
+            f"/api/admin/gateways/{gw.id}",
+            data=json.dumps(self.base_payload(ip="2.2.2.2", port=2222)),
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 200)
+        gw.refresh_from_db()
+        self.assertEqual(gw.host, "2.2.2.2")
+        self.assertEqual(gw.port, 2222)
+
+    def test_HTTP类型网关的接口根地址不受影响(self):
+        """顺带确认 baseUrl 这条别名没被 ip 的修复带坏。"""
+        res = self.post(
+            self.base_payload(
+                kind=EnergyGateway.KIND_HTTP, ip="", baseUrl="http://47.111.74.100:8980"
+            )
+        )
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["baseUrl"], "http://47.111.74.100:8980")
+
+    # ── 契约自检 ───────────────────────────────────────────
+    def test_前端字段都有去处(self):
+        """前端能提交的字段，必须每一个都能落到模型字段上（空列表 = 契约完好）。"""
+        self.assertEqual(api.assert_alias_covers_frontend(), [])
+
+    def test_自检能抓出漏登记的别名(self):
+        """自检本身要有效：故意摘掉 ip 的映射，必须能报出来。
+
+        没有这条，「自检永远返回空列表」和「契约真的完好」看起来一模一样。
+        """
+        broken = {k: v for k, v in api.GATEWAY_ALIAS.items() if k != "ip"}
+        with mock.patch.object(api, "GATEWAY_ALIAS", broken):
+            missing = api.assert_alias_covers_frontend()
+        self.assertIn("gateway.ip → ip", missing)
+
+
+class MeterSaveValidationTests(TestCase):
+    """v1.5.1（B-536）：新增计量点带空 `installDate` 直接 HTTP 500。
+
+    现场现象：新增「车间总表」「辅机」报 500。看起来像是这两类点位的问题，
+    其实是**所有**点位 —— 前端表单的 `installDate` 默认就是空串 `""`，
+    而 `_save_meter()` 把它原样塞给 `DateField`，Django 对空串抛 ValidationError
+    （它只认 `None` 或不带这个键），未被捕获 → 500。
+
+    与 scope / role 完全无关：只要表单带着 `installDate` 来就必炸，
+    所以现场会觉得「加车间总表就报错」，而加电表时可能没细看表单。
+    """
+
+    def setUp(self):
+        self.client = Client()
+        self.line = ProductionLine.objects.create(line_code="A8", line_name="八线")
+        self.gw = EnergyGateway.objects.create(
+            code="GW-VAL", name="校验测试网关", kind=EnergyGateway.KIND_MODBUS,
+            host="127.0.0.1", port=1,
+        )
+
+    def post(self, payload):
+        return self.client.post(
+            "/api/admin/meters", data=json.dumps(payload), content_type="application/json"
+        )
+
+    def base_payload(self, **over):
+        payload = {
+            "code": "M-VAL-01",
+            "name": "校验测试点位",
+            "kind": EnergyType.ELECTRIC.lower() if False else "elec",
+            "scope": "line",
+            "role": "line",
+            "lineCode": "A8",
+            "gatewayId": self.gw.id,
+            "slave": 1,
+            "register": 1000,
+            "registers": 2,
+            "factor": 0.1,
+            "unit": "kWh",
+            "installDate": "",
+        }
+        payload.update(over)
+        return payload
+
+    # ── 现场两条报错路径 ────────────────────────────────────
+    def test_车间总表带空安装日期能新增(self):
+        """现场报错场景①：车间总表（scope=workshop, role=total）。"""
+        res = self.post(
+            self.base_payload(code="W-VAL-01", name="校验车间总表", kind="water",
+                              scope="workshop", role="total", lineCode="", unit="t")
+        )
+        self.assertEqual(res.status_code, 201, res.content.decode("utf-8", "replace")[:300])
+        meter = EnergyMeter.objects.get(code="W-VAL-01")
+        self.assertIsNone(meter.install_date)
+        self.assertEqual(meter.scope, EnergyMeter.SCOPE_WORKSHOP)
+        # 车间总表挂车间哨兵行，不是留空
+        self.assertEqual(meter.line.line_code, ProductionLine.WORKSHOP_CODE)
+
+    def test_辅机带空安装日期能新增(self):
+        """现场报错场景②：辅机（role=aux）。"""
+        res = self.post(self.base_payload(code="E-VAL-AUX", name="校验辅机", role="aux"))
+        self.assertEqual(res.status_code, 201, res.content.decode("utf-8", "replace")[:300])
+        self.assertIsNone(EnergyMeter.objects.get(code="E-VAL-AUX").install_date)
+
+    def test_空串与不带该键等价(self):
+        """「没填」的两种表达（空串 / 不传）必须落成同一个结果：NULL。"""
+        no_key = self.base_payload(code="M-VAL-A", name="不传日期")
+        no_key.pop("installDate")
+        self.assertEqual(self.post(no_key).status_code, 201)
+
+        empty = self.base_payload(code="M-VAL-B", name="空串日期", installDate="")
+        self.assertEqual(self.post(empty).status_code, 201)
+
+        self.assertEqual(
+            EnergyMeter.objects.get(code="M-VAL-A").install_date,
+            EnergyMeter.objects.get(code="M-VAL-B").install_date,
+        )
+
+    def test_合法安装日期正常落库(self):
+        res = self.post(self.base_payload(code="M-VAL-C", installDate="2026-03-15"))
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(str(EnergyMeter.objects.get(code="M-VAL-C").install_date), "2026-03-15")
+
+    # ── 错误必须是 400 带原因，不能是 500 ──────────────────
+    def test_非法安装日期返回400而不是500(self):
+        res = self.post(self.base_payload(code="M-VAL-D", installDate="2026/13/45"))
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("安装日期", res.json()["detail"])
+
+    def test_更新时也接受空安装日期(self):
+        meter = EnergyMeter.objects.create(
+            code="M-VAL-E", name="更新测试", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=self.gw,
+            slave=2, register=1000, install_date=datetime(2026, 1, 1).date(),
+        )
+        res = self.client.put(
+            f"/api/admin/meters/{meter.id}",
+            data=json.dumps(self.base_payload(code="M-VAL-E", name="更新测试", installDate="")),
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 200, res.content.decode("utf-8", "replace")[:300])
+        meter.refresh_from_db()
+        self.assertIsNone(meter.install_date)
+
+    def test_模型校验失败转成400而不是500(self):
+        """`_save_meter` 里 Django 的 ValidationError 必须被接住转成 400。
+
+        触发方式：`_save_meter` 只归一无日期的**字符串**，若调用方直接塞一个
+        非法类型的日期对象（这里用 `datetime` 冒充），`DateField.to_python()`
+        就会抛 ValidationError。这条走的是与「安装日期格式不对」不同的分支 ——
+        它在 `m.save()` 里抛出，正是原先漏成 500 的那条路。
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        meter = EnergyMeter.objects.create(
+            code="M-VAL-F", name="模型校验", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=self.gw,
+            slave=5, register=1000,
+        )
+        err = DjangoValidationError({"install_date": ["日期不合法"]})
+        with mock.patch.object(EnergyMeter, "save", side_effect=err):
+            with self.assertRaises(ValueError) as ctx:
+                api._save_meter(meter, {"name": "模型校验"})
+        self.assertIn("字段校验未通过", str(ctx.exception))
+        self.assertIn("install_date", str(ctx.exception))
+
+    def test_倍率写入正确而不是被默认值顶掉(self):
+        """v1.5.1（B-535 同源）：前端叫 `factor`、模型叫 `scale`，别名漏登记时
+        倍率会被**静默改成默认 1** —— 界面照样保存成功，读数却差一个量级。"""
+        res = self.post(self.base_payload(code="M-VAL-G", factor=0.5))
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["factor"], 0.5)
+        self.assertEqual(EnergyMeter.objects.get(code="M-VAL-G").scale, Decimal("0.5"))
+
