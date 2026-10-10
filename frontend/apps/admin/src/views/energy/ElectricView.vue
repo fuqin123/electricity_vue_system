@@ -5,10 +5,13 @@
  * ⚠ 电表为累计值（总有功电能），入库时做差分得到小时用电量；
  *   换表 / 归零 / 通讯中断会在差分后产生尖峰，采集侧必须加异常值过滤。
  *
- * v1.4.0：加**起止时间（精确到小时）+ 线别筛选**，取数改走 /api/energy/range
+ * v1.4.0：加**起止时间（精确到小时）**，取数改走 /api/energy/range
  * （与用量查询页、大屏同源）。明细表此前恒为空，见 B-519。
+ * v1.5.2：筛选从「线别」改为 **车间 → 用能类型 → 设备** 三级联动 ——
+ *   辅机 / 瓶胚 / 调配电表在接口表里没有「线别」，用旧维度根本选不出来。
  */
-import { big, energyModel, int, thresholds, type PageQuery, type PageResult } from '@eep/shared';import PageHeader from '@/components/PageHeader.vue';
+import { big, energyModel, int, thresholds, type PageQuery, type PageResult } from '@eep/shared';
+import PageHeader from '@/components/PageHeader.vue';
 import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
 import TablePage from '@/components/TablePage.vue';
@@ -19,15 +22,24 @@ import { notImplemented } from '@/utils/pending';
 const {
   range,
   granularity,
-  lineCode,
   loading,
   data,
   load,
   rows,
   totals,
   missingBuckets,
+  coverageHint,
   chartOption,
-  extraQuery
+  extraQuery,
+  tree,
+  treeLoading,
+  workshop,
+  usageType,
+  node,
+  typeOptions,
+  nodeOptions,
+  focused,
+  selectionLabel
 } = useEnergyUsage('electric');
 
 const QUICK = usageQuickSpans();
@@ -97,10 +109,55 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
           <el-radio-button value="day">日</el-radio-button>
           <el-radio-button value="month">月</el-radio-button>
         </el-radio-group>
-        <span class="query__label">线别</span>
-        <el-select v-model="lineCode" size="small" style="width: 150px" @change="load">
-          <el-option label="车间合计（全厂电表）" value="" />
-          <el-option v-for="c in ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']" :key="c" :label="`${c} 线`" :value="c" />
+        <!-- 三级联动：车间 → 用能类型 → 设备/节点（v1.5.2） -->
+        <span class="query__label">车间</span>
+        <el-select
+          v-model="workshop"
+          size="small"
+          style="width: 140px"
+          :loading="treeLoading"
+          placeholder="选择车间"
+          @change="load"
+        >
+          <el-option
+            v-for="w in tree"
+            :key="w.workshopCode"
+            :label="w.workshop"
+            :value="w.workshopCode"
+          />
+        </el-select>
+        <span class="query__label">类型</span>
+        <el-select
+          v-model="usageType"
+          size="small"
+          style="width: 150px"
+          clearable
+          placeholder="全部类型"
+          @change="load"
+        >
+          <el-option
+            v-for="t in typeOptions"
+            :key="t.usageType"
+            :label="`${t.usageType}（${t.devices.length}）`"
+            :value="t.usageType"
+          />
+        </el-select>
+        <span class="query__label">设备</span>
+        <el-select
+          v-model="node"
+          size="small"
+          style="width: 220px"
+          clearable
+          :disabled="!usageType"
+          :placeholder="usageType ? '全部设备' : '请先选类型'"
+          @change="load"
+        >
+          <el-option
+            v-for="n in nodeOptions"
+            :key="n.code"
+            :label="n.count > 1 ? `${n.name} · 整节点（${n.count} 块表）` : `${n.name} · 单表`"
+            :value="n.code"
+          />
         </el-select>
         <el-button-group>
           <el-button
@@ -114,7 +171,26 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         </el-button-group>
         <el-button type="primary" size="small" :loading="loading" @click="load">查询</el-button>
       </div>
+      <!-- 说明当前查询范围：三级下拉选完就收起来了，不写出来没人知道看的是哪几个点位 -->
+      <div class="query__hint">
+        <el-tag size="small" type="info" effect="plain">{{ selectionLabel }}</el-tag>
+        <span v-if="focused" class="query__hint-text">已按所选设备单独出数</span>
+        <span v-else class="query__hint-text">车间合计（本车间全部计量点）</span>
+        <span v-if="data?.meterCount !== undefined" class="query__hint-text">
+          · 命中 {{ data.meterCount }} 个计量点
+        </span>
+      </div>
     </el-card>
+
+    <el-alert
+      v-if="coverageHint"
+      :type="data?.coverage?.missing?.length ? 'warning' : 'info'"
+      :closable="false"
+      show-icon
+      class="mb-16"
+      title="数据覆盖"
+      :description="coverageHint"
+    />
 
     <div class="stat-grid">
       <StatCard
@@ -151,7 +227,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
     </div>
 
     <ChartPanel
-      title="区间用电趋势"
+      :title="`区间用电趋势 · ${selectionLabel}`"
       :option="chartOption"
       :height="280"
       note="缺数处断开不连线；产量未接入，故不叠单位电耗曲线"
@@ -191,6 +267,17 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
 }
 .query__label {
   font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+.query__hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.query__hint-text {
+  font-size: 12px;
   color: var(--el-text-color-secondary);
 }
 </style>

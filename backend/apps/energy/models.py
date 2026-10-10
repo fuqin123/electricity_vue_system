@@ -83,33 +83,90 @@ class EnergyType(models.Model):
 
 
 class ProductionLine(models.Model):
-    """产线（含一条「车间」哨兵行）。
+    """组织节点表 —— 由「产线 + 一条车间哨兵行」升级为**多车间树**。
 
-    ⚠ **车间哨兵行**（`line_type='workshop'`，`line_code='WORKSHOP'`）是刻意加的：
-      车间水表 / 蒸汽表是**总表，不属于任何产线**，而日/月/年汇总表要按
-      `line_id` 建唯一键。若把 `line_id` 设为可空，MySQL 的唯一索引会把多个
-      NULL 视为互不相同 —— 唯一约束对总表就**形同失效**，重复行能照样插进去。
-      有一条真实记录（而不是 NULL）才能让唯一键真正生效。
-      界面上的「产线列表」按 `line_type` 过滤，看不到它。
+    为什么升级（v1.5.2，见 `docs/车间归属与能耗分摊设计-草案v0.1.md`）：
+      原设计只有**一条**车间哨兵行（`line_code='WORKSHOP'`），够不上现场实际 ——
+      现场是「碳水车间 / 制造车间」两个车间，各带自己的产线，且车间下还有
+      「辅机 / 瓶胚 / 调配」等非产线计量单元。`seed_registry` 会把所有
+      `scope=workshop` 的仪表强行挂到唯一那条哨兵行上，多车间必然互相覆盖。
 
-    ⚠ 另一个口径：**车间电力合计没有独立总表**，它等于 6 条产线之和；
-      而车间水 / 汽用哨兵行的总表读数。两者的算法不同，别混。
+    ⚠ **哨兵行机制本身是对的，只是数量从 1 变成 N。** 它解决的是同一个问题：
+      日/月/年汇总表要按 `line_id` 建唯一键，而车间级总表不属于任何产线。
+      若把 `line_id` 设为可空，MySQL 的唯一索引会把多个 NULL 视为互不相同 ——
+      唯一约束**形同失效**，重复行能照样插进去。所以每个车间各有一条真实记录
+      （`node_type='workshop'`）来承载它的总表，唯一键处处有效。
+
+    ⚠ 分类口径（`node_type` 与 `line_type` 的分工，**不要混用**）：
+      · `line_type`  —— **兼容字段**，只区分「是不是车间级」。汇总/取数等
+        既有代码全按它分支，多车间上线时不必逐处改。
+      · `node_type`  —— **新分类字段**，三值：
+          `workshop` 车间（碳水车间 / 制造车间）—— 挂车间总表
+          `line`     产线（A1—A6）—— 挂生产线电表，参与产量与达成率
+          `aux`      辅助计量单元（辅机 / 瓶胚 / 调配）—— 挂辅机类电表，
+                     **不参与**产量与分摊分母，但属于车间合计
+      两者由 `sync_line_type()` 保持一致（`node_type='workshop' ⟺ line_type='workshop'`），
+      避免出现「line_type 说是车间、node_type 说是产线」这种自相矛盾的行。
+
+    ⚠ 车间电力口径（实测，勿再假设为推导值）：
+      现场车间级电力**有实测总表**（辅机 / 瓶胚 / 调配等），车间电力合计 =
+      本车间产线电表 + 本车间辅机类电表。旧注释里的「车间电力 = 6 条产线之和、
+      无独立总表」是辅机未接入时的临时口径，已作废。
     """
 
     TYPE_LINE = "line"
     TYPE_WORKSHOP = "workshop"
     TYPE_CHOICES = [(TYPE_LINE, "产线"), (TYPE_WORKSHOP, "车间（总表）")]
 
+    NODE_WORKSHOP = "workshop"
+    NODE_LINE = "line"
+    NODE_AUX = "aux"
+    NODE_CHOICES = [
+        (NODE_WORKSHOP, "车间"),
+        (NODE_LINE, "产线"),
+        (NODE_AUX, "辅助计量单元"),
+    ]
+
     STATUS_ON = 1
     STATUS_OFF = 0
 
     WORKSHOP_CODE = "WORKSHOP"
 
-    line_code = models.CharField("产线编码", max_length=50, unique=True)
-    line_name = models.CharField("产线名称", max_length=100)
+    #: 一期已建的两个车间节点编码（配置 `workshops` 段的 code 即此值）
+    CODE_CARB = "WS-CARB"
+    CODE_MANU = "WS-MANU"
+
+    @classmethod
+    def default_workshop(cls):
+        """默认车间节点 —— 「当前唯一实际在跑的车间」。
+
+        ⚠ v1.5.2：旧代码到处写 `ProductionLine.objects.get(line_code='WORKSHOP')`，
+          多车间改造后那条哨兵行的编码已改成 `WS-CARB`，这些调用会直接抛
+          DoesNotExist。凡是要「随便拿一个车间来用」的地方改调本方法：
+          优先碳水车间（一期唯一），不存在再退到任意一条 workshop 行。
+
+        新代码**不要**用它做业务判断 —— 多车间下线后必须显式指定车间编码。
+        """
+        ws = cls.objects.filter(node_type=cls.NODE_WORKSHOP, line_code=cls.CODE_CARB).first()
+        if ws is not None:
+            return ws
+        return cls.objects.filter(node_type=cls.NODE_WORKSHOP).order_by("sort", "line_code").first()
+
+    line_code = models.CharField("编码", max_length=50, unique=True)
+    line_name = models.CharField("名称", max_length=100)
     status = models.PositiveSmallIntegerField("状态", default=STATUS_ON, help_text="1 启用 / 0 停用")
-    line_type = models.CharField("类型", max_length=10, choices=TYPE_CHOICES, default=TYPE_LINE)
-    #: 静态台账参数：没有它算不出计划产量与达成率（不是产量数据）
+    line_type = models.CharField("类型（兼容字段）", max_length=10, choices=TYPE_CHOICES, default=TYPE_LINE)
+    node_type = models.CharField(
+        "节点类型", max_length=10, choices=NODE_CHOICES, default=NODE_LINE,
+        help_text="workshop 车间 / line 产线 / aux 辅助计量单元（辅机、瓶胚、调配）",
+    )
+    parent = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="children",
+        verbose_name="上级节点",
+        help_text="产线 / 辅助单元指向所属车间；车间节点为空",
+    )
+    #: 静态台账参数：没有它算不出计划产量与达成率（不是产量数据）。
+    #: 对 workshop / aux 节点无意义，保持 0 即可。
     rated = models.PositiveIntegerField("额定产能(瓶/小时)", default=0)
     product = models.CharField("品项", max_length=64, blank=True, default="")
     sort = models.PositiveSmallIntegerField("排序", default=0)
@@ -119,15 +176,55 @@ class ProductionLine(models.Model):
     class Meta:
         db_table = "production_line"
         ordering = ["sort", "line_code"]
-        verbose_name = "产线"
-        verbose_name_plural = "产线"
+        verbose_name = "组织节点（车间/产线/辅助单元）"
+        verbose_name_plural = "组织节点（车间/产线/辅助单元）"
 
     def __str__(self) -> str:
         return f"{self.line_code} {self.line_name}"
 
+    # ── 下面三个属性是**唯一的判定入口**，别在别处再写 node_type == '...' ──
+    # 散落的字面量比较正是 B-519/B-532 那类「漏改一处」的温床。
+
     @property
     def is_workshop(self) -> bool:
-        return self.line_type == self.TYPE_WORKSHOP
+        """车间节点（挂车间总表）。等价于旧的 `line_type == workshop`。"""
+        return self.node_type == self.NODE_WORKSHOP
+
+    @property
+    def is_line(self) -> bool:
+        """真实产线（参与产量 / 达成率 / 分摊分母）。"""
+        return self.node_type == self.NODE_LINE
+
+    @property
+    def is_aux(self) -> bool:
+        """辅助计量单元（辅机 / 瓶胚 / 调配）—— 计入车间合计，但不是产线。"""
+        return self.node_type == self.NODE_AUX
+
+    def sync_line_type(self) -> None:
+        """把 `line_type` 与 `node_type` 对齐（保存前调）。"""
+        self.line_type = (
+            self.TYPE_WORKSHOP if self.node_type == self.NODE_WORKSHOP else self.TYPE_LINE
+        )
+
+    def save(self, *args, **kwargs):
+        self.sync_line_type()
+        super().save(*args, **kwargs)
+
+    # ── 常用查询集（收敛散落的过滤条件，见本文档 §七 的影响面清单）──
+
+    @classmethod
+    def lines_qs(cls):
+        """真实产线（不含车间节点与辅助单元）。"""
+        return cls.objects.filter(node_type=cls.NODE_LINE)
+
+    @classmethod
+    def active_lines_qs(cls):
+        """启用中的真实产线 —— 大屏 / 取数的默认范围。"""
+        return cls.objects.filter(status=cls.STATUS_ON, node_type=cls.NODE_LINE)
+
+    @classmethod
+    def workshops_qs(cls):
+        return cls.objects.filter(node_type=cls.NODE_WORKSHOP)
 
 
 class EnergyGateway(models.Model):
@@ -196,6 +293,15 @@ class EnergyMeter(models.Model):
     ROLE_TOTAL = "total"
     ROLE_CHOICES = [(ROLE_LINE, "生产线"), (ROLE_AUX, "辅机"), (ROLE_TOTAL, "车间总表")]
 
+    #: 「用电类型 / 用水类型」—— 界面三级筛选的第二级（车间 → 类型 → 设备）。
+    #: 取值直接来自现场接口表（生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电 …），
+    #: 因此用**自由字符串**而不是 choices：现场还会加类型，写死枚举就得改代码。
+    #: 同类型跨能源不冲突（汽表该字段留空）。
+    USAGE_LINE = "生产线用电"
+    USAGE_AUX = "辅机用电"
+    USAGE_PREFORM = "瓶胚用电"
+    USAGE_BLEND = "调配用电"
+
     SOURCE_CONFIG = "config"
     SOURCE_ADMIN = "admin"
     SOURCE_CHOICES = [(SOURCE_CONFIG, "配置文件"), (SOURCE_ADMIN, "后台维护")]
@@ -207,9 +313,17 @@ class EnergyMeter(models.Model):
     )
     scope = models.CharField("归属层级", max_length=10, choices=SCOPE_CHOICES, default=SCOPE_LINE)
     role = models.CharField("计量角色", max_length=10, choices=ROLE_CHOICES, default=ROLE_LINE)
+    usage_type = models.CharField(
+        "用能类型", max_length=32, blank=True, default="",
+        help_text="界面二级分类，如「生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电」；汽/水表可为空",
+    )
+    device_name = models.CharField(
+        "设备名", max_length=64, blank=True, default="",
+        help_text="现场接口表里的「设备」列，如「吹瓶机 / 冰水机和水塔 / 溶糖CIP」——界面第三级",
+    )
     line = models.ForeignKey(
-        ProductionLine, on_delete=models.PROTECT, related_name="meters", verbose_name="所属产线",
-        help_text="车间水/汽总表挂「车间哨兵行」（line_type=workshop），不分摊到线别",
+        ProductionLine, on_delete=models.PROTECT, related_name="meters", verbose_name="所属节点",
+        help_text="产线表挂产线节点、辅机表挂 aux 节点、车间水/汽总表挂 workshop 车间节点",
     )
     gateway = models.ForeignKey(
         EnergyGateway, on_delete=models.PROTECT, related_name="meters", verbose_name="所属网关"
@@ -267,6 +381,34 @@ class EnergyMeter(models.Model):
     def type_code(self) -> str:
         """能源编码（ELECTRIC / WATER / STEAM），省去到处写 `meter.energy_type.type_code`。"""
         return self.energy_type.type_code
+
+    @property
+    def workshop(self) -> ProductionLine | None:
+        """所属车间节点 —— 界面三级筛选的第一级。
+
+        产线直接挂在车间下，所以取 `line.parent`；若计量点本身挂在车间节点上
+        （车间总表），就是 `line` 自己。**不再假设全库只有一个车间**
+        （旧代码 `ProductionLine.objects.filter(line_type=workshop).first()` 在多车间下会取错）。
+        """
+        node = self.line
+        if node is None:
+            return None
+        if node.node_type == ProductionLine.NODE_WORKSHOP:
+            return node
+        return node.parent
+
+    @property
+    def category_path(self) -> tuple[str, str, str]:
+        """(车间名, 用能类型, 设备名) —— 界面三级筛选的联合键。
+
+        比逐个字段拼更可靠：三处都从这里取，界面与接口不会各拼一套。
+        """
+        ws = self.workshop
+        return (
+            ws.line_name if ws is not None else "",
+            self.usage_type or "",
+            self.device_name or self.name,
+        )
 
 
 class EnergyRaw(models.Model):

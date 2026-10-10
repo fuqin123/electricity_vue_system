@@ -22,6 +22,8 @@ energy_urlpatterns = [
     path("line/<str:code>", api.line_detail, name="energy-line"),
     path("hourly", api.hourly, name="energy-hourly"),
     path("meters", api.meters, name="energy-meters"),
+    # 分类树（车间 → 用能类型 → 设备）—— 后台筛选下拉用，与下面的 usage-range 同源
+    path("meter-categories", api.meter_categories, name="energy-meter-categories"),
     path("collect-logs", api.collect_logs, name="energy-collect-logs"),
     path("collect-summary", api.collect_summary, name="energy-collect-summary"),
     path("period-summary", api.period_summary, name="energy-period-summary"),

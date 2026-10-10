@@ -31,7 +31,7 @@ from apps.energy.models import (
     ProductionLine,
     SystemParam,
 )
-from apps.energy.services import ranges, slots
+from apps.energy.services import ranges, registry, slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
 from apps.energy.services.snapshot import build_line, build_overview
@@ -256,8 +256,11 @@ class AggregationTests(TestCase):
 
         v1.3.0 起改为挂哨兵行而不是留空：日/月/年汇总表以 (line, energy_type, 周期)
         建唯一键，而 MySQL 把多个 NULL 视为互不相同，留空会让唯一约束失效。
+        v1.5.2：哨兵行从 1 条变 N 条（每车间一条），编码由 WORKSHOP 改为 WS-CARB，
+        所以这里改用 `default_workshop()` 取当前唯一在跑的车间节点。
         """
-        ws = ProductionLine.objects.get(line_code=ProductionLine.WORKSHOP_CODE)
+        ws = ProductionLine.default_workshop()
+        self.assertIsNotNone(ws, "测试库缺少车间节点 —— 检查迁移 0009 是否执行")
         meter = self.make_meter(code="S-T-01", kind=EnergyType.STEAM,
                                 scope=EnergyMeter.SCOPE_WORKSHOP, line=ws)
         self.assertTrue(meter.line.is_workshop)
@@ -439,8 +442,9 @@ class ApiSerializationTests(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
-        # 车间哨兵行已由迁移 0006 建好，这里取用即可
-        cls.ws = ProductionLine.objects.get(line_code=ProductionLine.WORKSHOP_CODE)
+        # 车间节点由迁移 0009 建好（编码 WS-CARB），这里取用即可
+        cls.ws = ProductionLine.default_workshop()
+        assert cls.ws is not None, "测试库缺少车间节点 —— 检查迁移 0009"
         # ① 产线电力：正常有值
         EnergyDaily.objects.create(
             line=cls.line,
@@ -782,8 +786,11 @@ class DashboardCumulativeTests(TestCase):
     def setUpTestData(cls):
         cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
         # v1.3.0 起 line_id 全表非空：车间总表挂「车间哨兵行」，这样唯一键处处有效
+        # v1.5.2：多车间树 —— node_type 才是分类字段，line_type 只是兼容镜像。
+        # 只写 line_type 会让 is_workshop / workshops_qs() 落空（node_type 默认 line）。
         cls.workshop = ProductionLine.objects.create(
-            line_code="WS", line_name="车间", line_type=ProductionLine.TYPE_WORKSHOP
+            line_code="WS", line_name="车间",
+            node_type=ProductionLine.NODE_WORKSHOP, line_type=ProductionLine.TYPE_WORKSHOP,
         )
         cls.gw = EnergyGateway.objects.create(
             code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
@@ -917,8 +924,11 @@ class ClosedDaySnapshotTests(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
+        # v1.5.2：多车间树 —— node_type 才是分类字段，line_type 只是兼容镜像。
+        # 只写 line_type 会让 is_workshop / workshops_qs() 落空（node_type 默认 line）。
         cls.workshop = ProductionLine.objects.create(
-            line_code="WS", line_name="车间", line_type=ProductionLine.TYPE_WORKSHOP
+            line_code="WS", line_name="车间",
+            node_type=ProductionLine.NODE_WORKSHOP, line_type=ProductionLine.TYPE_WORKSHOP,
         )
         cls.gw = EnergyGateway.objects.create(
             code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
@@ -1804,8 +1814,9 @@ class MeterSaveValidationTests(TestCase):
         meter = EnergyMeter.objects.get(code="W-VAL-01")
         self.assertIsNone(meter.install_date)
         self.assertEqual(meter.scope, EnergyMeter.SCOPE_WORKSHOP)
-        # 车间总表挂车间哨兵行，不是留空
-        self.assertEqual(meter.line.line_code, ProductionLine.WORKSHOP_CODE)
+        # 车间总表挂车间节点（v1.5.2 起每车间一条，编码 WS-CARB），不是留空
+        self.assertIsNotNone(meter.line)
+        self.assertTrue(meter.line.is_workshop)
 
     def test_辅机带空安装日期能新增(self):
         """现场报错场景②：辅机（role=aux）。"""
@@ -1883,3 +1894,235 @@ class MeterSaveValidationTests(TestCase):
         self.assertEqual(res.json()["factor"], 0.5)
         self.assertEqual(EnergyMeter.objects.get(code="M-VAL-G").scale, Decimal("0.5"))
 
+
+class WorkshopHierarchyTests(TestCase):
+    """v1.5.2：车间→用能类型→设备 三级筛选 + 多车间树。
+
+    这一族修的坑都属同一类：**两份数字各用一条规则，于是对不上**。
+    现场核对时第一个结论必然是「系统算错了」，真正的病因反被淹掉。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.ws = ProductionLine.default_workshop()
+        assert cls.ws is not None, "测试库缺少车间节点 —— 检查迁移 0009"
+        cls.line = ProductionLine.objects.create(
+            line_code="A1", line_name="一线", node_type=ProductionLine.NODE_LINE,
+            line_type=ProductionLine.TYPE_LINE, parent=cls.ws,
+        )
+        cls.aux = ProductionLine.objects.create(
+            line_code="AUX-AIR", line_name="辅机单元", node_type=ProductionLine.NODE_AUX,
+            line_type=ProductionLine.TYPE_LINE, parent=cls.ws,
+        )
+
+    def test_多车间树_节点分类与过滤(self):
+        """workshop / line / aux 三类必须各归其位：靠 node_type 而不是 line_type。"""
+        self.assertTrue(self.ws.is_workshop)
+        self.assertTrue(self.line.is_line)
+        self.assertTrue(self.aux.is_aux)
+        # 产线查询不能把车间行或辅机行混进来
+        self.assertIn(self.line, list(ProductionLine.lines_qs()))
+        self.assertNotIn(self.ws, list(ProductionLine.lines_qs()))
+        self.assertNotIn(self.aux, list(ProductionLine.lines_qs()))
+
+    def test_车间电力口径含产线与辅机(self):
+        """车间电合计 = 本车间产线电表 + 本车间辅机类电表（v1.5.2 口径变更）。"""
+        gw = EnergyGateway.objects.create(
+            code="GW-H", name="层级测试", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        EnergyMeter.objects.create(
+            code="E-H-LINE", name="一线表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电", device_name="生产线",
+        )
+        EnergyMeter.objects.create(
+            code="E-H-AUX", name="辅机表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.aux, gateway=gw,
+            slave=2, register=1000, usage_type="辅机用电", device_name="高压机",
+        )
+        codes = [m.code for m in ranges._workshop_meters()]
+        # 辅机节点下的表也要进来（旧实现只认产线表，会把辅机漏掉）
+        self.assertIn("E-H-LINE", codes)
+        self.assertIn("E-H-AUX", codes)
+
+    def test_三级筛选按维度取点(self):
+        """workshop / usage_type / node_code 逐级收窄，任一级不传即不限。"""
+        gw = EnergyGateway.objects.create(
+            code="GW-H2", name="维度测试", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        EnergyMeter.objects.create(
+            code="E-H2-LINE", name="一线表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电", device_name="生产线",
+        )
+        EnergyMeter.objects.create(
+            code="E-H2-AUX", name="辅机表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.aux, gateway=gw,
+            slave=2, register=1000, usage_type="辅机用电", device_name="高压机",
+        )
+        # 车间级：两块都取到
+        self.assertEqual(len(ranges.meters_of(workshop="WS-CARB")), 2)
+        # 按用能类型收窄
+        self.assertEqual(
+            [m.code for m in ranges.meters_of(usage_type="辅机用电")], ["E-H2-AUX"]
+        )
+        # 按节点收窄
+        self.assertEqual([m.code for m in ranges.meters_of(node_code="A1")], ["E-H2-LINE"])
+
+    def test_缺一块表时合计为空而不是偏小值(self):
+        """★ 核心不变量：车间合计序列求和 与 totals.kwh 必须同时为空或相等。
+
+        修这个函数前，totals 用 `Sum(consumption)`（有几块算几块），
+        而序列用 `_hour_matrix`（全表可信才算）—— 于是出现
+        「图表全空、合计 16000 kWh」，用户只能得出「系统算错了」。
+        """
+        gw = EnergyGateway.objects.create(
+            code="GW-I", name="一致性", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        m1 = EnergyMeter.objects.create(
+            code="E-I-1", name="表1", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电",
+        )
+        EnergyMeter.objects.create(
+            code="E-I-2", name="表2", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=2, register=1000, usage_type="生产线用电",
+        )
+        day = datetime(2026, 9, 20).date()
+        # 只给 m1 数据、m2 整天空缺 → 严格口径下合计必须为空
+        # ⚠ energy_hourly 的 line / energy_type 是必填外键（不是从 meter 反推的），
+        #   漏传会直接 IntegrityError: Column 'line_id' cannot be null
+        for h in range(0, 5):
+            EnergyHourly.objects.create(
+                meter=m1, line=self.line, energy_type=m1.energy_type,
+                stat_date=day, stat_hour=h,
+                consumption=Decimal("10.0"), quality=EnergyHourly.Q_OK,
+            )
+        data = ranges.usage_range(
+            day, day, granularity="hour", scope="workshop", kind="elec",
+            workshop="WS-CARB", node_code="A1",
+        )
+        vals = [v for v in data["series"][0]["values"] if v is not None]
+        self.assertIsNone(
+            data["totals"]["kwh"], "缺一块表时合计必须是 None，不能是偏小的部分和"
+        )
+        self.assertEqual(vals, [], "缺表时序列也应全空（口径一致）")
+
+    def test_电量一位小数_与大屏同源(self):
+        """B-524 同族：本模块曾用 3 位小数，大屏用 1 位，同一格 24.812 / 24.8。"""
+        self.assertEqual(ranges.round_kwh(Decimal("24.8123")), 24.8)
+        self.assertEqual(ranges.round_kwh(Decimal("1234.5678")), 1234.6)
+        self.assertIsNone(ranges.round_kwh(None))
+
+    def test_水汽不给kwh字段_避免量纲错误(self):
+        """水/汽焦点通道不能把 m³ / t 塞进 kwh 字段（量纲会错）。"""
+        gw = EnergyGateway.objects.create(
+            code="GW-J", name="水汽", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        wtype = etype(EnergyType.WATER)
+        EnergyMeter.objects.create(
+            code="W-J-1", name="水表", energy_type=wtype,
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=self.ws, gateway=gw,
+            slave=1, register=68, unit="m\u00b3",
+            usage_type="车间进水", device_name="进水总表",
+        )
+        day = datetime(2026, 9, 20).date()
+        data = ranges.usage_range(
+            day, day, granularity="hour", scope="all", kind="water", workshop="WS-CARB"
+        )
+        self.assertIsNone(data["totals"]["kwh"], "水表没有 kWh 概念，不能填进 kwh")
+        self.assertEqual(data["series"][0]["unit"], "m\u00b3")
+
+    def test_合计与序列逐格对齐(self):
+        """`_range_total_kwh` 必须用与图表同一批桶，否则会多带一格。"""
+        gw = EnergyGateway.objects.create(
+            code="GW-K", name="桶对齐", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        m = EnergyMeter.objects.create(
+            code="E-K-1", name="表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电",
+        )
+        day = datetime(2026, 9, 20).date()
+        for h in range(24):
+            EnergyHourly.objects.create(
+                meter=m, line=self.line, energy_type=m.energy_type,
+                stat_date=day, stat_hour=h,
+                consumption=Decimal("100.0"), quality=EnergyHourly.Q_OK,
+            )
+        data = ranges.usage_range(
+            day, day, granularity="hour", scope="workshop", kind="elec",
+            workshop="WS-CARB", node_code="A1",
+        )
+        vals = [v for v in data["series"][0]["values"] if v is not None]
+        self.assertEqual(len(vals), data["bucketCount"], "序列与桶数必须一致")
+        self.assertAlmostEqual(sum(vals), data["totals"]["kwh"], places=1)
+    def test_漏写单位的点位按能源类型推导(self):
+        """★ B-538：`unit` 漏写时**按能源类型推**，绝不静默兜成 kWh。
+
+        这是 B-535 同族的坑：单位不参与任何计算，采集 / 聚合 / 汇总一路跑通、
+        不报一个错，只有界面把 380 吨水标成 380 kWh —— 现场核对时的表现是
+        「数字对不上」，而不是「配置写错了」，排查方向一开始就是歪的。
+        """
+        self.assertEqual(registry._unit_for(etype(EnergyType.WATER), None), "m\u00b3")
+        self.assertEqual(registry._unit_for(etype(EnergyType.STEAM), None), "t")
+        self.assertEqual(registry._unit_for(etype(EnergyType.ELECTRIC), None), "kWh")
+        # 配置里明确写了就以配置为准（现场可能用 m3 / 吨 等写法）
+        self.assertEqual(registry._unit_for(etype(EnergyType.WATER), "m3"), "m3")
+        self.assertEqual(registry._unit_for(etype(EnergyType.WATER), "  "), "m\u00b3")
+
+    def test_后台新增水表不填单位也不给kwh(self):
+        """同一坑的第二条路径：后台表单没填单位 → 走 `_save_meter` 的兜底。"""
+        gw = EnergyGateway.objects.create(
+            code="GW-U", name="单位兜底", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        m = api._save_meter(None, {
+            "code": "W-U-1", "name": "水表", "kind": "water",
+            "gatewayId": gw.id, "slave": 1, "register": 1000,
+            "lineCode": self.ws.line_code,
+        })
+        self.assertEqual(m.unit, "m\u00b3", "水表没填单位时必须推成 m³，不能是默认的 kWh")
+    def test_三级筛选参数驼峰下划线都认(self):
+        """★ B-539：`usageType` 与 `usage_type` 必须等价，认不出的参数不许静默忽略。
+
+        前端发驼峰、脚本/手敲习惯下划线。旧代码只读下划线，于是手敲的那份
+        被**静默丢掉**、整条链路退化成「车间全量」——界面照样出数，
+        只是口径从 13 块表变成 31 块表，比报错更难发现。
+        """
+        from django.test import Client
+        gw = EnergyGateway.objects.create(
+            code="GW-P", name="参数", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        EnergyMeter.objects.create(
+            code="E-P-1", name="一线表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电", device_name="生产线",
+        )
+        c = Client()
+        day = "2026-09-20"
+        camel = c.get("/api/energy/range", {
+            "kind": "elec", "workshop": "WS-CARB", "usageType": "生产线用电",
+            "granularity": "hour", "date": day,
+        }).json()
+        snake = c.get("/api/energy/range", {
+            "kind": "elec", "workshop": "WS-CARB", "usage_type": "生产线用电",
+            "granularity": "hour", "date": day,
+        }).json()
+        self.assertEqual(camel["meterCount"], 1, "usageType 被忽略时会退化成车间全量")
+        self.assertEqual(snake["meterCount"], 1)
+        self.assertEqual(camel["series"][0]["name"], snake["series"][0]["name"])
+
+    def test_非法日期返回400而不是500(self):
+        """★ B-540：`parse_date` 对**越界**日期抛 ValueError，不能漏成 500。
+
+        Django 的 parse_date 只在格式错（"abc"）时返回 None；`2026-13-99`
+        这种「格式对、数值越界」直接抛 ValueError。旧代码只判 None，
+        越界日期未捕获 → HTTP 500，界面只看到「服务器错误」，
+        拿不到「到底哪一格填错了」。
+        """
+        from django.test import Client
+        c = Client()
+        res = c.get("/api/energy/range", {"kind": "elec", "date": "2026-13-99"})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("date", res.json()["detail"])

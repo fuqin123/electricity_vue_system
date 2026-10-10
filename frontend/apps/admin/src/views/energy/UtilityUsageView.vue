@@ -6,8 +6,13 @@
  * 所以两页共用本组件（WaterView / SteamView 只是传不同 energy 的薄壳）——
  * 原来两份拷贝各自演化，才会出现「汽计量页明细表恒为空」只在其中一页被发现（B-519）。
  *
- * ⚠ 本页**没有线别筛选**：车间只有一块进水总表 / 一块蒸汽总表，
- *   任何「按产线的水/汽」都是折算出来的，不是计量出来的。要按线看只有电。
+ * ⚠ 本页**没有「按产线」筛选**：车间只有总表，任何「按产线的水/汽」都是折算出来的，
+ *   不是计量出来的。要按线看只有电。
+ *
+ * v1.5.2：但「车间 → 用能类型 → 设备」三级还是要给 —— 碳水车间现在有
+ *   「碳水市政水」和「车间进水」两块水表（蒸汽有一块），不区分的话
+ *   界面上根本看不出查的是哪一块（见 `meter-categories` 树）。
+ *   注意第三级给的是**计量点**而不是产线，两者语义完全不同。
  */
 import { computed } from 'vue';
 import { energyModel, int, type PageQuery, type PageResult } from '@eep/shared';
@@ -33,7 +38,15 @@ const {
   missingBuckets,
   emptyHint,
   chartOption,
-  extraQuery
+  extraQuery,
+  tree,
+  treeLoading,
+  workshop,
+  usageType,
+  node,
+  typeOptions,
+  nodeOptions,
+  selectionLabel
 } = useEnergyUsage(props.energy);
 
 const isSteam = computed(() => props.energy === 'steam');
@@ -97,8 +110,8 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
       :title="isSteam ? '采集提醒' : '数据口径'"
       :description="
         isSteam
-          ? '蒸汽表必须启用温压补偿，否则压力波动会被误算成用量波动。车间只有一块蒸汽总表，无法拆分到产线。'
-          : '车间仅有一块进水总表，水耗无法拆分到产线，因此本页没有线别筛选。折算强度需用真实历史数据回填后才能用于考核。'
+          ? '蒸汽表必须启用温压补偿，否则压力波动会被误算成用量波动。车间只有蒸汽总表，无法拆分到产线。'
+          : '车间水表为总表，水耗无法拆分到产线，因此本页只按仪表区分、不按产线筛选。折算强度需用真实历史数据回填后才能用于考核。'
       "
     />
 
@@ -122,13 +135,53 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
           <el-radio-button value="day">日</el-radio-button>
           <el-radio-button value="month">月</el-radio-button>
         </el-radio-group>
+        <!-- 三级联动：车间 → 用能类型 → 计量点（v1.5.2） -->
+        <span class="query__label">车间</span>
+        <el-select
+          v-model="workshop"
+          size="small"
+          style="width: 140px"
+          :loading="treeLoading"
+          placeholder="选择车间"
+          @change="load"
+        >
+          <el-option v-for="w in tree" :key="w.workshopCode" :label="w.workshop" :value="w.workshopCode" />
+        </el-select>
+        <span class="query__label">类型</span>
+        <el-select
+          v-model="usageType"
+          size="small"
+          style="width: 150px"
+          clearable
+          placeholder="全部类型"
+          @change="load"
+        >
+          <el-option
+            v-for="t in typeOptions"
+            :key="t.usageType"
+            :label="`${t.usageType}（${t.devices.length}）`"
+            :value="t.usageType"
+          />
+        </el-select>
+        <span class="query__label">仪表</span>
+        <el-select
+          v-model="node"
+          size="small"
+          style="width: 220px"
+          clearable
+          :disabled="!usageType"
+          :placeholder="usageType ? '全部仪表' : '请先选类型'"
+          @change="load"
+        >
+          <el-option v-for="n in nodeOptions" :key="n.code" :label="n.name" :value="n.code" />
+        </el-select>
         <el-button-group>
           <el-button v-for="q in QUICK" :key="q.label" size="small" @click="applyQuick(q.hours, q.gran)">
             {{ q.label }}
           </el-button>
         </el-button-group>
         <el-button type="primary" size="small" :loading="loading" @click="load">查询</el-button>
-        <span class="query__hint">车间总表口径 · 不支持按产线筛选</span>
+        <span class="query__hint">{{ selectionLabel }}</span>
       </div>
     </el-card>
 
@@ -169,7 +222,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
     <el-alert v-if="emptyHint" type="info" :closable="false" show-icon class="mb-16" :title="emptyHint" />
 
     <ChartPanel
-      :title="`区间用${isSteam ? '汽' : '水'}趋势`"
+      :title="`区间用${isSteam ? '汽' : '水'}趋势 · ${selectionLabel}`"
       :option="chartOption"
       :height="280"
       note="整点差值 · 缺数处断开不连线"

@@ -211,21 +211,95 @@ def _resolve_energy_type(value) -> EnergyType:
     return EnergyType.objects.get(type_code=code)
 
 
-def _workshop_line() -> ProductionLine:
-    """车间哨兵行 —— 水/汽总表的归属。
+def _workshop_line(code: str | None = None) -> ProductionLine | None:
+    """车间节点 —— 水/汽总表的归属。
 
     ⚠ 不能留空：日/月/年汇总表以 (line, energy_type, 周期) 建唯一键，
       而 MySQL 的唯一索引把多个 NULL 视为互不相同，留空会让唯一约束失效。
+
+    ⚠ v1.5.2：多车间后**不要再 `get_or_create` 一条固定编码的哨兵行**。
+      旧写法会凭空造出一条车间（或把请求路由到错误车间）。
+      现在：
+        · 给了 `code` → 必须已存在，不存在返回 None（由调用方给出 400）；
+        · 没给 `code` → 返回唯一的车间（只有一个时）或第一个（多个时的兼容行为，
+          调用方应尽量显式传 code）。
     """
-    obj, _ = ProductionLine.objects.get_or_create(
-        line_code=ProductionLine.WORKSHOP_CODE,
-        defaults={
-            "line_name": "车间（总表）",
-            "line_type": ProductionLine.TYPE_WORKSHOP,
-            "sort": 0,
-        },
+    qs = ProductionLine.workshops_qs().order_by("sort", "line_code")
+    if code:
+        return qs.filter(line_code=code).first()
+    return qs.first()
+
+
+def _meter_node(m: EnergyMeter) -> ProductionLine:
+    """计量点归属的组织节点（可能是产线 / 辅助单元 / 车间）。"""
+    return m.line
+
+
+def _category_tree(energy_type: str | None = None) -> list[dict]:
+    """按「车间 → 用能类型 → 设备」组织计量点，供后台三级联动筛选。
+
+    为什么由后端出这棵树而不是前端拿全量 meters 自己分组：
+      · 分组规则（车间解析、兜底命名、排序）必须与取数口径同源，
+        前端再实现一遍必然在某次改动后与后端不一致；
+      · 现场会不断加设备，前端硬编码分类迟早漏项。
+
+    结构：
+      [{ workshop, workshopCode, types: [
+            { usageType, devices: [
+                { code, name, deviceName, nodeCode, nodeName, kind, unit, enabled }
+            ]}]}]
+    """
+    qs = EnergyMeter.objects.select_related("line", "line__parent", "energy_type", "gateway")
+    if energy_type:
+        qs = qs.filter(energy_type__type_code=_resolve_energy_type(energy_type).type_code)
+    qs = qs.order_by(
+        "line__parent__sort", "line__parent__line_code",
+        "line__sort", "energy_type__sort", "usage_type", "code",
     )
-    return obj
+
+    # 用有序 dict 逐层归集，保证输出顺序稳定（前端下拉不会每次刷新换顺序）
+    workshops: dict[str, dict] = {}
+    for m in qs:
+        ws = m.workshop
+        ws_code = ws.line_code if ws else "__none__"
+        ws_name = ws.line_name if ws else "未归属车间"
+
+        wnode = workshops.setdefault(ws_code, {"workshop": ws_name, "workshopCode": ws_code, "types": {}})
+        # 未填 usage_type 时按能源类型兜底命名，避免界面出现空白选项
+        usage = m.usage_type or f"{m.energy_type.type_name}（未分类）"
+        tnode = wnode["types"].setdefault(usage, {"usageType": usage, "devices": []})
+
+        node = _meter_node(m)
+        tnode["devices"].append(
+            {
+                "code": m.code,
+                "name": m.name,
+                "deviceName": m.device_name or m.name,
+                # 第三级要既能显示设备、也要能定位到节点（产线 / 辅机 / 车间）
+                "nodeCode": node.line_code if node else None,
+                "nodeName": node.line_name if node else None,
+                "nodeType": node.node_type if node else None,
+                "lineCode": node.line_code if node and node.is_line else None,
+                "kind": m.type_code,
+                "kindLabel": m.energy_type.type_name,
+                "unit": m.unit,
+                "enabled": m.enabled,
+                "gateway": m.gateway.code if m.gateway else None,
+                # 生图/排障时直接显示「怎么读到的」
+                "address": meter_address(m),
+            }
+        )
+
+    out: list[dict] = []
+    for w in workshops.values():
+        w["types"] = [
+            {"usageType": t["usageType"], "devices": t["devices"]}
+            for t in sorted(w["types"].values(), key=lambda x: x["usageType"])
+        ]
+        out.append(w)
+    return out
+
+
 PROTOCOL = {EnergyGateway.KIND_MODBUS: "Modbus RTU over TCP", EnergyGateway.KIND_HTTP: "HTTP API"}
 
 
@@ -661,7 +735,7 @@ def period_summary(request: HttpRequest) -> JsonResponse:
         # 供界面显示参考；产量接入后应改为读真实计划。
         days = (row.end_date - row.start_date).days + 1
         rated = line_for_plan.rated if line_for_plan is not None else sum(
-            l.rated for l in ProductionLine.objects.filter(line_type=ProductionLine.TYPE_LINE)
+            l.rated for l in ProductionLine.lines_qs()
         )
         items.append(
             {
@@ -689,28 +763,81 @@ def period_summary(request: HttpRequest) -> JsonResponse:
 
 
 @require_GET
+def meter_categories(request: HttpRequest) -> JsonResponse:
+    """★ 计量点分类树 —— 后台「电 / 水 / 汽计量」页的三级联动数据源。
+
+    参数：
+      kind   可选，elec | water | steam —— 只取该能源类型的点位
+             （电计量页传 elec、水计量页传 water、汽计量页传 steam；
+               不传则返回全部，供调试与后续「用量查询」页复用）
+
+    返回：[{ workshop, workshopCode, types: [{ usageType, devices: [...] }] }]
+      第一级 车间     碳水车间 / 制造车间
+      第二级 用能类型 生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电 / 车间蒸汽 …
+      第三级 设备     生产线 / 吹瓶机 / 冰水机和水塔 / 市政水表1 …
+
+    ⚠ 与「大屏」无关：本接口只为后台的筛选下拉服务，大屏接口一律不动。
+    """
+    kind = request.GET.get("kind")
+    try:
+        tree = _category_tree(kind)
+    except EnergyType.DoesNotExist:
+        return json_err(f"未知能源类型：{kind}（可选 elec / water / steam）")
+    return json_ok({"tree": tree, "count": sum(len(t["devices"]) for w in tree for t in w["types"])})
+
+
+@require_GET
 def usage_range(request: HttpRequest) -> JsonResponse:
     """★ 按时间段查询用量 —— 大屏与后台共用。
 
     参数：
+      date               ★ 单日查询：`YYYY-MM-DD`，等价于 `from=该日 00:00&to=该日 23:00`。
+                         与 from/to 二选一；同时给出时 **date 优先**。
+                         （后台「电/水/汽计量」选的是「哪一天」，用 date 表达最自然。）
       from / to          **精确到小时**：`YYYY-MM-DD HH`（兼容纯日期，取当日 00:00）
                          缺省为今天；最长 366 天
       granularity        hour | day | month（默认 day）
       scope              workshop | line | all（默认 all：车间 + 各线）
       line               当 scope=line 时指定产线，如 A1
+      kind / workshop / usage_type / device / node_code
+                         ★ v1.5.2 后台三级筛选（车间 → 用能类型 → 设备）。
+                         与「线别」不同：这套维度能表达辅机 / 瓶胚 / 调配这类
+                         **不属于任何单条产线**的计量单元（现场接口表里它们的
+                         「线别」列写的是设备组合名）。
+                         任一项给定即进入「焦点」通道，只返回该范围一条序列。
+                         ⚠ 参数名**驼峰与下划线都收**（`usageType` = `usage_type`，
+                           `nodeCode` = `node`）—— 前端发驼峰、手敲/脚本习惯下划线，
+                           只认一种会让另一种被静默忽略、退化成车间全量口径。
 
-    返回：labels（时间轴）+ series（每条一组，车间/各线）+ utility（水汽，仅车间）
+    返回：labels（时间轴）+ series（每条一组，车间/各线/焦点）+ utility（水汽，仅车间）
           + totals（区间合计）+ productionAvailable（产量是否已接入）。
 
     ⚠ 产量字段在产量侧接入前恒为 0，并带 `productionAvailable=false` 显式标注 ——
       界面据此显示「产量未接入」而不是让人以为「今天真没产量」。
     ⚠ 小时端点只在 `granularity=hour` 时生效；day / month 的桶是整天/整月，
       端点会被规范到所属周期边界（不做「半天」这种桶）。
+    ⚠ B-537：`date` 曾是「文档里写了、代码里没读」的参数 —— 传 `date=昨天`
+      会被静默忽略并回退成「今天」，界面看着有数、其实是另一天的数。
+      非法 date 一律 400，不静默回退（同项目铁律：参数错就要报错）。
     """
-    try:
-        start_at, end_at = ranges.parse_hours(request)
-    except ValueError as exc:
-        return json_err(str(exc))
+    if request.GET.get("date"):
+        # date 优先于 from/to：单日查询是最常用入口，语义要唯一
+        # ⚠ Django 的 parse_date 只对**格式**错误返回 None；月份/日越界
+        #   （2026-13-99）会直接抛 ValueError → 未捕获就是 HTTP 500。
+        #   两种错都属「参数错」，必须一律 400 并把原因说清楚。
+        try:
+            day_sel = parse_date(request.GET["date"])
+        except ValueError:
+            day_sel = None
+        if day_sel is None:
+            return json_err(f"date 格式必须是 YYYY-MM-DD，收到 {request.GET['date']}")
+        start_at = datetime.combine(day_sel, time.min)
+        end_at = datetime.combine(day_sel, time(hour=23, minute=59))
+    else:
+        try:
+            start_at, end_at = ranges.parse_hours(request)
+        except ValueError as exc:
+            return json_err(str(exc))
     start, end = start_at.date(), end_at.date()
     granularity = request.GET.get("granularity", "day")
     scope = request.GET.get("scope", "all")
@@ -723,8 +850,21 @@ def usage_range(request: HttpRequest) -> JsonResponse:
     if scope == "line" and not line_code:
         return json_err("scope=line 时必须给 line 参数，如 line=A1")
 
-    day = _query_date(request) if request.GET.get("date") else datetime.now().date()
+    # 参考日：给前端标「服务器认为现在是哪天」。date 显式给了就用它，否则用今天。
+    day = start if request.GET.get("date") else datetime.now().date()
     now = datetime.now() if end >= datetime.now().date() else datetime.combine(end, datetime.max.time())
+
+    # ★ v1.5.2 三级筛选参数：**同时接受驼峰与下划线两种写法**。
+    #   前端 `getRange()` 把 `usageType` 转成 `usage_type` 发出来，而现场/大屏
+    #   调试时习惯直接手敲 `usageType=`。旧代码只读 `usage_type`，于是手敲的
+    #   那一份被**静默忽略**、退化成车间全量（31 块表而不是 13 块），
+    #   界面看着有数据，其实是另一个口径（B-535 同族：认不出的参数一路静默）。
+    def q(*names: str) -> str | None:
+        for n in names:
+            v = request.GET.get(n)
+            if v:
+                return v
+        return None
 
     data = ranges.usage_range(
         start,
@@ -735,6 +875,11 @@ def usage_range(request: HttpRequest) -> JsonResponse:
         now=now,
         start_at=start_at,
         end_at=end_at,
+        kind=q("kind"),
+        workshop=q("workshop"),
+        usage_type=q("usage_type", "usageType", "usage"),
+        device=q("device", "deviceName"),
+        node_code=q("node", "nodeCode", "node_code"),
     )
     data["cadence"] = slots.describe()
     data["serverDate"] = day.isoformat()
@@ -1055,7 +1200,7 @@ def admin_quality(request: HttpRequest) -> JsonResponse:
     today = datetime.now().date()
     expect = datetime.now().hour + 1
     rows = []
-    for ln in ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE).order_by("sort", "line_code"):
+    for ln in ProductionLine.active_lines_qs().order_by("sort", "line_code"):
         meters = [m for m in ln.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
         ok_rows = EnergyHourly.objects.filter(
             meter__in=meters, stat_date=today, quality__in=EnergyHourly.TRUSTED
@@ -1403,6 +1548,16 @@ def _save_meter(m: EnergyMeter | None, data: dict) -> EnergyMeter:
         raise ValueError("HTTP API 类型的点位必须填接口路径")
 
     m.source = EnergyMeter.SOURCE_ADMIN  # 后台改过 → 归后台维护
+
+    # 单位没给时按能源类型推（水=m³ / 汽=t）—— 与 registry._unit_for 同一条规则。
+    # ⚠ 判断依据是「**调用方有没有传 unit**」，不能看 `m.unit` 是否为空：
+    #   `EnergyMeter.unit` 的 default 是 "kWh"，模型实例一建出来 `m.unit` 就
+    #   已经是 "kWh"，`if not m.unit` 永远不成立 —— 水表照样被登记成 kWh。
+    #   单位不参与计算，采集/聚合/汇总全都不报错，只有界面把 m³ 标成 kWh
+    #   （B-535 同族：静默的默认值比报错更难查）。
+    if not str(data.get("unit") or "").strip():
+        m.unit = EnergyType.DEFAULT_UNIT.get(m.energy_type.type_code, "kWh")
+
     try:
         m.save()
     except DjangoValidationError as exc:

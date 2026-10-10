@@ -7,10 +7,20 @@
  *
  * 口径全部走 `/api/energy/range` —— 与后台「用量查询」页、大屏同一份实现，
  * 三处数字必然一致（同一指标只能有一个来源）。
+ *
+ * ── v1.5.2 三级筛选 ──────────────────────────────────────────
+ * 筛选维度从「线别」改为 **车间 → 用能类型 → 设备**（分类树来自
+ * `/api/energy/meter-categories`）。原因见 `MeterCategoryWorkshop` 的注释：
+ * 辅机 / 瓶胚 / 调配这些表在接口表里根本没有「线别」。
+ *
+ * 选择语义（三级联动，上级变则下级清空）：
+ *   · 只选车间            → 该车间全部电表（车间合计）
+ *   · 选到用能类型        → 该类型下的表合计
+ *   · 选到具体设备/节点   → 单表 / 单节点（焦点通道）
  */
-import { computed, onMounted, ref, type Ref } from 'vue';
+import { computed, onMounted, ref, watch, type Ref } from 'vue';
 import { ElMessage } from 'element-plus';
-import { energyApi, type UsageRangeResult } from '@eep/shared';
+import { energyApi, type MeterCategoryWorkshop, type UsageRangeResult } from '@eep/shared';
 import { energyUsageOption, type EnergyUsageSeries } from './charts';
 
 export type UsageEnergy = 'electric' | 'water' | 'steam';
@@ -25,10 +35,10 @@ export interface UsageRow {
   quality: string;
 }
 
-const META: Record<UsageEnergy, { name: string; unit: string; color: string; perLine: boolean; emptyHint: string }> = {
-  electric: { name: '用电', unit: 'kWh', color: '#1664ff', perLine: true, emptyHint: '本区间电表无可信差值' },
-  water: { name: '用水', unit: 't', color: '#387bff', perLine: false, emptyHint: '车间进水总表未接入' },
-  steam: { name: '用汽', unit: 't', color: '#bd7e00', perLine: false, emptyHint: '蒸汽总表本区间无数据' }
+const META: Record<UsageEnergy, { name: string; unit: string; color: string; perLine: boolean; emptyHint: string; kind: 'elec' | 'water' | 'steam' }> = {
+  electric: { name: '用电', unit: 'kWh', color: '#1664ff', perLine: true, emptyHint: '本区间电表无可信差值', kind: 'elec' },
+  water: { name: '用水', unit: 't', color: '#387bff', perLine: false, emptyHint: '车间进水总表未接入', kind: 'water' },
+  steam: { name: '用汽', unit: 't', color: '#bd7e00', perLine: false, emptyHint: '蒸汽总表本区间无数据', kind: 'steam' }
 };
 
 /** 本地时间字符串。⚠ 不能用 toISOString（UTC，东八区早上会得到昨天） */
@@ -78,12 +88,98 @@ export function useEnergyUsage(energy: UsageEnergy) {
 
   const range = ref<[string, string]>([usageQuickStart(0), closedHourText()]);
   const granularity = ref<UsageGranularity>('hour');
-  /** 空串 = 车间合计；否则为产线编码（只有电支持按线） */
-  const lineCode = ref('');
   const loading = ref(false);
   const data = ref<UsageRangeResult | null>(null);
 
-  const scope = computed<'workshop' | 'line'>(() => (meta.perLine && lineCode.value ? 'line' : 'workshop'));
+  // ── 三级筛选状态（车间 → 用能类型 → 设备）──────────────────
+  /** 分类树；只含本能源类型（电页不会看到水表） */
+  const tree = ref<MeterCategoryWorkshop[]>([]);
+  const treeLoading = ref(false);
+  /** ''=不限（全部车间，当前只有一个）；否则为车间编码 */
+  const workshop = ref('');
+  /** ''=该车间全部；否则用能类型名（如「生产线用电」） */
+  const usageType = ref('');
+  /**
+   * ''=该类型全部；否则为组织节点编码。
+   *
+   * ⚠ 这里存的是**节点**（A1 / AUX-CARB-AIR）而不是计量点编码：
+   *   一条产线常有多块表（生产线 / 吹瓶机 / 冰水机），按节点查才是
+   *   「看这条线用了多少电」；按单表查是「看这块表」。
+   *   两者在树里都存在，第三级下拉同时给出节点与单表两个选项组。
+   */
+  const node = ref('');
+
+  /** 当前选中车间下的类型列表 */
+  const typeOptions = computed(() => {
+    const ws = tree.value.find((w) => w.workshopCode === workshop.value) ?? tree.value[0];
+    return ws?.types ?? [];
+  });
+
+  /** 当前选中类型下的设备列表 */
+  const deviceOptions = computed(() => {
+    const t = typeOptions.value.find((x) => x.usageType === usageType.value);
+    return t?.devices ?? [];
+  });
+
+  /**
+   * 第三级的节点选项：把设备按 nodeCode 去重。
+   *
+   * 一条产线（A1）下有多块电表时，选「一线（整条线 2 块表）」比逐块勾更常用，
+   * 所以节点作为独立选项排在设备之前。
+   */
+  const nodeOptions = computed(() => {
+    const seen = new Map<string, { code: string; name: string; count: number }>();
+    for (const d of deviceOptions.value) {
+      const cur = seen.get(d.nodeCode);
+      if (cur) cur.count += 1;
+      else seen.set(d.nodeCode, { code: d.nodeCode, name: d.nodeName, count: 1 });
+    }
+    return [...seen.values()];
+  });
+
+  /** 载入分类树；只拉本页能源类型，避免电页出现水表 */
+  async function loadTree() {
+    treeLoading.value = true;
+    try {
+      const res = await energyApi.getMeterCategories({ kind: meta.kind });
+      tree.value = res.tree;
+      // 默认选中第一个车间，让三级下拉一开始就有内容可选
+      if (!workshop.value && res.tree.length) workshop.value = res.tree[0].workshopCode;
+    } catch (e) {
+      ElMessage.error((e as Error).message);
+      tree.value = [];
+    } finally {
+      treeLoading.value = false;
+    }
+  }
+
+  // 上级变化时清空下级 —— 否则会拿「A1 线的用能类型」去查另一个车间，
+  // 后端筛出空集，界面看起来像「这个车间没有数据」。
+  watch(workshop, () => {
+    usageType.value = '';
+    node.value = '';
+  });
+  watch(usageType, () => {
+    node.value = '';
+  });
+
+  /** 是否处于「焦点」通道：选了类型或节点就是看具体设备，只出一条序列 */
+  const focused = computed(() => !!(usageType.value || node.value));
+
+  /**
+   * 当前选择的中文描述 —— 放在图表标题/提示里，
+   * 让人一眼知道「这张图是哪几个点位的」，而不是只能靠下拉回看。
+   */
+  const selectionLabel = computed(() => {
+    const ws = tree.value.find((w) => w.workshopCode === workshop.value);
+    const parts = [ws?.workshop ?? '全部车间'];
+    if (usageType.value) parts.push(usageType.value);
+    if (node.value) {
+      const n = nodeOptions.value.find((x) => x.code === node.value);
+      parts.push(n ? (n.count > 1 ? `${n.name}（${n.count} 块表）` : n.name) : node.value);
+    }
+    return parts.join(' · ');
+  });
 
   async function load() {
     if (!range.value?.[0] || !range.value?.[1]) {
@@ -96,8 +192,12 @@ export function useEnergyUsage(energy: UsageEnergy) {
         from: range.value[0],
         to: range.value[1],
         granularity: granularity.value,
-        scope: scope.value,
-        line: scope.value === 'line' ? lineCode.value : undefined
+        // 焦点通道由后端按点位集合出数，scope 只影响非焦点时的序列构成
+        scope: focused.value ? 'all' : 'workshop',
+        kind: meta.kind,
+        workshop: workshop.value || undefined,
+        usageType: usageType.value || undefined,
+        node: node.value || undefined
       });
     } catch (e) {
       ElMessage.error((e as Error).message);
@@ -107,13 +207,17 @@ export function useEnergyUsage(energy: UsageEnergy) {
     }
   }
 
-  onMounted(load);
+  onMounted(async () => {
+    await loadTree();
+    await load();
+  });
 
   /** 本能源的逐桶用量 */
   const values = computed<(number | null)[]>(() => {
     const d = data.value;
     if (!d) return [];
     if (energy === 'electric') {
+      // 焦点通道下 series[0] 就是唯一那条；非焦点时取车间合计
       const wantKey = d.line ?? 'workshop';
       const s = d.series.find((x) => x.key === wantKey) ?? d.series[0];
       return s?.values ?? [];
@@ -161,11 +265,29 @@ export function useEnergyUsage(energy: UsageEnergy) {
   /** 有值但整段为空时给一句话说明，避免「图是空的」被读成「系统坏了」 */
   const emptyHint = computed(() => (values.value.length && !missingBuckets.value ? '' : values.value.length === 0 || missingBuckets.value === values.value.length ? meta.emptyHint : ''));
 
+  /**
+   * 覆盖度说明 —— 车间合计为空但下面各线有数时，最需要这句话。
+   *
+   * 合计口径是「全部参与表都有可信值才算数」，因此只要有一块表还没接入，
+   * 合计就恒为 `--`；界面不点破，用户只会得出「系统坏了」的结论。
+   */
+  const coverageHint = computed(() => {
+    const cov = data.value?.coverage;
+    if (!cov || cov.total === 0) return '';
+    if (cov.missing.length === 0) return `本区间 ${cov.covered}/${cov.total} 个计量点均有数据`;
+    const shown = cov.missing.slice(0, 6).join('、');
+    const more = cov.missing.length > 6 ? ` 等 ${cov.missing.length} 个` : '';
+    return `本区间仅 ${cov.covered}/${cov.total} 个计量点有数据，合计按「全部可信才算数」口径留空。未出数：${shown}${more}`;
+  });
+
   const chartOption = computed(() => {
     const d = data.value;
     if (!d) return null;
+    // 焦点通道下后端已给出精确的序列名（含车间/类型/节点），优先用它，
+    // 否则「车间用电」这种笼统名字会让人以为看的是全车间。
+    const seriesName = focused.value ? (d.series[0]?.name ?? selectionLabel.value) : `车间${meta.name}`;
     const series: EnergyUsageSeries[] = [
-      { key: energy, name: `车间${meta.name}`, unit: meta.unit, color: meta.color, data: values.value, emptyHint: meta.emptyHint }
+      { key: energy, name: seriesName, unit: meta.unit, color: meta.color, data: values.value, emptyHint: meta.emptyHint }
     ];
     return energyUsageOption(d.labels, series, { labelInterval: d.labels.length > 24 ? 2 : 'auto' });
   });
@@ -174,29 +296,45 @@ export function useEnergyUsage(energy: UsageEnergy) {
    * 传给 TablePage 的 extraQuery：
    * ⚠ 这里必须带上「数据是否已就绪」—— TablePage 只在挂载与 extraQuery 变化时取数，
    *   不带它就回到 B-519 的老问题（快照还没回来就取完数，之后再也不刷新）。
+   * ⚠ 也必须带上筛选条件 —— 否则改了三级下拉不点查询就不生效（B-532 同族）。
    */
   const extraQuery: Ref<Record<string, unknown>> = computed(() => ({
     ready: data.value !== null,
     buckets: data.value?.bucketCount ?? 0,
-    energy
+    energy,
+    workshop: workshop.value,
+    usageType: usageType.value,
+    node: node.value,
+    gran: granularity.value
   }));
 
   return {
     meta,
     range,
     granularity,
-    lineCode,
     loading,
     data,
-    scope,
     load,
     rows,
     values,
     totals,
     missingBuckets,
     emptyHint,
+    coverageHint,
     chartOption,
-    extraQuery
+    extraQuery,
+    // 三级筛选
+    tree,
+    treeLoading,
+    workshop,
+    usageType,
+    node,
+    typeOptions,
+    deviceOptions,
+    nodeOptions,
+    focused,
+    selectionLabel,
+    loadTree
   };
 }
 

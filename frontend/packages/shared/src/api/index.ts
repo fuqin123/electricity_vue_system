@@ -206,20 +206,38 @@ export const energyApi = {
   /**
    * 按时间段查询用量（大屏与后台共用 /api/energy/range，数字同源）
    *
+   * @param from / to  精确到小时的起止（`YYYY-MM-DD HH`）
+   * @param date       ★ 单日查询（`YYYY-MM-DD`），与 from/to 二选一；同时给时 date 优先。
+   *                   后台「电/水/汽计量」选的是「哪一天」，用它比拼 from/to 更直白。
    * @param granularity hour | day | month
    * @param scope       workshop | line | all
+   * @param line        当 scope=line 时的产线编码
+   * @param kind        elec | water | steam（三级筛选第一维）
+   * @param workshop    车间编码，如 WS-CARB
+   * @param usageType   用能类型，如「生产线用电」
+   * @param device      设备名
+   * @param node        组织节点编码（产线 / 辅助单元 / 车间）
+   *
+   * ⚠ usageType / device / node 任一给定即进入「焦点」通道，只返回一条序列
+   *   —— 用户已经在看具体设备，再叠一整套产线序列只会让图变成一锅粥。
    */
   async getRange(params: {
-    from: string;
-    to: string;
+    from?: string;
+    to?: string;
+    date?: string;
     granularity?: 'hour' | 'day' | 'month';
     scope?: 'workshop' | 'line' | 'all';
     line?: string;
+    kind?: 'elec' | 'water' | 'steam';
+    workshop?: string;
+    usageType?: string;
+    device?: string;
+    node?: string;
   }): Promise<UsageRangeResult> {
     if (!useApi('energy.range')) {
       const empty: UsageRangeResult = {
-        from: params.from,
-        to: params.to,
+        from: params.from ?? params.date ?? '',
+        to: params.to ?? params.date ?? '',
         granularity: params.granularity ?? 'day',
         scope: params.scope ?? 'workshop',
         labels: [],
@@ -231,8 +249,39 @@ export const energyApi = {
       };
       return delay(empty, 120);
     }
+    // 后端参数名是下划线（usage_type / node），前端保持驼峰，只在这一层转换
     return request<UsageRangeResult>('/api/energy/range', {
-      params: { ...params, granularity: params.granularity ?? 'day', scope: params.scope ?? 'workshop' }
+      params: {
+        from: params.from,
+        to: params.to,
+        date: params.date,
+        granularity: params.granularity ?? 'day',
+        scope: params.scope ?? 'workshop',
+        line: params.line,
+        kind: params.kind,
+        workshop: params.workshop,
+        usage_type: params.usageType,
+        device: params.device,
+        node: params.node
+      }
+    });
+  },
+
+  /**
+   * 计量点分类树（车间 → 用能类型 → 设备）。
+   *
+   * 后台「电/水/汽计量」页的三级下拉就吃这棵树 —— 与 `getRange` 同源，
+   * 保证「下拉里能选到的」和「查询能查到的」永远是同一批点位。
+   *
+   * @param kind elec | water | steam；不传则返回全部能源
+   */
+  async getMeterCategories(params: { kind?: 'elec' | 'water' | 'steam' } = {}): Promise<MeterCategoryResult> {
+    if (!useApi('energy.meterCategories')) {
+      // 后端未启用时给一棵空树（而不是编一棵假的）—— 界面会显示「暂无计量点」
+      return delay({ tree: [], count: 0 } as MeterCategoryResult, 120);
+    }
+    return request<MeterCategoryResult>('/api/energy/meter-categories', {
+      params: { kind: params.kind }
     });
   },
 
@@ -528,6 +577,56 @@ export interface UsageRangeSeries {
   values: (number | null)[];
 }
 
+/**
+ * 计量点分类树 —— 「车间 → 用能类型 → 设备」三级。
+ *
+ * 为什么不用「线别」那一套：现场接口表里辅机 / 瓶胚 / 调配的「线别」列写的是
+ * 设备组合名（如「4号高压机+3号吹瓶冰水机」），根本不是一条产线。
+ * 要用「线别」硬塞，这些表就会挂到一条不存在的线上，或者干脆漏掉。
+ * 三级树是唯一能如实表达它们的结构。
+ */
+export interface MeterCategoryDevice {
+  /** 计量点编码，如 E-A1-01 */
+  code: string;
+  /** 计量点名称，如「一线生产线电表」 */
+  name: string;
+  /** 设备名（分类用），如「生产线」 */
+  deviceName: string;
+  /** 所属组织节点编码（产线 A1 / 辅助单元 AUX-CARB-AIR / 车间 WS-CARB） */
+  nodeCode: string;
+  nodeName: string;
+  /** line = 产线，aux = 辅助计量单元，workshop = 车间（总表） */
+  nodeType: string;
+  lineCode: string;
+  /** 库内能源编码：ELECTRIC / WATER / STEAM */
+  kind: string;
+  /** 中文能源名：电 / 水 / 汽 */
+  kindLabel: string;
+  unit: string;
+  enabled: boolean;
+  gateway: string;
+  /** 「怎么读到的」摘要：IP:端口 / 从站 N / 寄存器 M×2 */
+  address: string;
+}
+
+export interface MeterCategoryType {
+  /** 用能类型，如「生产线用电」「辅机用电」 */
+  usageType: string;
+  devices: MeterCategoryDevice[];
+}
+
+export interface MeterCategoryWorkshop {
+  workshop: string;
+  workshopCode: string;
+  types: MeterCategoryType[];
+}
+
+export interface MeterCategoryResult {
+  tree: MeterCategoryWorkshop[];
+  /** 树里设备总数，用于「共 N 个计量点」的提示 */
+  count: number;
+}
+
 export interface UsageRangeResult {
   from: string;
   to: string;
@@ -544,6 +643,21 @@ export interface UsageRangeResult {
   productionAvailable: boolean;
   bucketCount: number;
   cadence?: string;
+  /** 本次查询命中的计量点数（焦点通道用于显示「本范围 N 个点位」） */
+  meterCount?: number;
+  /**
+   * 计量点覆盖度 —— 解释「为什么合计是空的」。
+   *
+   * 车间合计的口径是「全部参与表都有可信值才算数」，所以只要有一块表
+   * 从没接入过，整条合计就恒为 `--`。这是对的（不返回偏小值），
+   * 但界面必须说清缺的是哪几块，否则用户会以为系统坏了。
+   */
+  coverage?: { total: number; covered: number; missing: string[] };
+  /** 服务器认为的「参考日」（YYYY-MM-DD），用于跨零点校准日期控件 */
+  serverDate?: string;
+  /** 实际生效的区间端点（精确到小时文本），比 from/to 更准 */
+  fromHour?: string;
+  toHour?: string;
 }
 
 /**

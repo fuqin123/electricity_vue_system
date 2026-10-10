@@ -87,28 +87,54 @@ logging:
 # 现场设备登记表（采集侧唯一真值来源）
 # ══════════════════════════════════════════════════════════════
 
+# ── 车间（组织节点）─────────────────────────────────────────
+# ⚠ v1.5.2 起支持多车间。每个车间在 `production_line` 表里是一条
+#   `node_type='workshop'` 的记录，车间总表（水/汽）挂它。
+#   产线（下面的 `lines`）通过 `workshop` 字段指定上级车间。
+#   一期只启用碳水车间；制造车间留一条注释，现场上线时取消注释即可。
+workshops:
+  - { code: WS-CARB, name: 碳水车间, sort: 10, enabled: true }
+  # - { code: WS-MANU, name: 制造车间, sort: 20, enabled: true }
+
 # ── 产线 ─────────────────────────────────────────────────────
-# rated（额定产能 瓶/小时）与 product（品项）属于产量侧数据，
-# 产量接口本次留空，这里先置 0，待产量改造时一并回填。
-# 产线主数据。
-# ⚠ rated（额定产能）与 product（品项）是**静态台账参数**，不是产量数据，
-#   产量未接入也要填 —— 没有它就算不出计划产量与达成率。
+# rated（额定产能 瓶/小时）与 product（品项）是**静态台账参数**，不是产量数据，
+# 产量未接入也要填 —— 没有它就算不出计划产量与达成率。
 #   取值与 frontend/packages/shared/src/config.ts 的 linesConfig 必须同值，
 #   否则大屏（读接口）与后台（读同一张表）会显示不一致。
 #   现场口径若有出入，改这里一处即可（或直接在后台「生产管理」改）。
+#
+# ⚠ `workshop` 指向 workshops 段的 code。现场确认 **A1—A6 全部属于碳水车间**。
 lines:
-  - { code: A1, name: 一线, sort: 1, rated: 30000, product: 冰红茶 500ml }
-  - { code: A2, name: 二线, sort: 2, rated: 30000, product: 绿茶 500ml }
-  - { code: A3, name: 三线, sort: 3, rated: 24000, product: 茉莉蜜茶 500ml }
-  - { code: A4, name: 四线, sort: 4, rated: 24000, product: 酸梅汤 500ml }
-  - { code: A5, name: 五线, sort: 5, rated: 18000, product: 纯净水 550ml }
-  - { code: A6, name: 六线, sort: 6, rated: 18000, product: 冰糖雪梨 500ml }
+  - { code: A1, name: 一线, sort: 1, rated: 30000, product: 冰红茶 500ml, workshop: WS-CARB }
+  - { code: A2, name: 二线, sort: 2, rated: 30000, product: 绿茶 500ml,   workshop: WS-CARB }
+  - { code: A3, name: 三线, sort: 3, rated: 24000, product: 茉莉蜜茶 500ml, workshop: WS-CARB }
+  - { code: A4, name: 四线, sort: 4, rated: 24000, product: 酸梅汤 500ml, workshop: WS-CARB }
+  - { code: A5, name: 五线, sort: 5, rated: 18000, product: 纯净水 550ml, workshop: WS-CARB }
+  - { code: A6, name: 六线, sort: 6, rated: 18000, product: 冰糖雪梨 500ml, workshop: WS-CARB }
+
+# ── 辅助计量单元（车间下的非产线计量组）──────────────────────
+# 「辅机 / 瓶胚 / 调配」这些用电不属于任何单条产线，但也**不是车间总表** ——
+# 它们记在车间下的一条 `node_type='aux'` 节点上，计入车间合计，但不参与
+# 产量与分摊分母（见 docs/车间归属与能耗分摊设计-草案v0.1.md）。
+# 现场接口表里 `线别` 列写的是「1号高压机+3台低压机…」这类设备组合名，
+# 归到哪个 aux 节点由下面的 `node` 字段决定。
+aux_nodes:
+  - { code: AUX-CARB-AIR,  name: 辅机-空压冰水, sort: 31, workshop: WS-CARB }
+  - { code: AUX-CARB-PREFORM, name: 辅机-瓶胚, sort: 32, workshop: WS-CARB }
+  - { code: AUX-CARB-BLEND,   name: 辅机-调配, sort: 33, workshop: WS-CARB }
 
 # ── 网关 ─────────────────────────────────────────────────────
 # kind:
 #   modbus_rtu_tcp —— 485 串口服务器。**必须用 RTU 组帧**（从站号+功能码+数据+CRC16），
 #                    不是 Modbus TCP 帧；现场参考实现见 E:\http_test\serial_servier.py
 #   http_api       —— 第三方数据平台的 JSON 接口
+#
+# ⚠ 现场 IP 与端口以《能源管理平台网关接口配置.md》为准（2026-10 更新）：
+#   · 10.112.66.41:8891 / 8893 / 8894 —— 一期配电房串口服务器 1/3/4 口
+#   · 10.112.66.133:8890              —— 一期配电房塔石
+#   · 10.114.1.40:8891                —— 二期配电房 1# 变压器（★ 部分网络环境不通，
+#                                        正式部署环境正常；采集失败会正常记 last_error）
+#   · 10.114.1.71:10123               —— 市政水表 1（Modbus TCP，从站 5、起始地址 68）
 gateways:
   - code: GW-PDB-1
     name: 一期配电房串口服务器1口
@@ -130,6 +156,18 @@ gateways:
     kind: modbus_rtu_tcp
     host: 10.112.66.133
     port: 8890
+  - code: GW-PDB2-T1
+    name: 二期配电房1#变压器
+    kind: modbus_rtu_tcp
+    host: 10.114.1.40
+    port: 8891
+    remark: 现场部分网络不通，正式部署环境正常（见接口表备注）
+  - code: GW-WATER-CTY
+    name: 市政水表1
+    kind: modbus_rtu_tcp
+    host: 10.114.1.71
+    port: 10123
+    remark: 碳水市政水表1；从站 5、起始地址 68（不是常规的 1000）
   - code: GW-API-DJ
     name: 顶津能源平台（HTTP API）
     kind: http_api
@@ -137,41 +175,95 @@ gateways:
     timeout_ms: 8000
 
 # ── 计量点 ───────────────────────────────────────────────────
-# 电表（串口服务器）：功能码 03、起始寄存器 1000、2 个寄存器、32 位、倍率 0.1 → kWh
-#   现场 13 块表已全部实测可读。`max_hourly` 是异常尖峰阈值，先给一个宽松值，
-#   试运行一周后按实际用量重新标定（换表还会被「差值<0」rules 兜住，不依赖它）。
+# 电表（串口服务器）：功能码 03、**2 个寄存器、32 位、倍率 0.1 → kWh**。
+#   起始地址**跟仪表走**：现场绝大多数是 1000，但市政水表是 68（见下），
+#   所以 `register` 必须逐条显式写，不能靠默认值。
+#
+# 字段说明（新增三个，供后台「车间 → 类型 → 设备」三级筛选）：
+#   · workshop     —— 冗余留档，实际归属由 `line` / `node` 决定
+#   · usage_type   —— 用能类型（生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电）
+#   · device_name  —— 设备名（吹瓶机 / 冰水机和水塔 / 溶糖CIP …）
+#   · line         —— 挂到产线（A1—A6）
+#   · node         —— 挂到辅助计量单元（aux_nodes 段的 code）
+#
+# 现场接口表里的「线别」对辅机类设备写的是设备组合名，因此下面用 `node`
+# 而不是 `line` 挂靠；`device_name` 保留现场原文，界面第三级直接显示它。
 meters:
-  # ── 一线 ──
-  - { code: E-A1-01, name: 一线 生产线电表, kind: elec, scope: line, role: line, line: A1, gateway: GW-PDB-4, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A1-02, name: 一线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A1, gateway: GW-PDB-4, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  # ── 二线 ──
-  - { code: E-A2-01, name: 二线 生产线电表, kind: elec, scope: line, role: line, line: A2, gateway: GW-PDB-3, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A2-02, name: 二线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A2, gateway: GW-PDB-3, slave: 5,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  # ── 三线（两块生产线表 + 一块吹瓶机表）──
-  - { code: E-A3-01, name: 三线 生产线1电表, kind: elec, scope: line, role: line, line: A3, gateway: GW-PDB-1, slave: 13, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A3-02, name: 三线 生产线2电表, kind: elec, scope: line, role: line, line: A3, gateway: GW-PDB-1, slave: 15, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A3-03, name: 三线 吹瓶机电表,  kind: elec, scope: line, role: aux,  line: A3, gateway: GW-PDB-1, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  # ── 四线 ──
-  - { code: E-A4-01, name: 四线 生产线电表, kind: elec, scope: line, role: line, line: A4, gateway: GW-TASHI, slave: 11, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  # ── 五线（生产线 + 吹瓶机 + 冰水机）──
-  - { code: E-A5-01, name: 五线 生产线电表, kind: elec, scope: line, role: line, line: A5, gateway: GW-PDB-1, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A5-02, name: 五线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A5, gateway: GW-PDB-1, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A5-03, name: 五线 冰水机电表, kind: elec, scope: line, role: aux,  line: A5, gateway: GW-TASHI, slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  # ── 六线 ──
-  - { code: E-A6-01, name: 六线 生产线电表, kind: elec, scope: line, role: line, line: A6, gateway: GW-TASHI, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A6-02, name: 六线 吹瓶机电表, kind: elec, scope: line, role: aux,  line: A6, gateway: GW-TASHI, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  # ══ 生产线用电（挂产线）══
+  - { code: E-A1-01, name: 一线生产线电表,      kind: elec, scope: line, role: line, line: A1, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-4, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A1-02, name: 一线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A1, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-4, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A2-01, name: 二线生产线电表,      kind: elec, scope: line, role: line, line: A2, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-3, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A2-02, name: 二线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A2, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-3, slave: 5,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-01, name: 三线生产线1电表,     kind: elec, scope: line, role: line, line: A3, usage_type: 生产线用电, device_name: 生产线1, gateway: GW-PDB-1, slave: 13, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-02, name: 三线生产线2电表,     kind: elec, scope: line, role: line, line: A3, usage_type: 生产线用电, device_name: 生产线2, gateway: GW-PDB-1, slave: 15, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-03, name: 三线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A3, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-1, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A4-01, name: 四线生产线电表,      kind: elec, scope: line, role: line, line: A4, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-TASHI, slave: 11, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-01, name: 五线生产线电表,      kind: elec, scope: line, role: line, line: A5, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-1, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-02, name: 五线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A5, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-1, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-03, name: 五线冰水机电表,      kind: elec, scope: line, role: aux,  line: A5, usage_type: 生产线用电, device_name: 冰水机,  gateway: GW-TASHI, slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A6-01, name: 六线生产线电表,      kind: elec, scope: line, role: line, line: A6, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-TASHI, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A6-02, name: 六线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A6, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-TASHI, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
 
-  # ── 车间级总表（只有总表，不拆到线别，也就没有均摊问题）──
+  # ══ 辅机用电（挂 aux 节点；现场「线别」列为设备组合名）══
+  - { code: E-AUX-10, name: 冰水泵及塔1电表,                        kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-14, name: 冰水泵及塔2+小冰水机电表,               kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-3-10, name: 4号高压机+3号吹瓶冰水机电表,          kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压机和冰水机, gateway: GW-PDB-3, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-4-7, name: 1号高压机+3台低压机+1号吹瓶冰水机电表, kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 空压机和冰水机, gateway: GW-PDB-4, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-3-6, name: 2号高压机+2号吹瓶冰水机电表,           kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压机和冰水机, gateway: GW-PDB-3, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-3-9, name: 3号高压机+5/6号吹瓶冰水机+2台瓶胚低压机电表, kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 空压机和冰水机, gateway: GW-PDB-3, slave: 9, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-T8, name: 5号高压机电表,                          kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压机,      gateway: GW-TASHI,   slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-16, name: 冰水主机/水泵1电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 16, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-17, name: 冰水主机/水泵2电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 17, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-18, name: 冰水主机/水泵3电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 18, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+
+  # ══ 瓶胚用电 ══
+  - { code: E-PREFORM-1, name: 瓶胚1#电表,      kind: elec, scope: line, role: aux, node: AUX-CARB-PREFORM, usage_type: 瓶胚用电, device_name: 瓶胚机1,      gateway: GW-PDB2-T1, slave: 9,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000, remark: 10.114.1.40 部分网络不通，正式环境正常 }
+  - { code: E-PREFORM-2, name: 瓶胚2#电表,      kind: elec, scope: line, role: aux, node: AUX-CARB-PREFORM, usage_type: 瓶胚用电, device_name: 瓶胚机2,      gateway: GW-PDB-1,   slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-PREFORM-3, name: 瓶胚3#电表,      kind: elec, scope: line, role: aux, node: AUX-CARB-PREFORM, usage_type: 瓶胚用电, device_name: 瓶胚机3,      gateway: GW-TASHI,   slave: 9,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-PREFORM-3W, name: 瓶胚塔水空调电表, kind: elec, scope: line, role: aux, node: AUX-CARB-PREFORM, usage_type: 瓶胚用电, device_name: 瓶胚塔水空调, gateway: GW-PDB-1,   slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+
+  # ══ 调配用电 ══
+  - { code: E-BLEND-9,  name: 溶糖CIP电表,   kind: elec, scope: line, role: aux, node: AUX-CARB-BLEND, usage_type: 调配用电, device_name: 溶糖CIP,   gateway: GW-PDB-4, slave: 9,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-BLEND-12, name: 果糖系统电表,  kind: elec, scope: line, role: aux, node: AUX-CARB-BLEND, usage_type: 调配用电, device_name: 果糖系统,  gateway: GW-PDB-4, slave: 12, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-BLEND-3-8, name: 调配水站1电表, kind: elec, scope: line, role: aux, node: AUX-CARB-BLEND, usage_type: 调配用电, device_name: 调配水站1, gateway: GW-PDB-3, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-BLEND-3-11, name: 调配水站2电表, kind: elec, scope: line, role: aux, node: AUX-CARB-BLEND, usage_type: 调配用电, device_name: 调配水站2, gateway: GW-PDB-3, slave: 11, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+
+  # ══ 车间级总表（挂车间节点，不拆到线别）══
+  #
+  # ⚠ 市政水表**起始地址是 68，不是 1000** —— 现场接口表明确写了
+  #   「起始地址取决于对应仪表的起始地址，跟仪表走」。这条也是本项目
+  #   唯一一块走 Modbus TCP 的水表（其余水/汽走 HTTP API）。
+  - code: W-CARB-CITY-1
+    name: 碳水市政水表1
+    kind: water
+    scope: workshop
+    role: total
+    node: WS-CARB
+    usage_type: 碳水市政水
+    device_name: 市政水表1
+    gateway: GW-WATER-CTY
+    slave: 5
+    register: 68
+    registers: 2
+    scale: 0.1
+    unit: m³
+    max_hourly: 500
+    remark: 起始地址 68（非 1000）；倍率 0.1 待现场核对水表铭牌后确认
+
+  # 车间蒸汽表：**沿用现场既有编号 S-WS-01**（已有历史读数，换编号会断链）。
   - code: S-WS-01
-    name: 一期蒸汽表1#
+    name: 碳水车间蒸汽表1#
     kind: steam
     scope: workshop
     role: total
+    node: WS-CARB
+    usage_type: 车间蒸汽
+    device_name: 蒸汽表1#
     gateway: GW-API-DJ
     url_path: /js/a/at/yewushishi/atYewushuju/Data_dingjin
-    params: { cid: 135, token: CHANGE_ME }      # ← 用 settings.local.yaml 填真值
-    value_path: data.0.device_data.var1          # 累计蒸汽量
-    time_path: data.0.device_data.collect_time   # 平台采集时间
+    params: { cid: 135, token: CHANGE_ME }       # ← 用 settings.local.yaml 填真值
+    value_path: data.0.device_data.var1           # 累计蒸汽量
+    time_path: data.0.device_data.collect_time    # 平台采集时间
     scale: 1
     unit: t
     max_hourly: 100
@@ -180,10 +272,13 @@ meters:
   # ⚠ 车间进水总表：现场尚未提供接口地址与令牌，先登记不采集。
   #   拿到后把 url_path / params / value_path 补齐、enabled 改 true 即可，无需改代码。
   - code: W-WS-01
-    name: 车间进水总表
+    name: 碳水车间进水总表
     kind: water
     scope: workshop
     role: total
+    node: WS-CARB
+    usage_type: 车间进水
+    device_name: 进水总表(待接入)
     gateway: GW-API-DJ
     url_path: CHANGE_ME
     params: { cid: 0, token: CHANGE_ME }
@@ -193,7 +288,7 @@ meters:
     unit: t
     max_hourly: 500
     enabled: false
-    remark: 接入方式待现场确认（接口地址 / cid / token），暂不采集
+    remark: 接口地址 / cid / token 待现场确认
 
 # ── 业务阈值默认值 ───────────────────────────────────────────
 # 上线后以数据库/后台的「系统参数」为准，这里只是首次初始化的默认值。

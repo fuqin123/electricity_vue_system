@@ -48,33 +48,90 @@ def _energy_type(kind: str) -> EnergyType:
     return obj
 
 
+def _unit_for(etype: EnergyType, raw: str | None) -> str:
+    """计量点单位 —— 配置没写时**按能源类型推**，不要一律兜成 kWh。
+
+    ⚠ 这是一个静默错量纲的源头（B-535 同族）：旧代码写死
+      `item.get("unit", "kWh")`，于是漏写 `unit` 的**水表 / 汽表**会被登记成
+      「单位 = kWh」。单位本身不参与计算（小时差值只看累计值），所以采集、
+      聚合、汇总全都正常跑通、不报任何错，只有界面把 380 吨水标成 380 kWh ——
+      现场核对时表现为「数字对不上」，而不是「配置错了」。
+
+    推论：`unit` 只影响展示，**越是不报错的地方越要写死规则**。
+    """
+    text = str(raw or "").strip()
+    if text:
+        return text
+    return EnergyType.DEFAULT_UNIT.get(etype.type_code, "kWh")
+
+
 @transaction.atomic
 def sync_registry(*, force: bool = False) -> dict:
-    """按配置 upsert 产线 / 网关 / 计量点。返回变更计数。
+    """按配置 upsert 车间 / 辅助单元 / 产线 / 网关 / 计量点。返回变更计数。
 
     ⚠ **配置来源优先级：后台维护 > 配置文件。**
       后台（管理界面）改过的记录会打上 `source = admin`，本函数默认**跳过**它们 ——
       否则现场在后台调好的从站号/倍率，会被下一次 `seed_registry` 悄悄改回配置里的旧值，
       而且现场根本想不到是这个原因（这类「改了又自己变回去」最难查）。
       确实要以配置文件为准时，显式加 `--force`。
-    """
-    stat = {"line": 0, "gateway": 0, "meter": 0, "skipped": 0}
 
-    # ── 产线 ────────────────────────────────────────────────
-    for item in conf.get("lines", []) or []:
+    ⚠ v1.5.2 起组织节点分三层（见 models.ProductionLine 的 node_type）：
+      `workshops`（车间）→ `lines`（产线）/ `aux_nodes`（辅助单元）。
+      产线与辅助单元通过 `workshop` 字段指定上级车间。
+    """
+    stat = {"workshop": 0, "aux": 0, "line": 0, "gateway": 0, "meter": 0, "skipped": 0}
+
+    # ── 车间 ────────────────────────────────────────────────
+    # 先建车间，后面产线/辅助单元才能挂上去（parent 是非空挂靠，顺序不能反）。
+    for item in conf.get("workshops", []) or []:
         ProductionLine.objects.update_or_create(
             line_code=item["code"],
             defaults={
                 "line_name": item.get("name", item["code"]),
-                "rated": int(item.get("rated", 0) or 0),
-                "product": item.get("product", ""),
+                "node_type": ProductionLine.NODE_WORKSHOP,
+                "line_type": ProductionLine.TYPE_WORKSHOP,
+                "parent": None,  # 车间节点没有父级
                 "sort": int(item.get("sort", 0) or 0),
-                # 配置里的 enabled 只映射到 status；line_type 一律是产线
-                # （车间哨兵行由 0006 迁移建好，配置里不要出现，否则会把 it 变回产线）
                 "status": (
                     ProductionLine.STATUS_ON if item.get("enabled", True) else ProductionLine.STATUS_OFF
                 ),
+            },
+        )
+        stat["workshop"] += 1
+
+    # ── 辅助计量单元（辅机 / 瓶胚 / 调配）────────────────────
+    for item in conf.get("aux_nodes", []) or []:
+        parent = _find_workshop(item.get("workshop"))
+        ProductionLine.objects.update_or_create(
+            line_code=item["code"],
+            defaults={
+                "line_name": item.get("name", item["code"]),
+                "node_type": ProductionLine.NODE_AUX,
                 "line_type": ProductionLine.TYPE_LINE,
+                "parent": parent,
+                "sort": int(item.get("sort", 0) or 0),
+                "status": ProductionLine.STATUS_ON,
+            },
+        )
+        stat["aux"] += 1
+
+    # ── 产线 ────────────────────────────────────────────────
+    for item in conf.get("lines", []) or []:
+        parent = _find_workshop(item.get("workshop"))
+        ProductionLine.objects.update_or_create(
+            line_code=item["code"],
+            defaults={
+                "line_name": item.get("name", item["code"]),
+                "node_type": ProductionLine.NODE_LINE,
+                # 配置里的 enabled 只映射到 status
+                "line_type": ProductionLine.TYPE_LINE,
+                "parent": parent,
+                "rated": int(item.get("rated", 0) or 0),
+                "product": item.get("product", ""),
+                "sort": int(item.get("sort", 0) or 0),
+                "status": (
+                    ProductionLine.STATUS_ON if item.get("enabled", True) else ProductionLine.STATUS_OFF
+                ),
             },
         )
         stat["line"] += 1
@@ -117,24 +174,9 @@ def sync_registry(*, force: bool = False) -> dict:
         if gw is None:
             raise ValueError(f"计量点 {item.get('code')} 引用了不存在的网关：{gw_code}")
 
-        line = None
-        if item.get("line"):
-            line = line_map.get(item["line"]) or ProductionLine.objects.filter(line_code=item["line"]).first()
-            if line is None:
-                raise ValueError(f"计量点 {item.get('code')} 引用了不存在的产线：{item['line']}")
-
-        scope = item.get("scope", EnergyMeter.SCOPE_LINE)
-        if scope == EnergyMeter.SCOPE_WORKSHOP:
-            # 车间水/汽总表挂「车间哨兵行」—— 汇总表的唯一键需要 line，
-            # 留空会让 MySQL 的唯一约束失效（多个 NULL 互不相同）
-            line = ProductionLine.objects.get_or_create(
-                line_code=ProductionLine.WORKSHOP_CODE,
-                defaults={
-                    "line_name": "车间（总表）",
-                    "line_type": ProductionLine.TYPE_WORKSHOP,
-                    "sort": 0,
-                },
-            )[0]
+        line = _resolve_node(item, line_map)
+        # 能源类型先解析出来：单位兜底要用它，且解析失败要在这里就报错（别等写库）
+        etype = _energy_type(item["kind"])
 
         existed = EnergyMeter.objects.filter(code=item["code"]).first()
         if existed is not None and existed.source == EnergyMeter.SOURCE_ADMIN and not force:
@@ -147,9 +189,12 @@ def sync_registry(*, force: bool = False) -> dict:
             defaults={
                 "name": item.get("name", item["code"]),
                 # 配置里写的是能源短码（elec/water/steam），库里是 ELECTRIC/WATER/STEAM
-                "energy_type": _energy_type(item["kind"]),
-                "scope": scope,
+                "energy_type": etype,
+                "scope": item.get("scope", EnergyMeter.SCOPE_LINE),
                 "role": item.get("role", EnergyMeter.ROLE_LINE),
+                # v1.5.2：界面「车间 → 类型 → 设备」三级筛选的数据来源
+                "usage_type": item.get("usage_type", "") or "",
+                "device_name": item.get("device_name", "") or "",
                 "line": line,
                 "gateway": gw,
                 "slave": item.get("slave"),
@@ -162,7 +207,8 @@ def sync_registry(*, force: bool = False) -> dict:
                 "value_path": item.get("value_path", "") or "",
                 "time_path": item.get("time_path", "") or "",
                 "scale": _dec(item.get("scale", 1)),
-                "unit": item.get("unit", "kWh"),
+                # 漏写 unit 时按能源类型推（水=m³ / 汽=t），**不要兜成 kWh**
+                "unit": _unit_for(etype, item.get("unit")),
                 "max_hourly": _dec(item["max_hourly"]) if item.get("max_hourly") is not None else None,
                 "enabled": bool(item.get("enabled", True)),
                 "remark": item.get("remark", ""),
@@ -174,3 +220,55 @@ def sync_registry(*, force: bool = False) -> dict:
 
     logger.info("登记表同步完成：%s", stat)
     return stat
+
+
+def _find_workshop(code: str | None) -> ProductionLine | None:
+    """按车间编码取车间节点；未指定时返回 None（不瞎猜一个车间回去）。
+
+    ⚠ 旧实现在 scope=workshop 时无条件 `get_or_create(WORKSHOP)` —— 多车间下
+      这会把所有车间级仪表都挂到同一个节点上，是必须修掉的写法。
+    """
+    if not code:
+        return None
+    obj = ProductionLine.objects.filter(
+        line_code=code, node_type=ProductionLine.NODE_WORKSHOP
+    ).first()
+    if obj is None:
+        raise ValueError(
+            f"配置引用了不存在的车间：{code}（请先在 workshops 段登记，注意大小写）"
+        )
+    return obj
+
+
+def _resolve_node(item: dict, line_map: dict[str, ProductionLine]) -> ProductionLine:
+    """决定这条计量点挂到哪个组织节点。
+
+    优先级：`node`（车间 / 辅助单元）> `line`（产线）> `scope=workshop` 时的车间。
+
+    ⚠ `node` 是新写法，现场接口表里辅机类的「线别」列写的是设备组合名
+      （「1号高压机+3台低压机…」），不是一个产线编码，必须能挂到 aux 节点上。
+    """
+    node_code = item.get("node")
+    if node_code:
+        node = line_map.get(node_code) or ProductionLine.objects.filter(line_code=node_code).first()
+        if node is None:
+            raise ValueError(f"计量点 {item.get('code')} 引用了不存在的节点：{node_code}")
+        return node
+
+    if item.get("line"):
+        line = line_map.get(item["line"]) or ProductionLine.objects.filter(
+            line_code=item["line"]
+        ).first()
+        if line is None:
+            raise ValueError(f"计量点 {item.get('code')} 引用了不存在的产线：{item['line']}")
+        return line
+
+    if item.get("scope") == EnergyMeter.SCOPE_WORKSHOP:
+        # 车间总表必须显式说明是哪个车间；只写 scope=workshop 而不给 node，
+        # 在多车间下无法判断该挂哪里（旧代码是瞎猜一个）。
+        raise ValueError(
+            f"车间级计量点 {item.get('code')} 必须用 `node:` 指定所属车间编码"
+            f"（如 node: WS-CARB）"
+        )
+
+    raise ValueError(f"计量点 {item.get('code')} 既没有 line 也没有 node，无法确定归属")

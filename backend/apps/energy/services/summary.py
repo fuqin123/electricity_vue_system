@@ -194,39 +194,52 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
     **不是**「日末读数 − 日初读数」—— 那样会静默吞掉采集中断的小时。
     """
     now = now or datetime.now()
-    lines = list(ProductionLine.objects.all())
+    # ⚠ 不能用 `.all()`：多车间后表里有 workshop / aux 节点，
+    #   它们不是产线，逐条写「产线汇总行」会产出无意义的行（B-519 那类漏改）。
+    #   车间级水/汽由下面的 workshop 分支单独处理。
+    lines = list(ProductionLine.lines_qs())
+    workshops = _workshops()
     types = {t.type_code: t for t in EnergyType.objects.all()}
     written: list[str] = []
 
     for day_key_start in (day,):
-        for line in lines:
-            if line.is_workshop:
-                # 车间行只填水 / 汽（车间电力没有总表，见模块说明）
-                for code in (EnergyType.WATER, EnergyType.STEAM):
-                    etype = types.get(code)
-                    meter = EnergyMeter.objects.filter(
-                        line=line, energy_type=etype, enabled=True
-                    ).first()
-                    if etype is None or meter is None:
-                        continue
-                    total, covered = _one_type_metrics(meter, day, day)
-                    written.append(
-                        _upsert(
-                            EnergyDaily,
-                            line,
-                            etype,
-                            DIM_DAY,
-                            day,
-                            consumption=total,
-                            unit=etype.unit,
-                            covered_count=covered,
-                            expected_count=24,
-                            quality=_quality_from(covered, 24),
-                        )
+        # ── 车间节点：水 / 汽（总表口径）──
+        for ws in workshops:
+            for code in (EnergyType.WATER, EnergyType.STEAM):
+                etype = types.get(code)
+                if etype is None:
+                    continue
+                meters = EnergyMeter.objects.filter(line=ws, energy_type=etype, enabled=True)
+                if not meters.exists():
+                    continue
+                # 一块总表时行为与旧实现一致；多块则求和（缺一块即整段 None）
+                total = Decimal(0)
+                covered = 0
+                for m in meters:
+                    sub_total, sub_covered = _one_type_metrics(m, day, day)
+                    if sub_total is None:
+                        total = None
+                        covered = 0
+                        break
+                    total += sub_total
+                    covered = max(covered, sub_covered)
+                written.append(
+                    _upsert(
+                        EnergyDaily,
+                        ws,
+                        etype,
+                        DIM_DAY,
+                        day,
+                        consumption=total,
+                        unit=etype.unit,
+                        covered_count=covered,
+                        expected_count=24,
+                        quality=_quality_from(covered, 24),
                     )
-                continue
+                )
 
-            # 产线行：电力是这块产线自己的电表之和
+        # ── 产线节点：电力 ──
+        for line in lines:
             total, covered = _elec_metrics([line], day, day)
             etype = types.get(EnergyType.ELECTRIC)
             if etype is not None:
@@ -234,6 +247,28 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                     _upsert(
                         EnergyDaily,
                         line,
+                        etype,
+                        DIM_DAY,
+                        day,
+                        consumption=total,
+                        unit=etype.unit,
+                        covered_count=covered,
+                        expected_count=24,
+                        quality=_quality_from(covered, 24),
+                    )
+                )
+
+        # ── 辅助计量单元：电力（辅机 / 瓶胚 / 调配）──
+        # 挂到 aux 节点自己名下，这样「车间合计 = 产线 + 辅机」可以直接由
+        # 本车间所有节点的日行相加得出，不必在查询时特判。
+        for aux in ProductionLine.objects.filter(node_type=ProductionLine.NODE_AUX):
+            total, covered = _elec_metrics([aux], day, day)
+            etype = types.get(EnergyType.ELECTRIC)
+            if etype is not None:
+                written.append(
+                    _upsert(
+                        EnergyDaily,
+                        aux,
                         etype,
                         DIM_DAY,
                         day,
@@ -262,10 +297,12 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
     for anchor in days:
         start, end = period_bounds(dim, make_key(dim, anchor))
         expected = _days_in(start, end, now) if dim == DIM_MONTH else 0
-        for line in ProductionLine.objects.all():
+        # 与 summarize_days 同源：产线 + 车间 + 辅助单元三类节点都要有月/年行，
+        # 否则「车间合计」在查询时按节点相加会漏掉辅机（见 _workshop_scope_lines）。
+        for node in ProductionLine.objects.all():
             for etype in EnergyType.objects.all():
                 rows = EnergyDaily.objects.filter(
-                    line=line, energy_type=etype, stat_date__gte=start, stat_date__lte=end
+                    line=node, energy_type=etype, stat_date__gte=start, stat_date__lte=end
                 )
                 agg = rows.aggregate(t=Sum("consumption"), c=Sum("covered_count"))
                 # 该周期有多少天是有可信数据的（用来算覆盖率）
@@ -276,7 +313,7 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
                 written.append(
                     _upsert(
                         model,
-                        line,
+                        node,
                         etype,
                         dim,
                         start,
@@ -375,9 +412,28 @@ def _line_scope_lines(line: ProductionLine | None) -> list[ProductionLine]:
     return [line] if line is not None else []
 
 
-def _workshop_scope_lines() -> list[ProductionLine]:
-    """scope=workshop 时参与**电力**合计的产线：全部真实产线（不含车间哨兵行）。"""
-    return list(ProductionLine.objects.filter(line_type=ProductionLine.TYPE_LINE))
+def _workshop_scope_lines(workshop: ProductionLine | None = None) -> list[ProductionLine]:
+    """scope=workshop 时参与**电力**合计的节点。
+
+    ⚠ v1.5.2 口径变更（旧实现只返回全部真实产线，已作废）：
+      现场车间级电力**有实测总表**（辅机 / 瓶胚 / 调配等），所以车间电力合计 =
+      本车间产线电表 + 本车间辅助单元（aux）电表。旧口径「车间电力 = 6 条产线之和、
+      无独立总表」是辅机未接入时的临时状态，辅机接入后继续沿用会**漏掉辅机电量**。
+
+    `workshop` 给定时只算该车间下的节点；不给时（兼容旧调用方）返回全部产线与
+    辅助单元，语义等同「全厂」。
+    """
+    qs = ProductionLine.objects.filter(
+        node_type__in=(ProductionLine.NODE_LINE, ProductionLine.NODE_AUX)
+    )
+    if workshop is not None:
+        qs = qs.filter(parent=workshop)
+    return list(qs)
+
+
+def _workshops() -> list[ProductionLine]:
+    """全部车间节点，按 sort 排序（多车间后**不要**再写 `.first()` 取唯一车间）。"""
+    return list(ProductionLine.workshops_qs().order_by("sort", "line_code"))
 
 
 def _day_not_settled(dim: str, start: date_cls, now: datetime) -> bool:
@@ -434,12 +490,17 @@ def period_rows(
     else:
         agg_lines = _line_scope_lines(line)
 
-    # 车间的水/汽取哨兵行上的总表
-    workshop_line = None
+    # 车间的水/汽取车间节点上的总表。
+    # ⚠ v1.5.2：旧实现是无条件 `.first()`（全库唯一一条车间哨兵行）。
+    #   多车间下这会永远取到同一个车间 —— 碳水车间的界面会显示制造车间的蒸汽。
+    #   现在按「传入的 line 是哪个车间」解析；调用方没有指定车间时（大屏的
+    #   全厂视图）汇总全部车间的水/汽总表。
+    workshop_lines: list[ProductionLine] = []
     if scope == SCOPE_WORKSHOP:
-        workshop_line = ProductionLine.objects.filter(
-            line_type=ProductionLine.TYPE_WORKSHOP
-        ).first()
+        if line is not None and line.is_workshop:
+            workshop_lines = [line]
+        else:
+            workshop_lines = _workshops()
 
     for key in keys:
         start, end = period_bounds(dim, key)
@@ -484,33 +545,63 @@ def period_rows(
             quality = _quality_from(covered, expected)
 
         # ── 水 / 汽（只有车间级有）──
+        # 多个车间时**逐车间累加**：任一车间缺数则整段为 None（缺数不补 0）。
         water = steam = None
-        if workshop_line is not None:
+        if workshop_lines:
             for code, holder in ((EnergyType.WATER, "water"), (EnergyType.STEAM, "steam")):
                 etype = types.get(code)
                 if etype is None:
                     continue
-                if open_period or live_fallback:
-                    meter = EnergyMeter.objects.filter(
-                        line=workshop_line, energy_type=etype, enabled=True
-                    ).first()
-                    val = _one_type_metrics(meter, start, end)[0] if meter is not None else None
-                elif dim == DIM_DAY:
-                    row = EnergyDaily.objects.filter(
-                        line=workshop_line, energy_type=etype, stat_date=start
-                    ).first()
-                    val = row.consumption if row else None
-                else:
-                    row = model.objects.filter(
-                        line=workshop_line,
-                        energy_type=etype,
-                        **{period_field: _period_value(dim, start)},
-                    ).first()
-                    val = row.consumption if row else None
-                if holder == "water":
-                    water = val
-                else:
-                    steam = val
+                parts: list[Decimal] = []
+                missing = False
+                for ws in workshop_lines:
+                    meters = EnergyMeter.objects.filter(
+                        line=ws, energy_type=etype, enabled=True
+                    )
+                    meter = meters.first()
+                    val: Decimal | None = None
+                    if open_period or live_fallback:
+                        # 多块总表时求和（如车间进水 + 车间回用）
+                        subtotal = None
+                        for m in meters:
+                            v = _one_type_metrics(m, start, end)[0]
+                            if v is None:
+                                subtotal = None
+                                break
+                            subtotal = v if subtotal is None else subtotal + v
+                        val = subtotal
+                    elif dim == DIM_DAY:
+                        rows = EnergyDaily.objects.filter(
+                            line=ws, energy_type=etype, stat_date=start
+                        )
+                        vals = [r.consumption for r in rows]
+                        val = (
+                            sum(vals, Decimal(0))
+                            if vals and all(v is not None for v in vals)
+                            else None
+                        )
+                    else:
+                        rows = model.objects.filter(
+                            line=ws,
+                            energy_type=etype,
+                            **{period_field: _period_value(dim, start)},
+                        )
+                        vals = [r.consumption for r in rows]
+                        val = (
+                            sum(vals, Decimal(0))
+                            if vals and all(v is not None for v in vals)
+                            else None
+                        )
+                    if val is None:
+                        missing = True
+                        break
+                    parts.append(val)
+                if not missing and parts:
+                    total_val = sum(parts, Decimal(0))
+                    if holder == "water":
+                        water = total_val
+                    else:
+                        steam = total_val
 
         # ── 产量（不在汇总表里，按区间现算；24 行/天/线，开销可忽略）──
         output = None

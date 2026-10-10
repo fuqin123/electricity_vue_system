@@ -665,7 +665,7 @@ def _utility_metric(kind: str, now: datetime, unit: str, closed: bool = False) -
 
 def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict:
     now = now or datetime.now()
-    lines = list(ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE))
+    lines = list(ProductionLine.active_lines_qs())
     line_dicts = [build_line(ln, now, closed=closed) for ln in lines]
 
     w_cells = _workshop_kwh_cells(now.date(), now, closed)
@@ -801,7 +801,7 @@ def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
         meter__energy_type__type_code=EnergyType.ELECTRIC, stat_date__gte=start, stat_date__lte=end, quality__in=EnergyHourly.TRUSTED
     ).aggregate(total=Sum("consumption"))
     out = sum(
-        (production_sum(ln, start, end) for ln in ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE)), Decimal(0)
+        (production_sum(ln, start, end) for ln in ProductionLine.active_lines_qs()), Decimal(0)
     )
     return {"output": int(out) if real else NULL, "kwh": agg["total"] or Decimal(0)}
 

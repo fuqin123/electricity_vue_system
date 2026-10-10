@@ -118,7 +118,7 @@ class Command(BaseCommand):
           绝不会把占位误当成真实产量。
         """
         now = datetime.now()
-        lines = list(ProductionLine.objects.filter(status=ProductionLine.STATUS_ON, line_type=ProductionLine.TYPE_LINE))
+        lines = list(ProductionLine.active_lines_qs())
         total = 0
         for back in range(days):
             day = (now - timedelta(days=back)).date()
