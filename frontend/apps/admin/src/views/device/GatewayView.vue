@@ -219,6 +219,10 @@ async function doTest(g: Gateway) {
   } finally {
     testing.value = null;
     testVisible.value = true;
+    // ⚠ 无论成败都要刷新：测试结果会写成网关的「成功 / 失败证据」（B-542），
+    //   失败同样会把状态翻成「离线」。旧代码写成 `if (res.reachable) refresh()`，
+    //   于是测试失败的网关点了也没反应，看起来像「状态没有更新」。
+    await refresh();
   }
 }
 </script>

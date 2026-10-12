@@ -15,7 +15,7 @@
  */
 import { computed, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { adminApi, type Gateway, type MeterPoint } from '@eep/shared';
+import { adminApi, type Gateway, type LineMaster, type MeterPoint } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
@@ -78,7 +78,8 @@ function blankForm() {
     kind: 'elec' as MeterPoint['kind'],
     scope: 'line' as MeterPoint['scope'],
     role: 'line' as MeterPoint['role'],
-    lineCode: 'A1',
+    // 归属节点由 openCreate() 按实际节点列表回填，不写死 'A1'（B-541）
+    lineCode: '',
     gatewayId: null as number | null,
     slave: 1 as number | null,
     register: 1000 as number | null,
@@ -101,6 +102,35 @@ function blankForm() {
 
 const form = reactive(blankForm());
 
+/* ── 组织节点（所属产线 / 辅助计量单元）─────────────────────
+ * ⚠ v1.5.2 修复（B-541）：这里原来把选项**写死成 ['A1'..'A6']**，
+ *   于是现场新增辅机 / 调配 / 瓶胚的点位时根本选不到归属节点 ——
+ *   而那三类电表恰恰不挂在产线上（挂 AUX-CARB-AIR / -BLEND / -PREFORM）。
+ *   改为从 `admin/lines` 拉全部组织节点，按 nodeType 分两组展示。
+ */
+const nodes = ref<LineMaster[]>([]);
+
+/** 可被计量点归属的节点：产线 + 辅助计量单元（车间走 scope=车间总表，不在此列） */
+const nodeGroups = computed(() => {
+  const lines: LineMaster[] = [];
+  const auxes: LineMaster[] = [];
+  for (const n of nodes.value) {
+    // 演示数据没有 nodeType，按产线处理（降级不报错）
+    const t = n.nodeType ?? 'line';
+    if (t === 'line') lines.push(n);
+    else if (t === 'aux') auxes.push(n);
+  }
+  const groups: { label: string; items: LineMaster[] }[] = [];
+  if (lines.length) groups.push({ label: '产线', items: lines });
+  if (auxes.length) groups.push({ label: '辅助计量单元（辅机 / 调配 / 瓶胚）', items: auxes });
+  return groups;
+});
+
+/** 新增时的默认归属：取第一个产线节点，而不是写死 'A1' */
+function defaultNodeCode(): string {
+  return nodeGroups.value[0]?.items[0]?.code ?? '';
+}
+
 /** 当前选择的网关 —— 决定表单显示 Modbus 段还是 HTTP 段 */
 const currentGateway = computed(() => gateways.value.find((g) => g.id === form.gatewayId) ?? null);
 const isModbus = computed(() => currentGateway.value?.kind !== 'http_api');
@@ -113,6 +143,8 @@ function openCreate() {
   Object.assign(form, blankForm());
   editingId.value = null;
   if (gateways.value.length) form.gatewayId = gateways.value[0].id;
+  // 归属默认取真实节点列表的第一个产线（而不是写死的 'A1'）
+  form.lineCode = defaultNodeCode();
   drawer.value = true;
 }
 
@@ -153,6 +185,11 @@ async function submit() {
   }
   if (!form.gatewayId) {
     ElMessage.warning('请选择所属网关');
+    return;
+  }
+  // 产线级点位必须有归属节点：产线或辅助计量单元（辅机 / 调配 / 瓶胚）
+  if (form.scope === 'line' && !form.lineCode) {
+    ElMessage.warning('请选择「所属节点」（产线或辅助计量单元）');
     return;
   }
   let params: Record<string, unknown> = {};
@@ -267,6 +304,13 @@ void (async () => {
   } catch {
     /* 网关取不到不影响列表展示，只是新增时选不了 */
   }
+  try {
+    // 组织节点：所属节点下拉的数据源（产线 + 辅助计量单元）
+    // ⚠ 分页结构的字段是 `list`（不是 items）；pageSize 给足，避免节点多于默认 10 条时被截断
+    nodes.value = (await adminApi.getLines({ page: 1, pageSize: 200 })).list;
+  } catch {
+    /* 节点取不到时下拉为空，提交前会有「请选择所属节点」提示，不会静默存成错误归属 */
+  }
 })();
 </script>
 
@@ -355,10 +399,25 @@ void (async () => {
             <el-radio-button value="workshop">车间总表</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-form-item v-if="form.scope === 'line'" label="所属产线">
-          <el-select v-model="form.lineCode" style="width: 100%">
-            <el-option v-for="c in ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']" :key="c" :label="c" :value="c" />
+        <el-form-item v-if="form.scope === 'line'" label="所属节点">
+          <!-- v1.5.2（B-541）：辅机 / 调配 / 瓶胚的电表挂在 aux 节点上，
+               下拉必须覆盖「产线 + 辅助计量单元」，否则现场选不到归属 -->
+          <el-select
+            v-model="form.lineCode"
+            filterable
+            style="width: 100%"
+            placeholder="选择产线或辅助计量单元"
+          >
+            <el-option-group v-for="grp in nodeGroups" :key="grp.label" :label="grp.label">
+              <el-option
+                v-for="n in grp.items"
+                :key="n.code"
+                :label="`${n.code} ${n.name}`"
+                :value="n.code"
+              />
+            </el-option-group>
           </el-select>
+          <span class="form-hint">辅机 / 调配 / 瓶胚的电表选对应的辅助计量单元</span>
         </el-form-item>
         <el-form-item label="计量角色">
           <el-select v-model="form.role" style="width: 100%">

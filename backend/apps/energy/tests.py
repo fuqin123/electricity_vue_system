@@ -2126,3 +2126,212 @@ class WorkshopHierarchyTests(TestCase):
         res = c.get("/api/energy/range", {"kind": "elec", "date": "2026-13-99"})
         self.assertEqual(res.status_code, 400)
         self.assertIn("date", res.json()["detail"])
+
+class MeterNodeOptionTests(TestCase):
+    """v1.5.2（B-541）：计量点「所属节点」下拉必须覆盖产线与辅助计量单元。
+
+    现场现象：新增辅机 / 调配点位时，「所属产线」下拉**只有 A1—A6 六条产线**，
+    选不到归属 —— 因为那三类电表挂在 aux 节点（辅机 / 调配 / 瓶胚）上，不挂产线。
+
+    根因：前端把选项**写死**成 ['A1'...'A6']，而不是读组织节点。
+    修复后前端改为读 `admin/lines`，因此该接口必须如实返回：
+      · `nodeType`   —— 前端靠它把节点分成「产线」与「辅助计量单元」两组；
+      · `parentCode` —— 节点归属哪个车间。
+    另外 `workshop` 原本写死 "灌装车间"，多车间下是错的标注，一并锁住。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.ws = ProductionLine.default_workshop()
+        cls.line = ProductionLine.objects.create(
+            line_code="A9", line_name="九线",
+            node_type=ProductionLine.NODE_LINE, line_type=ProductionLine.TYPE_LINE,
+            parent=cls.ws,
+        )
+        cls.aux = ProductionLine.objects.create(
+            line_code="AUX-A9", line_name="九线辅机",
+            node_type=ProductionLine.NODE_AUX, line_type=ProductionLine.TYPE_LINE,
+            parent=cls.ws,
+        )
+
+    def _rows(self):
+        res = Client().get("/api/admin/lines", {"pageSize": 200})
+        self.assertEqual(res.status_code, 200)
+        return {r["code"]: r for r in res.json()["list"]}
+
+    def test_接口返回节点类型与父车间(self):
+        rows = self._rows()
+        self.assertEqual(rows["A9"]["nodeType"], ProductionLine.NODE_LINE)
+        self.assertEqual(rows["A9"]["parentCode"], self.ws.line_code)
+        self.assertEqual(rows["AUX-A9"]["nodeType"], ProductionLine.NODE_AUX)
+        self.assertEqual(rows["AUX-A9"]["parentCode"], self.ws.line_code)
+        # 车间节点自身：nodeType=workshop 且没有父节点
+        self.assertEqual(rows[self.ws.line_code]["nodeType"], ProductionLine.NODE_WORKSHOP)
+        self.assertIsNone(rows[self.ws.line_code]["parentCode"])
+
+    def test_辅机节点必须出现在列表里(self):
+        """接口若把 aux 过滤掉，前端下拉里就永远选不到辅机归属。"""
+        codes = self._rows().keys()
+        self.assertIn("AUX-A9", codes)
+        self.assertIn("A9", codes)
+
+    def test_所属车间按父节点实测而不是写死灌装车间(self):
+        """多车间下把 workshop 写死成「灌装车间」是**错误标注**（旧代码如此）。"""
+        rows = self._rows()
+        self.assertEqual(rows["A9"]["workshop"], self.ws.line_name)
+        self.assertNotEqual(rows["A9"]["workshop"], "灌装车间")
+
+
+class GatewayTestEvidenceTests(TestCase):
+    """v1.5.2（B-542）：网关「测试连接」的结果必须落成证据，失败要判离线。
+
+    现场现象：点「测试连接」失败后，列表里的状态**仍是「在线」**，
+    与眼前看到的结果正好相反，最长拖到旧心跳过期（约 91 分钟）。
+
+    根因两层：
+      ① `admin_gateway_test` 是**纯只读**，测试结果不落库，状态只由心跳推导；
+         而心跳只能证明「这一刻通」，无法证明「不通」。
+      ② `_gateway_last_heartbeat` 取「任意一条日志」的时间 ——
+         整轮**全失败**的采集同样刷新心跳，彻底连不上的网关永远显示在线。
+
+    修复：成功写 `last_ok_at`、失败写 `last_fail_at`；判定改为**最新证据优先**，
+    并且只有 `ok_count > 0` 的采集日志才算心跳。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A8", line_name="八线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-EV", name="证据测试网关",
+            kind=EnergyGateway.KIND_MODBUS, host="10.0.0.8", port=8888,
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-EV-01", name="八线表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw,
+            slave=1, register=1000, enabled=True,
+        )
+
+    # ── 工具 ───────────────────────────────────────────────
+    def _fresh_heartbeat(self, minutes_ago=1):
+        """造一个「刚成功过」的点位信号（网关此刻确实通）。"""
+        self.meter.last_at = datetime.now() - timedelta(minutes=minutes_ago)
+        self.meter.last_ok = True
+        self.meter.last_error = ""
+        self.meter.save(update_fields=["last_at", "last_ok", "last_error"])
+
+    def _status(self):
+        self.gw.refresh_from_db()
+        hb = api._gateway_heartbeats().get(self.gw.id)
+        fails = api._gateway_failures().get(self.gw.id)
+        return api.gateway_json(self.gw, last_heartbeat=hb, failure_at=fails)["status"]
+
+    def _test(self, ok: bool):
+        """走真实接口并替掉底层试读，只关心结果怎么落库。"""
+        items = [
+            {
+                "meter": self.meter.code, "name": self.meter.name, "ok": ok,
+                "value": 100.0 if ok else None, "raw": "0103" if ok else "",
+                "error": "" if ok else "Modbus 无响应",
+            }
+        ]
+        with mock.patch.object(api, "_try_read", return_value={"durationMs": 7, "items": items}):
+            res = Client().post(f"/api/admin/gateways/{self.gw.id}/test")
+        self.assertEqual(res.status_code, 200)
+        return res.json()
+
+    # ── ① 失败要判离线 ─────────────────────────────────────
+    def test_测试失败写入失败证据并判离线(self):
+        """★ 现场反馈的场景：心跳还新鲜（1 分钟前刚读到过），但此刻测试失败。"""
+        self._fresh_heartbeat()
+        self.assertEqual(self._status(), "online", "前提：测试前确实是在线")
+
+        body = self._test(ok=False)
+        self.assertFalse(body["reachable"])
+
+        self.gw.refresh_from_db()
+        self.assertIsNotNone(self.gw.last_fail_at, "失败必须留下证据")
+        self.assertEqual(self._status(), "offline", "更新的失败证据必须推翻旧的成功")
+
+    def test_失败后网关列表也显示离线(self):
+        self._fresh_heartbeat()
+        self._test(ok=False)
+        row = next(
+            r for r in Client().get("/api/admin/gateways").json() if r["code"] == "GW-EV"
+        )
+        self.assertEqual(row["status"], "offline")
+        self.assertTrue(row["lastFailure"], "界面据此解释为什么有心跳却判离线")
+
+    # ── ② 成功要判在线（不能只修失败那一半）───────────────
+    def test_测试成功写入成功证据无需等待采集(self):
+        """对称的一条：修了「失败→离线」却漏了「成功→在线」，现场照样会反复怀疑。"""
+        self.assertEqual(EnergyCollectLog.objects.filter(gateway=self.gw).count(), 0)
+        body = self._test(ok=True)
+        self.assertTrue(body["reachable"])
+        self.gw.refresh_from_db()
+        self.assertIsNotNone(self.gw.last_ok_at)
+        self.assertIsNone(self.gw.last_fail_at, "成功要清掉旧的失败证据")
+        self.assertEqual(self._status(), "online")
+
+    # ── ③ 采集日志的 ok_count 语义 ────────────────────────
+    def test_整轮采集全失败不算心跳(self):
+        """旧实现取「任意一条日志」，于是彻底连不上的网关永远显示在线。"""
+        EnergyCollectLog.objects.create(
+            gateway=self.gw, started_at=datetime.now() - timedelta(minutes=5),
+            total=3, ok_count=0, fail_count=3,
+        )
+        self.assertNotIn(self.gw.id, api._online_gateway_ids())
+        self.assertEqual(self._status(), "offline")
+
+    def test_整轮采集全失败构成失败证据(self):
+        """有心跳（刚成功过）+ 整轮采集全失败 → 失败的证据更新 → 离线。"""
+        self._fresh_heartbeat(minutes_ago=5)
+        self.assertEqual(self._status(), "online")
+        EnergyCollectLog.objects.create(
+            gateway=self.gw, started_at=datetime.now() - timedelta(minutes=1),
+            total=3, ok_count=0, fail_count=3,
+        )
+        self.assertEqual(self._status(), "offline")
+
+    def test_整轮采集成功仍算心跳(self):
+        """越严格越好，但不能把正常采集判掉 —— 这条防止 'ok_count > 0' 过滤写反。"""
+        EnergyCollectLog.objects.create(
+            gateway=self.gw, started_at=datetime.now() - timedelta(minutes=5),
+            total=3, ok_count=3, fail_count=0,
+        )
+        self.assertEqual(self._status(), "online")
+        self.assertIn(self.gw.id, api._online_gateway_ids())
+
+    def test_没有点位的网关不写证据(self):
+        """无从判断 ≠ 不通：一个点位都没有时不能判离线、也不该留失败证据。"""
+        self.meter.enabled = False
+        self.meter.save(update_fields=["enabled"])
+        body = self._test(ok=False)
+        self.assertFalse(body["reachable"])
+        self.gw.refresh_from_db()
+        self.assertIsNone(self.gw.last_fail_at, "「没得测」不能当成「测出不通」")
+
+    def test_更新的失败推翻更早的成功_反之不成立(self):
+        """最新证据优先：只有**更新**的失败才推翻旧成功，旧的失败不推翻新的成功。"""
+
+        def decide():
+            """每次都从库里重读两条证据。
+
+            ⚠ 不能先把心跳取出来复用：`datetime.now() - timedelta(...)` 在两次
+              调用中会得到不同的绝对时刻，复用旧心跳会让「失败」凭空变新，
+              测出的是测试写法的问题而不是规则的问题（这条踩过）。
+            """
+            hb = api._gateway_test_heartbeat().get(self.gw.id)
+            fails = api._gateway_failures().get(self.gw.id)
+            return api.gateway_is_online(self.gw, hb, fails)
+
+        # 场景 A：成功在前（-10 分）、失败在后（-2 分）→ 失败的证据更新 → 离线
+        self.gw.last_ok_at = datetime.now() - timedelta(minutes=10)
+        self.gw.last_fail_at = datetime.now() - timedelta(minutes=2)
+        self.gw.save(update_fields=["last_ok_at", "last_fail_at"])
+        self.assertFalse(decide(), "更新的失败必须推翻更早的成功")
+
+        # 场景 B：失败在前（-10 分）、成功在后（-1 分）→ 成功的证据更新 → 在线
+        self.gw.last_fail_at = datetime.now() - timedelta(minutes=10)
+        self.gw.last_ok_at = datetime.now() - timedelta(minutes=1)
+        self.gw.save(update_fields=["last_ok_at", "last_fail_at"])
+        self.assertTrue(decide(), "更早的失败不该推翻更新的成功")

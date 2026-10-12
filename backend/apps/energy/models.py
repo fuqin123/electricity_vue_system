@@ -255,6 +255,16 @@ class EnergyGateway(models.Model):
         "配置来源", max_length=10, choices=SOURCE_CHOICES, default=SOURCE_CONFIG,
         help_text="后台维护的记录不会被 seed_registry 覆盖，除非加 --force",
     )
+
+    # ── 最近一次「网关连接测试」的证据（B-542）──────────────────────
+    # 网关在线与否由**心跳**推导：采集日志 ∪ 点位读数成功 ∪ 本表 last_ok_at。
+    # 但心跳只能证明「这一刻通」，无法证明「不通」——
+    # 于是现场点「测试连接」失败后，状态会一直停在「在线」（直到旧心跳过期，最长约 91 分钟），
+    # 与操作者眼前看到的结果正好相反。
+    # 增加失败证据后，判定改为**最新证据优先**：一次更新的失败可以推翻旧的成功。
+    last_ok_at = models.DateTimeField("最近测试成功", null=True, blank=True)
+    last_fail_at = models.DateTimeField("最近测试失败", null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -288,6 +288,18 @@ export interface LineMaster {
   /** 额定产能 瓶/小时 */
   rated: number;
   workshop: string;
+  /**
+   * 组织节点类型（v1.5.2）：
+   *   workshop 车间 / line 产线 / aux 辅助计量单元（辅机、瓶胚、调配）
+   *
+   * ⚠ 计量点的「所属产线」下拉必须按它分组：辅机与调配单元的电表挂在 aux 节点上，
+   *   只列 `line` 会让现场根本选不到归属。
+   */
+  nodeType?: 'workshop' | 'line' | 'aux';
+  /** 上级节点编码（产线/辅助单元指向所属车间；车间为空） */
+  parentCode?: string | null;
+  /** 上级节点名称 */
+  parentName?: string | null;
   meterNo: string;
   counterNo: string;
   status: 'running' | 'idle' | 'maintenance';
@@ -376,6 +388,13 @@ export interface Gateway {
   pointCount: number;
   status: 'online' | 'offline';
   lastHeartbeat: string;
+  /**
+   * 最近一次**失败证据**的时刻（v1.5.2，B-542）：连接测试失败、或整轮采集全失败。
+   *
+   * 在线判定是「最新证据优先」——若它比 `lastHeartbeat` 更新，网关即判离线。
+   * 界面用它解释「明明有心跳，为什么显示离线」。
+   */
+  lastFailure?: string;
   timeoutMs: number;
   intervalSeconds: number;
   enabled: boolean;

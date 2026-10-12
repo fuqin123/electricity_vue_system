@@ -333,10 +333,32 @@ def gateway_offline_after(interval_seconds: int | None = None) -> timedelta:
 
 
 def _gateway_last_heartbeat() -> dict:
-    """用采集日志的最近一次开始时间当作网关心跳。"""
+    """用采集日志里**最近一次读成功**的时刻当作网关级心跳。
+
+    ⚠ v1.5.2（B-542）修为「只认 ok_count > 0 的日志」：
+      旧实现取「任意一条日志的 started_at」，于是**整轮全失败的采集**同样会
+      刷新心跳 —— 一个彻底连不上的网关，只要计划任务照常跑，就会一直显示在线。
+      日志是「我们试过」，不是「设备应了」；只有读到至少一个点位才证明它是通的。
+    """
     return {
         row["gateway_id"]: row["last"]
         for row in EnergyCollectLog.objects.exclude(gateway=None)
+        .filter(ok_count__gt=0)
+        .values("gateway_id")
+        .annotate(last=Max("started_at"))
+    }
+
+
+def _gateway_log_failure() -> dict:
+    """**失败证据**：整轮采集一个点位都没读到的最近时刻。
+
+    只有「有尝试（total > 0）且全部失败（ok_count == 0）」才算数 ——
+    没有点位的网关是「无从判断」，不是「不通」，不能拿它判离线。
+    """
+    return {
+        row["gateway_id"]: row["last"]
+        for row in EnergyCollectLog.objects.exclude(gateway=None)
+        .filter(total__gt=0, ok_count=0)
         .values("gateway_id")
         .annotate(last=Max("started_at"))
     }
@@ -368,13 +390,66 @@ def _gateway_meter_heartbeat() -> dict:
     }
 
 
+def _gateway_test_heartbeat() -> dict:
+    """网关自身「连接测试成功」的时刻（B-542）。"""
+    return {
+        row["id"]: row["last_ok_at"]
+        for row in EnergyGateway.objects.exclude(last_ok_at=None).values("id", "last_ok_at")
+    }
+
+
+def _gateway_failures() -> dict:
+    """网关的**最新失败证据** = max(连接测试失败, 整轮采集全失败)。
+
+    单一出口：列表页与数据中心都必须读它，否则同一个网关会给两个答案。
+    """
+    fails: dict[int, datetime] = {}
+    for gid, ts in _gateway_log_failure().items():
+        if ts:
+            fails[gid] = ts
+    for row in EnergyGateway.objects.exclude(last_fail_at=None).values("id", "last_fail_at"):
+        gid, ts = row["id"], row["last_fail_at"]
+        if ts and (gid not in fails or ts > fails[gid]):
+            fails[gid] = ts
+    return fails
+
+
 def _gateway_heartbeats() -> dict:
-    """网关级 + 点位级心跳取较新者（见 `_gateway_meter_heartbeat` 的说明）。"""
+    """所有「证明它通」的信号取较新者：采集日志 ∪ 点位读数 ∪ 网关连接测试。"""
     beats = _gateway_last_heartbeat()
-    for gid, ts in _gateway_meter_heartbeat().items():
-        if ts and (gid not in beats or beats[gid] is None or ts > beats[gid]):
-            beats[gid] = ts
+    for source in (_gateway_meter_heartbeat(), _gateway_test_heartbeat()):
+        for gid, ts in source.items():
+            if ts and (gid not in beats or beats[gid] is None or ts > beats[gid]):
+                beats[gid] = ts
     return beats
+
+
+def gateway_is_online(
+    g: EnergyGateway,
+    heartbeat: datetime | None,
+    failure_at: datetime | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """★ 网关在线判定的**唯一规则**（列表页与数据中心共用）。
+
+    两条都要满足：
+      ① 心跳还新鲜：`now - heartbeat < gateway_offline_after(该网关周期)`
+      ② **最新证据不是失败**：若存在比心跳更新的失败证据，则判离线 ——
+         一次更新的失败（人工测试连接不通、整轮采集颗粒无收）本身就推翻了
+         更早的成功，不能因为它早先通过过就继续显示在线（B-542）。
+
+    ⚠ 只看 ① 会出现「刚测出连不上，状态仍是在线」（最长拖到心跳过期约 91 分钟）；
+      只看 ② 则会把「从没成功过」的网关误判成在线。
+    """
+    now = now or datetime.now()
+    if heartbeat is None:
+        return False
+    limit = gateway_offline_after(getattr(g, "interval_seconds", None))
+    if (now - heartbeat) >= limit:
+        return False
+    if failure_at and failure_at > heartbeat:
+        return False
+    return True
 
 
 def _online_gateway_ids(now: datetime | None = None) -> set[int]:
@@ -382,15 +457,26 @@ def _online_gateway_ids(now: datetime | None = None) -> set[int]:
 
     ⚠ 曾经这里只判「有过任意一条采集日志」（即永远在线），而列表页判 5 分钟 ——
       同一个「在线网关」在数据中心与网关页给出两个答案。统一到本函数（v1.4.4）。
+
+    v1.5.2（B-542）：判定逻辑抽到 `gateway_is_online()`，这里改为**逐台**调用 ——
+      因为失败证据要跟「该网关自己的心跳」比大小，按 id 集合批量算会丢掉这层信息；
+      顺带每台网关用自己的采样周期判超时（慢网关不再被误判）。
     """
     now = now or datetime.now()
-    limit = gateway_offline_after()
-    return {gid for gid, ts in _gateway_heartbeats().items() if ts and (now - ts) < limit}
+    beats = _gateway_heartbeats()
+    fails = _gateway_failures()
+    return {
+        g.id
+        for g in EnergyGateway.objects.all()
+        if gateway_is_online(g, beats.get(g.id), fails.get(g.id), now)
+    }
 
 
-def gateway_json(g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None) -> dict:
-    limit = gateway_offline_after(getattr(g, "interval_seconds", None))
-    online = bool(last_heartbeat and (datetime.now() - last_heartbeat) < limit)
+def gateway_json(
+    g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None, failure_at=None
+) -> dict:
+    """网关列表行。在线判定统一走 `gateway_is_online()`（B-542）。"""
+    online = gateway_is_online(g, last_heartbeat, failure_at)
     return {
         "id": g.id,
         "code": g.code,
@@ -404,6 +490,8 @@ def gateway_json(g: EnergyGateway, *, point_count: int = 0, last_heartbeat=None)
         "pointCount": point_count,
         "status": "online" if online else "offline",
         "lastHeartbeat": last_heartbeat.strftime("%Y-%m-%d %H:%M:%S") if last_heartbeat else "",
+        # 最近一次失败证据：界面据此说明「为什么明明有心跳却判离线」
+        "lastFailure": failure_at.strftime("%Y-%m-%d %H:%M:%S") if failure_at else "",
         "timeoutMs": g.timeout_ms,
         "intervalSeconds": g.interval_seconds,
         "enabled": g.enabled,
@@ -486,13 +574,28 @@ def meter_json(m: EnergyMeter, *, today_usage=None, today_hours: int = 0) -> dic
 
 
 def line_json(ln: ProductionLine, *, meter_count: int = 0, counter: str = "") -> dict:
+    """组织节点（车间 / 产线 / 辅助单元）的对外结构。
+
+    ⚠ v1.5.2：这里原本把 `workshop` 写死成 "灌装车间"。单车间时代看不出问题，
+      多车间后就是**错的标注** —— 辅机与调配单元的所属车间会被显示成「灌装车间」。
+      现改为按 `parent` 实测（无父节点时才退回自身名称）。
+
+    `nodeType` / `parentCode` 是前端「所属产线」下拉的数据来源：计量点可以挂在
+    产线，也可以挂在辅机 / 调配这类 aux 节点上，下拉伸选项必须覆盖这三种节点，
+    否则现场新增辅机点位根本选不到归属（B-541）。
+    """
+    parent = ln.parent if ln.parent_id else None
     return {
         "id": ln.id,
         "code": ln.line_code,
         "name": ln.line_name,
         "product": ln.product,
         "rated": ln.rated,
-        "workshop": "灌装车间",
+        # 组织节点树（v1.5.2）：前端靠 nodeType 分组、靠 parentCode 归属
+        "nodeType": ln.node_type,
+        "parentCode": parent.line_code if parent else None,
+        "parentName": parent.line_name if parent else None,
+        "workshop": parent.line_name if parent else (ln.line_name if ln.is_workshop else ""),
         "meterNo": f"{meter_count} 个电表点位",
         "counterNo": counter or "产量计数器待接入",
         # 产线状态：1 启用 / 0 停用（TINYINT，见 models.ProductionLine）
@@ -1188,7 +1291,8 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
 @require_GET
 def admin_lines(request: HttpRequest) -> JsonResponse:
     rows = []
-    for ln in ProductionLine.objects.order_by("sort", "line_code"):
+    # select_related("parent")：line_json 要读父节点名称，不预取会对每一行各查一次
+    for ln in ProductionLine.objects.select_related("parent").order_by("sort", "line_code"):
         cnt = ln.meters.filter(energy_type__type_code=EnergyType.ELECTRIC, enabled=True).count()
         rows.append(line_json(ln, meter_count=cnt))
     return json_ok(_paged(request, rows))
@@ -1305,12 +1409,18 @@ def assert_alias_covers_frontend() -> list[str]:
 def admin_gateways(request: HttpRequest) -> JsonResponse:
     if request.method == "GET":
         hb = _gateway_heartbeats()
+        fails = _gateway_failures()
         counts = {
             row["gateway_id"]: row["n"]
             for row in EnergyMeter.objects.values("gateway_id").annotate(n=Count("id"))
         }
         rows = [
-            gateway_json(g, point_count=counts.get(g.id, 0), last_heartbeat=hb.get(g.id))
+            gateway_json(
+                g,
+                point_count=counts.get(g.id, 0),
+                last_heartbeat=hb.get(g.id),
+                failure_at=fails.get(g.id),
+            )
             for g in EnergyGateway.objects.order_by("code")
         ]
         return json_ok(rows)
@@ -1361,26 +1471,57 @@ def admin_gateway_detail(request: HttpRequest, pk: int) -> JsonResponse:
 @require_http_methods(["POST"])
 @csrf_exempt
 def admin_gateway_test(request: HttpRequest, pk: int) -> JsonResponse:
-    """网关连接测试：对旗下每个计量点试读一次，返回真实读数与错误。"""
+    """网关连接测试：对旗下每个计量点试读一次，返回真实读数与错误。
+
+    ★ v1.5.2（B-542）：测试结果要**留证据**，否则状态栏纹丝不动。
+      旧实现纯只读，网关状态完全由心跳推导 —— 现场点完「测试连接」看到失败，
+      列表里的状态却还是「在线」（要等旧心跳过期，最长约 91 分钟），
+      与眼前看到的结果正好相反。现在成功写 `last_ok_at`、失败写 `last_fail_at`，
+      在线判定按**最新证据优先**（见 `gateway_is_online`）。
+
+    ⚠ 与 `admin_meter_test`（点位试采）的分工不变：那个写的是**点位** `last_*`，
+      本接口写的是**网关** `last_*`；两者都会并进心跳/失败证据。
+    """
     gw = EnergyGateway.objects.filter(pk=pk).first()
     if gw is None:
         return json_err("网关不存在", 404)
     ms = [m for m in gw.meters.filter(enabled=True) if m.enabled]
     if not ms:
-        return json_ok({"gateway": gw.code, "reachable": False, "detail": "该网关下没有启用中的计量点", "items": []})
+        # 没有点位 = 无从判断，**不写任何证据**（写了会把「没得测」说成「不通」）
+        return json_ok(
+            {"gateway": gw.code, "reachable": False, "detail": "该网关下没有启用中的计量点", "items": []}
+        )
+
+    def record(reachable: bool) -> None:
+        now = datetime.now()
+        gw.last_ok_at = now if reachable else gw.last_ok_at
+        gw.last_fail_at = None if reachable else now
+        gw.save(update_fields=["last_ok_at", "last_fail_at", "updated_at"])
 
     try:
         result = _try_read(gw, ms)
     except Exception as exc:  # noqa: BLE001
         logger.exception("网关测试失败：%s", gw.code)
-        return json_ok({"gateway": gw.code, "reachable": False, "detail": f"{type(exc).__name__}: {exc}", "items": []})
+        record(False)
+        return json_ok(
+            {
+                "gateway": gw.code,
+                "reachable": False,
+                "detail": f"{type(exc).__name__}: {exc}",
+                "items": [],
+            }
+        )
 
     ok = sum(1 for r in result["items"] if r["ok"])
+    reachable = ok > 0
+    # ⚠ 一个点位都没读通才算「不可达」；只通了部分点位仍算可达（设备是活的），
+    #   单个点位参数写错属于点位问题，不该把整台网关判离线。
+    record(reachable)
     return json_ok(
         {
             "gateway": gw.code,
             "endpoint": gw.endpoint,
-            "reachable": ok > 0,
+            "reachable": reachable,
             "detail": f"{ok}/{len(result['items'])} 个点位读取成功，耗时 {result['durationMs']}ms",
             **result,
         }
