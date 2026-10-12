@@ -550,8 +550,11 @@ def meter_json(m: EnergyMeter, *, today_usage=None, today_hours: int = 0) -> dic
         "gatewayCode": m.gateway.code,
         "slave": m.slave,
         "register": m.register,
+        # registers 是兼容镜像（由 dataType 推导），列表与表单都按它显示真实读取长度
         "registers": m.registers,
         "funcCode": m.func_code,
+        "dataType": m.data_type,
+        "byteOrder": m.byte_order,
         "wordOrder": m.word_order,
         "urlPath": m.url_path,
         "params": m.params or {},
@@ -1371,7 +1374,8 @@ FRONTEND_GATEWAY_KEYS = (
 )
 FRONTEND_METER_KEYS = (
     "code", "name", "kind", "scope", "role", "lineCode", "gatewayId",
-    "slave", "register", "registers", "funcCode", "wordOrder", "urlPath", "params",
+    "slave", "register", "registers", "funcCode", "dataType", "byteOrder", "wordOrder",
+    "urlPath", "params",
     "valuePath", "timePath", "factor", "unit", "maxHourly", "enabled", "remark",
     "assetNo", "installDate",
 )
@@ -1535,6 +1539,8 @@ METER_FIELDS = (
     "code", "name", "scope", "role", "slave", "register", "registers", "func_code",
     "word_order", "url_path", "params", "value_path", "time_path", "scale", "unit",
     "max_hourly", "enabled", "remark", "asset_no", "install_date",
+    # v1.5.3 数据类型（水表是 double，不能再按 32 位整数拼）
+    "data_type", "byte_order",
 )
 METER_ALIAS = {
     # ⚠ 前端契约里叫 factor（那一列的表头就是「倍率」），模型字段叫 scale。
@@ -1542,6 +1548,10 @@ METER_ALIAS = {
     #   这个比 IP 更隐蔽：界面照常保存成功，只是电表读数从此差一个量级。
     "factor": "scale",
     "funcCode": "func_code",
+    # v1.5.3：数据类型与字节序。**漏登记就会静默被丢弃**，
+    # 于是现场选了 float64 保存后仍是 uint32，水表继续给出一个荒谬的大整数（B-535 同族）。
+    "dataType": "data_type",
+    "byteOrder": "byte_order",
     "wordOrder": "word_order",
     "urlPath": "url_path",
     "valuePath": "value_path",
@@ -1662,6 +1672,25 @@ def _save_meter(m: EnergyMeter | None, data: dict) -> EnergyMeter:
             v = getattr(m, f)
             if isinstance(v, str):
                 setattr(m, f, int(v) if v.strip() else None)
+
+    # ★ 数据类型（v1.5.3）：改名字/换表的现场入口。校验放在写库前，
+    #   因为认不出的类型会让 modbus 采集侧 decode_registers 抛错 ——
+    #   点位能存进去却永远读不到数，不如在这里直接 400 说清。
+    if not m.data_type:
+        m.data_type = EnergyMeter.DATA_TYPE_DEFAULT
+    if m.data_type not in dict(EnergyMeter.DATA_TYPE_CHOICES):
+        raise ValueError(
+            f"数据类型不支持：{m.data_type!r}，可选 "
+            + " / ".join(t for t, _ in EnergyMeter.DATA_TYPE_CHOICES)
+        )
+    if m.byte_order not in dict(EnergyMeter.BYTE_ORDER_CHOICES):
+        raise ValueError(
+            f"字节序不支持：{m.byte_order!r}，可选 "
+            + " / ".join(t for t, _ in EnergyMeter.BYTE_ORDER_CHOICES)
+        )
+    # registers 是**推导列**：由数据类型决定，不接受手填（手填会与读取长度冲突，
+    # 而冲突的后果是「读少了寄存器」——不报错、只给出一个荒谬的读数）。
+    m.sync_registers()
 
     if isinstance(m.scale, str):
         m.scale = _dec(m.scale, Decimal("1"))

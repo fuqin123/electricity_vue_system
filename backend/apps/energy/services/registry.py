@@ -65,6 +65,28 @@ def _unit_for(etype: EnergyType, raw: str | None) -> str:
     return EnergyType.DEFAULT_UNIT.get(etype.type_code, "kWh")
 
 
+def _data_type_for(raw: str | None) -> str:
+    """计量点寄存器数据类型 —— 配置没写时用**现场既有的默认口径**（32 位无符号整数）。
+
+    ⚠ 为什么不能一律兜一个「聪明」的值：数据类型与 `unit` 一样**不参与校验、只影响解码**，
+      猜错不会报错，只会读出一个数值离谱的数（例：double 水表按 32 位整数拼）。
+      所以这里只做「写错就报错、不写就用既有口径」两件事，绝不猜测含义。
+
+    现场已知的例外：碳水市政水表 `W-CARB-CITY-1` 是 **4 寄存器 IEEE754 double**，
+    配置里必须显式写 `data_type: float64`。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return EnergyMeter.DATA_TYPE_DEFAULT
+    if text not in dict(EnergyMeter.DATA_TYPE_CHOICES):
+        raise ValueError(
+            f"未知数据类型 {text!r}：配置里请写 "
+            + " / ".join(t for t, _ in EnergyMeter.DATA_TYPE_CHOICES)
+            + " 之一"
+        )
+    return text
+
+
 @transaction.atomic
 def sync_registry(*, force: bool = False) -> dict:
     """按配置 upsert 车间 / 辅助单元 / 产线 / 网关 / 计量点。返回变更计数。
@@ -184,7 +206,7 @@ def sync_registry(*, force: bool = False) -> dict:
             logger.warning("计量点 %s 由后台维护，跳过配置覆盖（需要覆盖请加 --force）", item["code"])
             continue
 
-        EnergyMeter.objects.update_or_create(
+        obj, _created = EnergyMeter.objects.update_or_create(
             code=item["code"],
             defaults={
                 "name": item.get("name", item["code"]),
@@ -199,8 +221,12 @@ def sync_registry(*, force: bool = False) -> dict:
                 "gateway": gw,
                 "slave": item.get("slave"),
                 "register": item.get("register"),
+                # ⚠ registers 是**推导列**（见 EnergyMeter.sync_registers）：它由 data_type 决定，
+                #   配置里仍允许写，但随后会被 data_type 覆盖 —— 避免「配的 float64、读的 2 个寄存器」。
                 "registers": int(item.get("registers", 2) or 2),
                 "func_code": int(item.get("func_code", 3) or 3),
+                "data_type": _data_type_for(item.get("data_type")),
+                "byte_order": item.get("byte_order", "big") or "big",
                 "word_order": item.get("word_order", "big"),
                 "url_path": item.get("url_path", "") or "",
                 "params": item.get("params", {}) or {},
@@ -216,6 +242,10 @@ def sync_registry(*, force: bool = False) -> dict:
                 "source": EnergyMeter.SOURCE_CONFIG,
             },
         )
+        # registers 由 data_type 推导：配置里写错（或没写）也以数据类型为准，
+        # 保证「读几个寄存器」永远与「按什么类型解」一致（v1.5.3）。
+        if obj.sync_registers():
+            obj.save(update_fields=["registers", "updated_at"])
         stat["meter"] += 1
 
     logger.info("登记表同步完成：%s", stat)
