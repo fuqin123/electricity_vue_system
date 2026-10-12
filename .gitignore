@@ -22,6 +22,8 @@ frontend/apps/*/dist/
 backend/config/settings.local.yaml
 backend/config/settings.*.yaml
 !backend/config/settings.example.yaml
+# docker 部署时挂进容器的本地配置（设备登记表 + 平台 token）
+deploy/docker/settings/
 *.pem
 *.key
 *.p12

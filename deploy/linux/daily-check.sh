@@ -60,7 +60,7 @@ probe "http://${HOST}/healthz"            "健康检查        "
 probe "http://${HOST}/screen/"            "大屏首页        "
 probe "http://${HOST}/admin/"             "后台首页        "
 probe "http://${HOST}/admin/system/user"  "后台子路由回退  "    # ★ history 回退是否生效
-probe "http://${HOST}/api/health"         "后端 API        " 200 "后端可能未启动"
+probe "http://${HOST}/api/energy/overview" "后端 API(经反代) " 200 "后端可能未启动"
 probe "http://${HOST}:${GO2RTC_PORT}/api/streams" "视频网关 go2rtc" 200 "未部署视频则忽略"
 
 # ── 3. 磁盘 ─────────────────────────────────────────────────

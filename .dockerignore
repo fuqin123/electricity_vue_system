@@ -3,35 +3,57 @@
 #
 # 重要性：构建上下文是**仓库根目录**，若不排除 node_modules，
 # docker build 会先把几百 MB 的依赖传给守护进程，构建慢十倍以上。
+#
+# 注意：前后端两个镜像共用本清单（Dockerfile / Dockerfile.backend 的
+# context 都是仓库根），所以 backend 必须保留在上下文里，
+# 只排除它的虚拟环境、缓存与本地密钥配置。
 # ══════════════════════════════════════════════════════════════
 
-# 依赖与构建产物（容器内会重新安装、重新构建）
+# ── 前端依赖与构建产物（容器内会重新安装、重新构建）──────────
 **/node_modules
 **/dist
 **/dist-ssr
 **/.vite
 **/.cache
 
-# 版本控制与工具数据
+# ── Python 依赖缓存与虚拟环境 ────────────────────────────────
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+.venv
+venv
+env
+**/.venv
+
+# ── 版本控制与工具数据 ───────────────────────────────────────
 .git
 .gitignore
 .workbuddy
 .vscode
 .idea
 
-# 部署与文档（镜像里不需要）
+# ── 部署与文档（镜像里不需要）───────────────────────────────
+# 注意：deploy/docker 必须保留，Dockerfile.backend 要拷 entrypoint 脚本
 deploy/linux
 deploy/windows
+deploy/go2rtc
 docs
-backend
+backend/docs
 *.md
 
-# 环境变量与密钥 —— 绝不能进镜像
+# ── 环境变量与密钥 —— 绝不能进镜像 ──────────────────────────
 .env
 .env.*
 !.env.example
+backend/config/settings.local.yaml
+backend/config/settings.*.yaml
+!backend/config/settings.example.yaml
+deploy/docker/settings
 
-# 日志与临时文件
+# ── 运行期产物与容器数据目录 ────────────────────────────────
 **/*.log
 **/logs
 **/*.tsbuildinfo
+deploy/docker/data

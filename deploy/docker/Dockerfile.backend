@@ -1,0 +1,77 @@
+# ══════════════════════════════════════════════════════════════
+# 能源产效管理系统 · 后端镜像（Django + gunicorn）
+#
+# 构建上下文 = **仓库根目录**（与前端镜像共用一份 .dockerignore）：
+#   docker build -f deploy/docker/Dockerfile.backend -t eep-backend:1.5.2 .
+#   或：cd deploy/docker && docker compose build backend
+#
+# 采集容器（collector）复用本镜像，只换 command，不另建镜像 ——
+# 两个容器必须跑同一份代码，否则「接口读到的」和「采集写入的」口径会分叉。
+#
+# 拉不到 Docker Hub 时：
+#   --build-arg PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+# ══════════════════════════════════════════════════════════════
+
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# pip 源用 build-arg 暴露：有私有源时改构建参数即可，不用动文件
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+
+# 时区必须是东八区：settings.py 里 USE_TZ=False，auto_now/auto_now_add
+# 直接取进程本地时间。容器跑成 UTC 的话，所有 collect_time 会整体早 8 小时，
+# 而这套系统的核心口径就是「每小时差值」——时间错位等于数据全废。
+#
+# 这里**不装任何系统包**：实测 python:3.12-slim 自带
+# /usr/share/zoneinfo/Asia/Shanghai，够用了；健康检查改用标准库发请求，
+# 所以连 curl 也不需要。少一个 apt/apk 步骤，构建就不依赖任何系统包源
+# （很多内网构建机上 deb.debian.org 的 80 端口是不通的，加一步必失败）。
+RUN ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && echo "Asia/Shanghai" > /etc/timezone
+
+ENV TZ=Asia/Shanghai
+
+# 先装依赖（requirements 不变就不重装）
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 再拷代码。settings.local.yaml / .env / venv 已被 .dockerignore 排除，
+# 镜像里只留 settings.example.yaml 作为兜底配置。
+COPY backend/ ./
+
+COPY deploy/docker/entrypoint.backend.sh /usr/local/bin/eep-entrypoint
+
+# 非 root 运行；logs 目录属主要在建卷之前定好，
+# 命名卷 eep-backend-logs 首次挂载时会继承这里的属主。
+RUN groupadd -g 10001 eep \
+ && useradd -r -u 10001 -g eep -d /app -s /bin/sh eep \
+ && mkdir -p /app/logs \
+ && chown -R eep:eep /app
+
+USER eep
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/eep-entrypoint"]
+
+# 默认 3 worker × 2 thread；小内存工控机用 EEP_GUNICORN_WORKERS 调低。
+# exec  form 的 CMD 不会展开环境变量，所以用 sh -c + exec：
+# exec 保证 gunicorn 仍是最前台进程，docker stop 才能触发优雅退出。
+CMD ["sh", "-c", "exec gunicorn eep.wsgi:application \
+      --bind 0.0.0.0:${EEP_BACKEND_PORT:-8000} \
+      --workers ${EEP_GUNICORN_WORKERS:-3} \
+      --threads ${EEP_GUNICORN_THREADS:-2} \
+      --timeout ${EEP_GUNICORN_TIMEOUT:-120} \
+      --worker-tmp-dir /dev/shm \
+      --access-logfile - --error-logfile -"]

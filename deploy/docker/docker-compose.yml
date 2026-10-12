@@ -1,98 +1,250 @@
 # ══════════════════════════════════════════════════════════════
-# 能源产效管理系统 · Docker Compose 编排
+# 能源产效管理系统 · Docker Compose 编排（全栈）
 #
-# 启动：
+# 五个默认服务：frontend(Nginx) / backend(Django) / collector(采集)
+#               / rollup(每天 00:30 周期结算) / mysql
+#
+# 首次启动：
 #   cd deploy/docker
-#   cp .env.example .env        # 然后填写密钥
+#   cp .env.example .env                              # 填口令与密钥
+#   mkdir -p settings && cp ../../backend/config/settings.example.yaml \
+#           settings/settings.local.yaml              # 设备登记表与采集参数
 #   docker compose up -d --build
 #
-# 更新前端：
-#   docker compose build frontend && docker compose up -d frontend
+# 只想快速看页面（不要采集、不要自己的库）：
+#   docker compose up -d frontend backend
 #
-# 注意：本文件的 build.context 是**仓库根目录**（../..），
-#       因为 Dockerfile 需要同时访问 frontend/ 与 deploy/。
-#       仓库根目录的 .dockerignore 已排除 node_modules，避免上下文过大。
+# 日常运维：
+#   docker compose ps                    # 看状态与健康度
+#   docker compose logs -f backend       # 后端日志
+#   docker compose logs -f collector     # 采集日志（每轮结果都在这里）
+#   docker compose build frontend && docker compose up -d frontend    # 只更新前端
+#   docker compose down                  # 停止（数据卷保留）
+#
+# 注意：build.context 是**仓库根目录**（../..），Dockerfile 需要同时访问
+#       frontend/、backend/ 与 deploy/。根目录 .dockerignore 已排除
+#       node_modules / venv，上下文只有源码大小。
 # ══════════════════════════════════════════════════════════════
+
+name: eep
+
+# ── 公共片段（YAML 锚点）───────────────────────────────────
+x-logging: &eep-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+# 设备登记表 / 采集参数 / 蒸汽平台 token —— 只读挂载，绝不进镜像层。
+# 单独做成锚点而不是塞进服务级 volumes：YAML 的 `<<:` 合并是「同名键整体覆盖」，
+# 服务里只要写了 volumes:，锚点里的挂载列表就会被整个丢掉（不会追加）。
+#
+# create_host_path: false 是关键：宿主机上文件不存在时直接报错停止，
+# 而不是悄悄建一个同名空目录挂进去 —— 后者会让 Django 抛 IsADirectoryError，
+# 现场根本查不到真实原因是「文件没建」。
+x-settings-mount: &eep-settings-mount
+  type: bind
+  source: ./settings/settings.local.yaml
+  target: /app/config/settings.local.yaml
+  read_only: true
+  bind:
+    create_host_path: false
+
+# 后端与采集器共用同一镜像、同一套连接参数，只差跑什么命令。
+# 不放 container_name / volumes / depends_on，避免上面那个覆盖陷阱。
+x-backend-base: &eep-backend-base
+  image: eep-backend:1.5.2
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile.backend
+  restart: unless-stopped
+  env_file:
+    - .env
+  networks:
+    - eep-net
+  logging: *eep-logging
 
 services:
 
-  # ── 前端：大屏 + 后台（Nginx 托管静态产物）───────────────
+  # ── 前端：大屏 + 后台（Nginx 托管静态产物，并反代 API/视频）──
   frontend:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: eep-frontend:1.1.0
+    image: eep-frontend:1.5.2
     container_name: eep-frontend
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "${EEP_HTTP_PORT:-80}:80"
     depends_on:
-      # 后端未就绪也允许前端先起来（前端有 mock 兜底，不会白屏）
+      # 用 service_started 而不是 service_healthy：
+      # 后端没起来时前端要能照常打开（页面自带降级提示与 mock 兜底），
+      # 反过来把前端也卡住会让现场误判成「整个系统挂了」。
       backend:
         condition: service_started
     networks:
       - eep-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *eep-logging
 
-  # ── 后端：Django + gunicorn ─────────────────────────────
-  # 本期后端尚未实现，默认用 profiles 关闭。
-  # 后端就绪后：去掉 profiles 注释，或执行 docker compose --profile backend up -d
+  # ── 后端：Django + gunicorn（只做接口，不对外发布端口）─────
   backend:
-    image: eep-backend:1.1.0
+    <<: *eep-backend-base
     container_name: eep-backend
-    restart: unless-stopped
-    profiles: ["backend"]
-    env_file:
-      - .env
+    environment:
+      # 默认连编排内的 mysql；改成外部库只需在 .env 里设 EEP_DB_HOST
+      EEP_DB_HOST: ${EEP_DB_HOST:-mysql}
+      EEP_DB_PORT: "${EEP_DB_PORT:-3306}"
+      EEP_ALLOWED_HOSTS: "${EEP_ALLOWED_HOSTS:-*}"
+      EEP_AUTO_MIGRATE: "true"
+      EEP_AUTO_SEED: "true"
     expose:
       - "8000"
     volumes:
-      - ./data/backend-logs:/var/log/eep
-      - ./data/reports:/opt/eep-data/reports
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    networks:
-      - eep-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+      - *eep-settings-mount
+      - eep-backend-logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # 需要从宿主机直连接口排障时再放开（只绑回环，不对局域网暴露）：
+    # ports:
+    #   - "127.0.0.1:8000:8000"
 
-  # ── 数据库：PostgreSQL ──────────────────────────────────
-  db:
-    image: postgres:16-alpine
-    container_name: eep-db
-    restart: unless-stopped
-    profiles: ["backend"]
+  # ── 采集：每 5 分钟跑一轮 collect --if-due ─────────────────
+  # 用「计划任务式」循环而不是常驻 collect_loop：--if-due 幂等，
+  # 容器重启 / 网络抖动漏掉的那一轮，下一个 5 分钟会自动补上，
+  # 不会像常驻循环那样丢掉整个小时的采样（见 backend/docs/采集说明.md）。
+  # 迁移与 seed 交给 backend 做，避免两个容器同时抢 DDL 锁。
+  collector:
+    <<: *eep-backend-base
+    container_name: eep-collector
     environment:
-      POSTGRES_DB: ${EEP_DB_NAME:-eep_db}
-      POSTGRES_USER: ${EEP_DB_USER:-eep}
-      POSTGRES_PASSWORD: ${EEP_DB_PASSWORD:?必须设置 EEP_DB_PASSWORD}
+      EEP_DB_HOST: ${EEP_DB_HOST:-mysql}
+      EEP_DB_PORT: "${EEP_DB_PORT:-3306}"
+      EEP_AUTO_MIGRATE: "false"
+      EEP_AUTO_SEED: "false"
+    # 批处理容器不监听 8000，继承自镜像的 HEALTHCHECK 会稳定报 unhealthy，
+    # 那属于假告警，反而会把真出问题的容器淹掉。存活与否看 compose ps 的
+    # Up/Exited 状态和日志（采集看 collector、结算看 rollup）。
+    healthcheck:
+      disable: true
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          if python manage.py collect --aggregate --if-due; then
+            sleep ${EEP_COLLECT_INTERVAL:-300}
+          else
+            # 一轮失败不能干等 5 分钟：数据库短暂抖动时错过整点就丢一小时数据
+            sleep 60
+          fi
+        done
+    volumes:
+      - *eep-settings-mount
+      - eep-collector-logs:/app/logs
+    depends_on:
+      # 必须等 backend **healthy** 而不是等 mysql healthy：
+      # 建表是 backend 的 entrypoint 做的，只看 mysql 会让采集在第一轮就撞上
+      # (1146, "Table 'eep_energy.energy_meter' doesn't exist")。
+      # backend 的 HEALTHCHECK 打 /healthz，而 entrypoint 是「先 migrate+seed
+      # 再 exec gunicorn」，所以 healthy 严格等价于「表已经建好了」。
+      backend:
+        condition: service_healthy
+
+  # ── 周期结算：每天 00:30 跑 summarize --rollup ──────────────
+  # v1.4.2 起日/月/年汇总**不再**跟着采集刷（collect 的 --summarize 默认关），
+  # 改由此任务结算「昨天 + 今天 + 近 2 月 + 今年」。
+  # ⚠ 漏掉它的后果是静默的：大屏「近 30 日 / 近 12 月」会永远停在最后一次结算
+  #   那天，当期数字却一切正常、也不报任何错 —— 是最容易漏部署的一个服务。
+  #   依据见 backend/scripts/daily-rollup-task.py 顶部说明与 collect.py 的注释。
+  rollup:
+    <<: *eep-backend-base
+    container_name: eep-rollup
+    environment:
+      EEP_DB_HOST: ${EEP_DB_HOST:-mysql}
+      EEP_DB_PORT: "${EEP_DB_PORT:-3306}"
+      EEP_AUTO_MIGRATE: "false"
+      EEP_AUTO_SEED: "false"
+    # 批处理容器不监听 8000，继承自镜像的 HEALTHCHECK 会稳定报 unhealthy，
+    # 那属于假告警，反而会把真出问题的容器淹掉。存活与否看 compose ps 的
+    # Up/Exited 状态和日志（采集看 collector、结算看 rollup）。
+    healthcheck:
+      disable: true
+    command:
+      - sh
+      - -c
+      - |
+        # ⚠ compose 会对整段文本做变量插值，所以交给容器内 shell 的变量与
+        #   算术展开一律要写成「两个美元符号」转义形式，否则到容器里就成了空串；
+        #   只有确实想让 compose 从 .env 代入的才用单花括号形式。
+        # 启动先补一次：容器可能正好错过 00:30（发版、断电、重启）
+        python manage.py summarize --rollup || sleep 300
+        while true; do
+          now=$$(date +%s)
+          next=$$(date -d "today 00:30" +%s)
+          [ "$$next" -le "$$now" ] && next=$$(date -d "tomorrow 00:30" +%s)
+          echo "[rollup] 距下次结算还有 $$(( (next - now) / 60 )) 分钟"
+          sleep $$((next - now))
+          python manage.py summarize --rollup || sleep 300
+        done
+    volumes:
+      - *eep-settings-mount
+      - eep-rollup-logs:/app/logs
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ── 数据库：MySQL 8.0 ────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: eep-mysql
+    restart: unless-stopped
+    command:
+      # 这套库的时间字段是**朴素本地时间**（settings.py 里 USE_TZ=False），
+      # 所以会话时区必须固定在 +08:00，否则 NOW() 与 Python 写入的时间差 8 小时。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+      # 认证插件必须显式指定：MySQL 8 默认 caching_sha2_password，而 PyMySQL
+      # 走这条认证需要 cryptography 包做 RSA 密钥交换 —— requirements.txt 里没有
+      # （加依赖按《项目规范》要评审），不指定就是后端一启动就 RuntimeError 反复重启。
+      # ⚠ 改成「连现场已有 MySQL」时，如果那边的账号是 caching_sha2_password，
+      #   就必须给 requirements.txt 补一行 cryptography，否则同样的错误会再出现。
+      # ⚠ 这个变量在 MySQL 8.4 起被移除、mysql_native_password 默认停用；
+      #   要升级到 8.4+ 就改用 cryptography 方案，别沿用这条。
+      - --default-authentication-plugin=mysql_native_password
+      # 关掉 performance_schema 省 200~300MB 内存：现场工控机往往只有 4GB，
+      # 还要和前后端 + 采集容器挤在一起。真要排查数据库性能再临时打开。
+      - --performance-schema=OFF
+    environment:
+      MYSQL_ROOT_PASSWORD: ${EEP_DB_ROOT_PASSWORD:?必须设置 EEP_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${EEP_DB_NAME:-eep_energy}
+      MYSQL_USER: ${EEP_DB_USER:-eep}
+      MYSQL_PASSWORD: ${EEP_DB_PASSWORD:?必须设置 EEP_DB_PASSWORD}
       TZ: Asia/Shanghai
     volumes:
-      - db-data:/var/lib/postgresql/data
-    expose:
-      - "5432"
+      - eep-mysql-data:/var/lib/mysql
+    healthcheck:
+      # mysqladmin ping 即使认证不通过也会回 "mysqld is alive" 且退出码 0，
+      # 所以不必把口令写进 healthcheck（写了会泄到 docker inspect 里）。
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
     networks:
       - eep-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *eep-logging
+    # 默认**不**把 3306 发布到宿主机：数据库只给容器内的后端与采集器用。
+    # 要从宿主机连库时再放开（务必只绑回环，别对整个车间网段开门）：
+    # ports:
+    #   - "127.0.0.1:3306:3306"
 
-  # ── 视频转流网关：go2rtc ────────────────────────────────
+  # ── 视频转流网关：go2rtc（可选，默认不启动）────────────────
   # 现场目前用 Windows 版 go2rtc（E:\能源产效管理平台\go2rtc_win64），
-  # 若改为容器化部署再启用本服务；否则保持注释，前端直连现有网关即可。
+  # 要容器化再执行：docker compose --profile stream up -d
+  # 不启动也不影响别处：Nginx 对 /live/ 是运行时解析，最多视频区 502，
+  # 不会连累整个前端容器起不来。
   stream:
     image: alexxit/go2rtc:latest
     container_name: eep-stream
@@ -103,19 +255,26 @@ services:
       - "8555:8555"     # WebRTC（TCP+UDP）
       - "8554:8554"     # RTSP（供录像机再拉流）
     volumes:
-      - ../go2rtc/go2rtc.example.yaml:/config/go2rtc.yaml:ro
+      - type: bind
+        source: ./settings/go2rtc.local.yaml
+        target: /config/go2rtc.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - eep-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *eep-logging
 
 networks:
   eep-net:
     driver: bridge
 
 volumes:
-  db-data:
+  eep-mysql-data:
+    driver: local
+  eep-backend-logs:
+    driver: local
+  eep-collector-logs:
+    driver: local
+  eep-rollup-logs:
     driver: local

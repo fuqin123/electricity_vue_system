@@ -25,10 +25,17 @@ deploy/
 │  ├─ eep-backend.service        # 后端 systemd 单元
 │  ├─ logrotate.eep              # 日志轮转（保留 30 天 + 按大小滚动）
 │  └─ daily-check.sh             # 每日巡检脚本
-└─ docker/
-   ├─ Dockerfile                 # 前端多阶段构建
-   ├─ docker-compose.yml         # 前端 + 后端 + go2rtc 编排
-   └─ nginx.default.conf         # 容器内 Nginx 配置
+└─ docker/                       # 全栈容器化（详见 docker/README.md）
+   ├─ Dockerfile                 # 前端镜像（大屏 + 后台 → Nginx）
+   ├─ Dockerfile.backend         # 后端镜像（Django + gunicorn，采集容器复用）
+   ├─ entrypoint.backend.sh      # 等库 → 建库 → migrate → seed → exec
+   ├─ docker-compose.yml         # frontend + backend + collector + rollup + mysql（+ 可选 stream）
+   ├─ nginx.default.conf         # 容器内 Nginx 配置（运行时解析上游，后端挂了前端不崩）
+   ├─ .env.example               # 口令与参数模板
+   ├─ settings/                  # 现场真实配置挂载点（不入库）
+   ├─ build-offline-bundle.sh    # 构建机：出镜像 + docker save → 离线压缩包
+   ├─ load-and-run.sh            # 目标机：导镜像 + 起服务 + 等健康检查
+   └─ README.md                  # 容器化部署说明与排障对照表
 ```
 
 ---
@@ -61,6 +68,9 @@ deploy/
 2. **后台部署到子路径时必须同步改 `base`**
    `frontend/apps/admin/vite.config.ts` 的 `base` 默认为 `/`。
    部署到 `/admin/` 就必须改成 `base: '/admin/'` 再构建，且 Nginx `alias` 两侧都要有尾斜杠。
+   **Docker 形态不用改源码**：`docker/Dockerfile` 在构建时用 CLI 覆盖
+   （`vite build --base=/admin/`），源码里的 `base: '/'` 保留给「后台放站点根目录」
+   那种形态。直接把 `base` 改成 `/admin/` 会让宿主机部署（`linux/deploy.sh`）那条路断掉。
 
 3. **`index.html` 绝不缓存，带哈希的 assets 长期缓存**
    反过来配会出现「发版后用户还在跑旧版本」或「每次访问都重新下载 1MB JS」。
@@ -87,6 +97,24 @@ sudo ./deploy.sh rollback
 # 查看状态
 sudo ./deploy.sh status
 ```
+
+### Docker（全栈，一条命令起五个容器）
+
+```bash
+cd deploy/docker
+cp .env.example .env                                   # 填口令与密钥
+mkdir -p settings && cp ../../backend/config/settings.example.yaml settings/settings.local.yaml
+docker compose up -d --build
+```
+
+目标机不能联网时，在构建机上打包再拷过去：
+
+```bash
+./build-offline-bundle.sh                              # → dist/eep-docker-bundle-*.tar.gz
+# 拷到目标机：tar xzf 包 && cd */runtime && ./load-and-run.sh
+```
+
+服务组成、验证清单（6 步 curl）、排障对照表见 `docker/README.md`。
 
 ### 挂载配置文件
 

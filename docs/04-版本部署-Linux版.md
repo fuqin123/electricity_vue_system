@@ -462,274 +462,102 @@ curl -s http://127.0.0.1/healthz
 
 ## 四、方案 B：Docker Compose
 
-适用场景：容器化环境、多环境一致性要求高、需要快速交付。
+适用场景：容器化环境、多环境一致性要求高、需要快速交付（离线镜像包）。
 
-### 4.1 目录结构
+> **配置的真值在 `deploy/docker/`，本节只讲结构与踩过的坑，不复制文件内容。**
+> 完整步骤、部署后验证清单、排障对照表见 `deploy/docker/README.md`。
 
-```
-eep-docker/
-├─ docker-compose.yml
-├─ nginx/
-│  └─ default.conf
-├─ screen/            # 大屏构建产物（构建机产出后拷入）
-├─ admin/             # 后台构建产物
-└─ .env
-```
+### 4.1 服务组成
 
-### 4.2 多阶段构建 Dockerfile
+| 服务 | 镜像 | 职责 |
+| :--- | :--- | :--- |
+| `frontend` | `Dockerfile` 构建（Nginx） | 托管大屏 + 后台静态产物，反代 `/api/`、`/live/` |
+| `backend` | `Dockerfile.backend` 构建（gunicorn） | Django 接口；启动时自动 migrate + seed |
+| `collector` | **与 backend 同一个镜像** | 每 5 分钟 `collect --aggregate --if-due` |
+| `rollup` | **与 backend 同一个镜像** | 每天 00:30 `summarize --rollup`，结算日/月/年 |
+| `mysql` | `mysql:8.0` | 业务库；换现场已有库见 docker/README 第 6 节 |
+| `stream` | `alexxit/go2rtc` | 可选，`--profile stream` 才启动 |
 
-```dockerfile
-# ══════════════════════════════════════════════════════════════
-# 能源产效管理系统 · 前端镜像（多阶段构建）
-# 阶段 1：在容器内构建（需要出网拉依赖）
-# 阶段 2：仅保留 Nginx + 静态产物（镜像极小）
-# ══════════════════════════════════════════════════════════════
+采集与接口共用镜像是刻意的：两边必须跑同一份代码，否则「接口读到的」和
+「采集写入的」口径会分叉，而这种分叉在界面上看起来像数据错了。
 
-# ── 阶段 1：构建 ────────────────────────────────────────────
-FROM node:22-alpine AS builder
+### 4.2 容器化踩到的五个坑
 
-WORKDIR /src
+1. **Nginx 不能用 `upstream{}` 静态块指向后端容器**
+   nginx 在**启动瞬间**解析 upstream 里的主机名。后端容器没起来就是
+   `[emerg] host not found in upstream "backend"` → 前端容器 crash loop，
+   现场看到的现象是「整个系统打不开」，而真实故障只在后端。
+   必须用 `resolver 127.0.0.11` + 变量形式的 `proxy_pass`，把解析推迟到请求时；
+   后端不在也只是 `/api` 返回 502，静态页面照常可访问。
 
-# 国内镜像源加速
-RUN npm config set registry https://registry.npmmirror.com && \
-    corepack enable && corepack prepare pnpm@latest --activate
+2. **后台产物必须带 `--base=/admin/` 构建**
+   源码里的 `base: '/'` 是给「后台部署在站点根目录」那种形态用的；容器里放在
+   `/admin/` 子路径，不带 base 构建出的 `index.html` 引用 `/assets/xxx.js`
+   → 后台整片白屏。在 Dockerfile 里用 CLI 覆盖，**不改源码**
+   （理由见 `deploy/README.md` 红线 2）。
 
-# 先拷依赖清单，利用 Docker 层缓存
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY frontend/apps/screen/package.json  frontend/apps/screen/
-COPY frontend/apps/admin/package.json   frontend/apps/admin/
-COPY frontend/packages/shared/package.json frontend/packages/shared/
+3. **采集容器要等 `backend` healthy，不是等 `mysql` healthy**
+   建表是 backend 的 entrypoint 做的。只等 mysql，采集第一轮就撞
+   `(1146, "Table 'eep_energy.energy_meter' doesn't exist")`。
 
-RUN pnpm install --frozen-lockfile
+4. **MySQL 8 的 `caching_sha2_password` 需要 `cryptography` 包**
+   PyMySQL 走这条认证要做 RSA 密钥交换，而 `requirements.txt` 里没有该包
+   （新增依赖按《项目规范》需评审）。所以容器内的库显式用
+   `--default-authentication-plugin=mysql_native_password`。
+   ⚠ 改成连现场已有的 MySQL 时，若那边账号是 caching_sha2_password，
+   就必须给 `requirements.txt` 补一行 `cryptography`，否则同样的错误会再现。
 
-# 再拷源码构建
-COPY . .
-RUN pnpm build
+5. **周期结算必须单独排一个服务**
+   v1.4.2 起 `collect` 默认**不**再刷日/月/年汇总（`--summarize` 要显式加），
+   改由每天 00:30 的 `summarize --rollup` 结算。漏掉它的现象是**静默的**：
+   当天数字照常从小时表现算、不报错，而大屏「近 30 日 / 近 12 月」永远停在
+   最后一次结算那天。依据见 `backend/scripts/daily-rollup-task.py` 顶部说明。
 
-# ── 阶段 2：运行 ────────────────────────────────────────────
-FROM nginx:1.27-alpine
+另有两条与「数据正确性」直接相关，不只是跑不跑得起来：
 
-# 移除默认站点
-RUN rm -f /etc/nginx/conf.d/default.conf
+- **时区**：`settings.py` 里 `USE_TZ=False`，时间按本地朴素时间读写。
+  三个应用容器与 MySQL 都要 `Asia/Shanghai`（MySQL 还要
+  `--default-time-zone=+08:00`），否则界面时间整体偏 8 小时，
+  而这套系统的核心口径就是「每小时差值」——错位等于数据全废。
+- **不要把 apt/apk 装包写进 Dockerfile**：内网构建机上 `deb.debian.org:80`
+  经常不通，而 `python:3.12-slim`、`nginx:1.27-alpine` 本来就自带 zoneinfo
+  与 curl。多那一步只是让构建在必定失败的地方失败。
 
-COPY --from=builder /src/frontend/apps/screen/dist /usr/share/nginx/html/screen
-COPY --from=builder /src/frontend/apps/admin/dist  /usr/share/nginx/html/admin
-COPY nginx/default.conf /etc/nginx/conf.d/eep.conf
-
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1/healthz || exit 1
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
-```
-
-### 4.3 容器内 Nginx 配置 `nginx/default.conf`
-
-与外网配置基本相同，**只有路径前缀不同**（容器内产物在 `/usr/share/nginx/html/`）：
-
-```nginx
-upstream eep_backend {
-    server backend:8000;      # docker-compose 服务名
-    keepalive 32;
-}
-
-server {
-    listen 80;
-    server_name _;
-    charset utf-8;
-    root /usr/share/nginx/html;
-
-    client_max_body_size 20m;
-
-    gzip on;
-    gzip_comp_level 6;
-    gzip_min_length 1024;
-    gzip_types text/plain text/css application/javascript application/json
-               application/xml image/svg+xml font/woff2;
-
-    add_header X-Content-Type-Options "nosniff" always;
-    server_tokens off;
-
-    # 大屏（hash 路由）
-    location /screen/ {
-        alias /usr/share/nginx/html/screen/;
-        try_files $uri $uri/ /screen/index.html;
-
-        location ~* ^/screen/assets/.*\.(js|css|woff2?|png|svg)$ {
-            expires 365d;
-            add_header Cache-Control "public, immutable";
-            access_log off;
-        }
-        location = /screen/index.html {
-            add_header Cache-Control "no-cache, no-store, must-revalidate";
-            expires -1;
-        }
-    }
-    location = /screen { return 301 /screen/; }
-
-    # 后台（history 路由，必须回退）
-    location /admin/ {
-        alias /usr/share/nginx/html/admin/;
-        try_files $uri $uri/ /admin/index.html;
-
-        location ~* ^/admin/assets/.*\.(js|css|woff2?|png|svg)$ {
-            expires 365d;
-            add_header Cache-Control "public, immutable";
-            access_log off;
-        }
-        location = /admin/index.html {
-            add_header Cache-Control "no-cache, no-store, must-revalidate";
-            expires -1;
-        }
-    }
-    location = /admin { return 301 /admin/; }
-
-    # API
-    location /api/ {
-        proxy_pass          http://eep_backend;
-        proxy_http_version  1.1;
-        proxy_set_header    Host              $host;
-        proxy_set_header    X-Real-IP         $remote_addr;
-        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header    Connection        "";
-        proxy_read_timeout  120s;
-    }
-
-    # 视频流（长连接）
-    location /live/ {
-        proxy_pass          http://stream:1984/;
-        proxy_http_version  1.1;
-        proxy_buffering     off;
-        proxy_read_timeout  3600s;
-        chunked_transfer_encoding off;
-        add_header          Access-Control-Allow-Origin * always;
-    }
-
-    location = / { return 302 /admin/; }
-
-    location = /healthz {
-        access_log off;
-        return 200 "ok\n";
-        add_header Content-Type text/plain;
-    }
-}
-```
-
-### 4.4 `docker-compose.yml`
-
-```yaml
-services:
-  # ── 前端（大屏 + 后台）──────────────────────────────────
-  frontend:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    image: eep-frontend:0.1.0
-    container_name: eep-frontend
-    restart: unless-stopped
-    ports:
-      - "80:80"
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - eep-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-
-  # ── 后端 Django ─────────────────────────────────────────
-  backend:
-    image: eep-backend:0.1.0      # 由后端仓库构建
-    container_name: eep-backend
-    restart: unless-stopped
-    env_file:
-      - .env
-    expose:
-      - "8000"
-    volumes:
-      - ./logs/backend:/var/log/eep
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-    networks:
-      - eep-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-
-  # ── 流媒体网关（RTSP → HTTP-FLV）─────────────────────────
-  stream:
-    image: alexxit/go2rtc:latest
-    container_name: eep-stream
-    restart: unless-stopped
-    ports:
-      - "1984:1984"     # HTTP API / 播放页 / MSE / HLS / MJPEG
-      - "8555:8555"     # WebRTC（TCP+UDP）
-    volumes:
-      - ../go2rtc/go2rtc.example.yaml:/config/go2rtc.yaml:ro
-    networks:
-      - eep-net
-
-networks:
-  eep-net:
-    driver: bridge
-```
-
-### 4.5 常用命令
+### 4.3 启动与更新
 
 ```bash
-# 构建并启动
-docker compose up -d --build
+cd deploy/docker
+cp .env.example .env                                   # 填口令与密钥
+mkdir -p settings
+cp ../../backend/config/settings.example.yaml settings/settings.local.yaml
+docker compose up -d --build                           # 首次：建库 + 迁移 + 登记设备
 
-# 查看状态与日志
-docker compose ps
-docker compose logs -f frontend
-
-# 更新前端（重新构建镜像）
-docker compose build frontend
-docker compose up -d frontend
-
-# 滚动重启（不中断服务）
-docker compose up -d --no-deps --build frontend
-
-# 回滚到上一镜像
-docker tag eep-frontend:0.1.0 eep-frontend:rollback
-docker compose down frontend
-docker compose up -d frontend
-
-# 清理无用镜像（注意不要误删 rollback 标签的）
-docker image prune -f
+docker compose build frontend && docker compose up -d frontend    # 只更新前端
+docker compose logs -f collector                       # 现场最该看的一路
+docker compose ps                                      # 五个容器的健康状态
 ```
 
-### 4.6 离线环境交付
-
-内网 Docker 环境无法拉镜像时，用 `save` / `load` 传递：
+### 4.4 离线环境交付
 
 ```bash
-# ── 在能出网的构建机上 ───────────────────────────────
-docker compose build
-docker save eep-frontend:0.1.0 eep-backend:0.1.0 \
-  -o eep-images-0.1.0.tar
-docker save nginx:1.27-alpine alexxit/go2rtc:latest \
-  -o eep-3rdparty.tar
-gzip eep-images-0.1.0.tar eep-3rdparty.tar
+# 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
+cd deploy/docker && cp .env.example .env
+./build-offline-bundle.sh
+# → dist/eep-docker-bundle-v1.5.2-<日期>.tar.gz（三个镜像 + runtime/）
 
-# ── 拷到内网服务器 ──────────────────────────────────
-gunzip eep-images-0.1.0.tar.gz eep-3rdparty.tar.gz
-docker load -i eep-3rdparty.tar
-docker load -i eep-images-0.1.0.tar
-docker compose up -d
+# 目标机（无需源码、无需外网，只要装了 docker + compose v2）
+tar xzf eep-docker-bundle-*.tar.gz
+cd eep-docker-bundle-*/runtime && ./load-and-run.sh
 ```
+
+Docker Hub 不通时给构建脚本加加速前缀：
+
+```bash
+REGISTRY_MIRROR=docker.m.daocloud.io ./build-offline-bundle.sh
+```
+
+⚠ 离线包里的 `settings/settings.local.yaml` 由 `backend/config/settings.example.yaml`
+生成，蒸汽平台 token 等仍是 `CHANGE_ME`，上线前必须现场填好。
 
 ---
 

@@ -20,7 +20,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ── 基础 ─────────────────────────────────────────────────────
 SECRET_KEY = conf.env("EEP_SECRET_KEY", conf.get("auth.secret_key", "dev-only-CHANGE_ME"))
 DEBUG = conf.env_bool("EEP_DEBUG", bool(conf.get("app.debug", False)))
-ALLOWED_HOSTS = conf.get("app.allowed_hosts") or ["127.0.0.1", "localhost"]
+# 环境变量优先（逗号分隔）：反代后 Django 看到的 Host 是浏览器里的地址，
+# 光靠配置文件里那两条回环条目，换一台机器就要改一次代码外的配置。
+ALLOWED_HOSTS = [h.strip() for h in str(conf.env("EEP_ALLOWED_HOSTS", "")).split(",") if h.strip()] or conf.get("app.allowed_hosts") or ["127.0.0.1", "localhost"]
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
