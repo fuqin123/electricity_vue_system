@@ -543,7 +543,7 @@ docker compose ps                                      # 五个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.5.3-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.5.4-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz

@@ -13,7 +13,7 @@
  *     后端实现后把它从数组里删掉即可，**不用改别处代码**。
  *
  * 已接真实后端：energy.*、admin.overview / lines / gateways / meters /
- *              quality / collect-logs / params / readings / alarms（v1.5.3 告警引擎）
+ *              quality / collect-logs / params / readings / alarms（v1.5.4 告警引擎）
  * 仍走演示数据：admin.users / roles / menus / dicts /
  *              logs.operation / logs.login / reports
  * ⚠ 这个清单必须与下面 config.ts 的 dataConfig.mockOnly 一致 ——

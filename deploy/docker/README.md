@@ -52,7 +52,7 @@ MySQL 首次建数据卷要 30~60 秒，期间 backend 会停在「等待数据�
 cd deploy/docker
 cp .env.example .env            # build 阶段 compose 也要校验必填项
 ./build-offline-bundle.sh
-# 产物：dist/eep-docker-bundle-v1.5.3-<日期>.tar.gz
+# 产物：dist/eep-docker-bundle-v1.5.4-<日期>.tar.gz
 # Docker Hub 不通时加加速前缀（只影响 mysql 这类公共基础镜像）：
 #   REGISTRY_MIRROR=docker.m.daocloud.io ./build-offline-bundle.sh
 ```
@@ -103,7 +103,7 @@ curl -s http://127.0.0.1/api/energy/overview | head -c 200
 # ⑥ 采集是否在跑（现场最需要看这个）
 docker compose logs --tail=30 collector
 
-# ⑧ 告警是否对应真实问题（v1.5.3 起有告警表）
+# ⑧ 告警是否对应真实问题（v1.5.4 起有告警表）
 docker compose exec backend python manage.py check_alerts
 curl -s http://127.0.0.1:8080/api/admin/alarms?status=active | head -c 200
 #    每条都应能对应到现场的实事（未接入 / 网关不通 / 昨日没结算）

@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.5.3 ｜ 最后更新：2026-10-12
+> 版本：v1.5.4 ｜ 最后更新：2026-10-16
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -32,7 +32,7 @@
 | `GET /api/energy/production` | ✅ 已实现 | 产量采集尚未改造：**如实返回 null + available=false**（不是 501，不是 0） |
 | `GET/POST/PUT/DELETE /api/admin/gateways*` `meters*` | ✅ v1.2.1 已实现 | 网关 / 计量点后台增删改；`POST …/{id}/test` 连接测试与试采（返回**真实读数**） |
 | `GET /api/admin/overview` `lines` `quality` `collect-logs` | ✅ v1.2.1 已实现 | 后台看板 / 产线主数据 / 数据质量 / 采集日志 |
-| `GET /api/admin/alarms` `POST /api/admin/alarms/{id}/ack` | ✅ v1.5.3 已实现 | 告警列表与确认，读 `energy_alarm` 表（由告警引擎生成） |
+| `GET /api/admin/alarms` `POST /api/admin/alarms/{id}/ack` | ✅ v1.5.4 已实现 | 告警列表与确认，读 `energy_alarm` 表（由告警引擎生成） |
 | `/api/admin/*` 其余（系统管理、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`）；**告警已移出该清单，不再有演示数据** |
 
 > ⚠ v1.2.1 修复：admin 组接口曾误挂在 `/api/energy/admin/*` 下导致前端 404（B-404），
@@ -933,7 +933,7 @@ Authorization: Bearer <token>
 }
 ```
 
-### 4.4 告警（v1.5.3 已实现）
+### 4.4 告警（v1.5.4 已实现）
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
