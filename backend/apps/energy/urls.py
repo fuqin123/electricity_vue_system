@@ -39,6 +39,8 @@ _ADMIN_ROUTES = [
     ("quality", api.admin_quality, "admin-quality"),
     ("collect-logs", api.admin_collect_logs, "admin-collect-logs"),
     ("readings", api.admin_readings, "admin-readings"),
+    ("alarms", api.admin_alarms, "admin-alarms"),
+    ("alarms/<int:pk>/ack", api.admin_alarm_ack, "admin-alarm-ack"),
     ("params", api.admin_params, "admin-params"),
     ("params/<int:pk>", api.admin_param_detail, "admin-param-detail"),
     ("gateways", api.admin_gateways, "admin-gateways"),

@@ -67,7 +67,10 @@ export const HOUR_QUALITY_LABEL: Record<string, string> = {
   missing: '异常·缺数',
   reset: '异常·换表',
   spike: '异常·尖峰',
-  partial: '异常·部分缺数'
+  partial: '异常·部分缺数',
+  // 登记了但从未出过可信值 —— 要人去接线 / 给 token，
+  // 与「接入过却缺采」（missing，要查链路）是两种处理动作，不能混成一个文案
+  unconnected: '未接入'
 };
 
 /** 数值保留 n 位小数（四舍五入），用于统一 mock 与接口口径 */

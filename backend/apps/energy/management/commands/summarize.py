@@ -25,6 +25,7 @@ from datetime import datetime
 from django.core.management.base import BaseCommand
 
 from ...models import PeriodSummary
+from ...services import alerts
 from ...services import summary as S
 
 
@@ -51,6 +52,13 @@ class Command(BaseCommand):
             written = S.refresh_rollups(now)
             self.stdout.write(
                 self.style.SUCCESS(f"滚动窗口结算完成（昨天 + 今天 + 近 2 月 + 今年）：{len(written)} 条")
+            )
+            # 结算完立刻评估：覆盖率规则读的就是刚写下的这批昨日日汇总行。
+            # 等下一轮采集才报会白挂几个小时，而 00:30 正是值班交接前
+            # 最该看到「昨天哪些数不完整」的时刻。
+            res = alerts.evaluate(now=now)
+            self.stdout.write(
+                f"告警：新增 {res['created']}、恢复 {res['resolved']}、未处理 {res['active']}"
             )
             return
 

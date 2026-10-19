@@ -380,37 +380,6 @@ export function mockGateways(): Gateway[] {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   告警
-   ══════════════════════════════════════════════════════════════ */
-
-export function mockAlarms(): AlarmRecord[] {
-  const defs: Array<Partial<AlarmRecord> & { content: string; source: string; level: AlarmRecord['level'] }> = [
-    { code: 'ALM-20260922-0001', level: 'critical', source: 'A4 生产线', content: '单位电耗超告警上限', value: '10.24', threshold: '9.60', status: 'active' },
-    { code: 'ALM-20260922-0002', level: 'major', source: 'A6 生产线', content: '连续 4 小时无产量，疑似停机', value: '0', threshold: '—', status: 'active' },
-    { code: 'ALM-20260922-0003', level: 'major', source: 'EM-A5-1005', content: '电表通讯中断', value: '—', threshold: '心跳 60s', status: 'acked' },
-    { code: 'ALM-20260922-0004', level: 'minor', source: 'A3 生产线', content: 'CIP 清洗期间辅机负荷偏高', value: '18.6', threshold: '15.0', status: 'acked' },
-    { code: 'ALM-20260922-0005', level: 'minor', source: '车间蒸汽总表', content: '汽耗较昨日同期偏高', value: '+12.4%', threshold: '±10%', status: 'resolved' },
-    { code: 'ALM-20260922-0006', level: 'info', source: '视频通道', content: '6 路通道未配置转流网关', value: '6', threshold: '0', status: 'active' },
-    { code: 'ALM-20260921-0017', level: 'minor', source: 'A1 生产线', content: '单位电耗接近告警上限', value: '9.31', threshold: '9.60', status: 'resolved' },
-    { code: 'ALM-20260921-0011', level: 'critical', source: '空压站网关', content: '网关离线超 24 小时', value: '—', threshold: '心跳 5min', status: 'resolved' }
-  ];
-  const rng = makeRng('alarms');
-  return defs.map((d, i) => ({
-    id: i + 1,
-    code: d.code as string,
-    level: d.level,
-    source: d.source,
-    content: d.content,
-    value: (d.value as string) ?? '—',
-    threshold: (d.threshold as string) ?? '—',
-    status: d.status as AlarmRecord['status'],
-    occurredAt: priorTime(12 + i * 47),
-    ackedBy: d.status === 'active' ? '' : pick(NICKNAMES, rng),
-    ackedAt: d.status === 'active' ? '' : priorTime(10 + i * 40)
-  }));
-}
-
-/* ══════════════════════════════════════════════════════════════
    日志
    ══════════════════════════════════════════════════════════════ */
 
@@ -515,7 +484,9 @@ export function mockQuality(): DataQualityRow[] {
 export function mockAdminOverview(now: Date = new Date()): AdminOverview {
   const snap = buildSnapshot(now);
   const ws = snap.workshop;
-  const alarms = mockAlarms();
+  // 告警不再有演示数据：告警是「数据没被正确计量」的事实陈述，
+  // 编几条假的会让人以为系统真的在监控这些问题。演示模式下如实给空。
+  const alarms: AlarmRecord[] = [];
   const gateways = mockGateways();
   const quality = mockQuality();
   const noise = makeRng(`ov|${now.getHours()}|${now.getDate()}`);

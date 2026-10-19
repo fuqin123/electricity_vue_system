@@ -517,7 +517,10 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
     steam: x.future ? null : round2(((x.kwh ?? 0) * m.steamPerKwhKg) / 1000)
   }));
 
-  /* 告警：全部由真实判定条件生成，同类合并、按严重度排序 */
+  /* 告警：演示层不再编造告警。真实告警由后端告警引擎按实际计量情况生成
+     （见 backend/apps/energy/services/alerts.py）—— 在这里凭空造几条，只会让人
+     以为「这些问题正在被监控」。只保留两类**如实**提示：
+     产量数据源未接入、视频通道配置状态。 */
   const alerts: AlertItem[] = [];
 
   if (!PROD_ENABLED) {
@@ -525,100 +528,6 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
     alerts.push({ level: 'info', text: dataConfig.productionNote, time: '--:--:--' });
   }
 
-  lines.forEach((l) => {
-    if (PROD_ENABLED) {
-      /* ① 连续无产量合并为一条 */
-      const runs: [number, number][] = [];
-      let start = -1;
-      for (let i = 0; i <= curH; i++) {
-        const s = l.hours[i];
-        if (s && !s.future && s.output === 0 && s.kwh !== null) {
-          if (start < 0) start = i;
-        } else if (start >= 0) {
-          runs.push([start, i - 1]);
-          start = -1;
-        }
-      }
-      if (start >= 0) runs.push([start, curH]);
-      runs.forEach((r) => {
-        const span = r[1] - r[0] + 1;
-        alerts.push({
-          level: 'warn',
-          text: `${l.id} 线 ${
-            span > 1 ? `${pad2(r[0])}—${pad2(r[1])} 时连续 ${span} 小时无产量` : `${pad2(r[0])} 时无产量`
-          }（待确认是否计划停机）`,
-          time: `${pad2(r[1])}:00:00`
-        });
-      });
-
-      /* ② 单位电耗超阈值：只报当日最差的一个已完成整点 */
-      let worst: HourPoint | null = null;
-      for (let j = 0; j < curH; j++) {
-        const sj = l.hours[j];
-        if (sj && !sj.future && !sj.partial && sj.unitKwh !== null && sj.unitKwh > th.unitKwhHigh) {
-          if (!worst || sj.unitKwh > (worst.unitKwh ?? 0)) worst = sj;
-        }
-      }
-      if (worst) {
-        alerts.push({
-          level: 'err',
-          text: `${l.id} 线 ${pad2(worst.hour)} 时单位电耗 ${(worst.unitKwh ?? 0).toFixed(2)}，超阈值 ${th.unitKwhHigh.toFixed(2)}`,
-          time: `${pad2(worst.hour)}:00:00`
-        });
-      }
-
-      /* ③ 电表缺失（有产量无电量） */
-      for (let k = 0; k < curH; k++) {
-        const sk = l.hours[k];
-        if (sk && !sk.future && (sk.output ?? 0) > 0 && (sk.kwh === null || sk.kwh === 0)) {
-          alerts.push({
-            level: 'err',
-            text: `${l.id} 线 ${pad2(k)} 时电表无数据，产量正常`,
-            time: `${pad2(k)}:00:00`
-          });
-          break;
-        }
-      }
-
-      /* ④ 本小时低产：用整点预期值判定，且至少已过 1/4 小时才判 */
-      const cur2 = l.hours[curH];
-      if (
-        cur2 &&
-        !cur2.future &&
-        cur2.partial &&
-        (cur2.progress ?? 0) >= 0.25 &&
-        (cur2.projected ?? 0) > 0 &&
-        (cur2.projected ?? 0) < l.rated * th.outputLowRate
-      ) {
-        alerts.push({
-          level: 'warn',
-          text: `${l.id} 线本小时预计产量 ${((cur2.projected ?? 0) / 1000).toFixed(1)} 千瓶，低于额定 ${Math.round(
-            th.outputLowRate * 100
-          )}%`,
-          time: `${pad2(curH)}:00:00`
-        });
-      }
-    }
-  });
-
-  if (ySteamT > 0) {
-    const sd = ((steamTodayT - ySteamT) / ySteamT) * 100;
-    if (Math.abs(sd) > 10)
-      alerts.push({
-        level: 'warn',
-        text: `车间汽耗较昨日同期 ${sd > 0 ? '+' : ''}${sd.toFixed(1)}%`,
-        time: `${pad2(curH)}:00:00`
-      });
-  }
-  if (yWaterT > 0) {
-    const wd = ((waterTodayT - yWaterT) / yWaterT) * 100;
-    if (Math.abs(wd) > 12)
-      alerts.push({
-        level: 'info',
-        text: `车间水耗较昨日同期 ${wd > 0 ? '+' : ''}${wd.toFixed(1)}%`,
-        time: `${pad2(curH)}:00:00`
-      });
-  }
 
   /* ⑤ 视频通道：合并为一条，不逐线刷屏 */
   if (videoConfig.enabled) {

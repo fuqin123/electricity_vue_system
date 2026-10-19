@@ -39,7 +39,15 @@ from ..models import (
     ProductionLine,
 )
 from . import cost
+from . import coverage as C
 from . import summary as S
+from .coverage import (
+    Q_UNCONNECTED,
+    expected_ids,
+    first_data_map,
+    split_by_kind,
+    unit_of,
+)
 # 电量展示口径与大屏同源（1 位小数）：见 snapshot.round_kwh 的说明（B-524）
 from .snapshot import round_kwh
 
@@ -181,21 +189,29 @@ def _utility_hour_series_for(
     return [_round(mat[b][0]) for b in buckets]
 
 
-def _workshop_meters() -> list[EnergyMeter]:
+def _workshop_meters(workshop: str | None = None) -> list[EnergyMeter]:
     """车间电力合计口径下的全部电表 = 产线电表 + 辅助单元电表。
 
     ⚠ v1.5.2 口径变更：旧实现返回**全部电表**（当时只有 13 块产线表，等价）；
       现在表里有辅机 / 瓶胚 / 调配电表，若还按「全部」算，车间合计里的
       辅机部分就变成了「碰巧包含」而不是显式约定。这里显式排除车间总表本身
       （车间没有电力总表），把口径写死。
+
+    ⚠ 本次补上 `workshop` 过滤：后台电计量页会带车间参数走常规通道，
+      此前该参数被静默忽略 —— 界面上写着「碳水车间」，算的却是全厂数字。
+      只有一个车间时两者恰好相等，所以一直没暴露；第二个车间一接入就会错。
     """
-    return list(
-        EnergyMeter.objects.filter(
-            energy_type__type_code=EnergyType.ELECTRIC,
-            enabled=True,
-            line__node_type__in=(ProductionLine.NODE_LINE, ProductionLine.NODE_AUX),
-        )
+    qs = EnergyMeter.objects.filter(
+        energy_type__type_code=EnergyType.ELECTRIC,
+        enabled=True,
+        line__node_type__in=(ProductionLine.NODE_LINE, ProductionLine.NODE_AUX),
     )
+    if workshop:
+        code = workshop.upper()
+        qs = qs.filter(
+            Q(line__line_code=code) | Q(line__parent__line_code=code)
+        )
+    return list(qs)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -245,25 +261,53 @@ def _hour_labels(
     return out
 
 
-def _hour_matrix(meters: list[EnergyMeter], buckets: list[tuple[date_cls, int]], start: date_cls, end: date_cls):
+def _hour_matrix(
+    meters: list[EnergyMeter],
+    buckets: list[tuple[date_cls, int]],
+    start: date_cls,
+    end: date_cls,
+    *,
+    first_ok: dict[int, datetime] | None = None,
+):
     """返回 {bucket: (合计|None, quality)}。
 
-    口径与小时接口一致：**任一计量点缺数/换表，该小时合计就不成立（给 None）**，
+    口径：**参与这一格的每一块表都有可信值，这一格才算数（给 None）**，
     而不是「有几块算几块」的偏小值。
+
+    ⚠ 「参与这一格的表」不等于「组里登记的全部表」，见 coverage 模块的说明：
+      · 从未出过可信值的表（登记了但没接线 / 没给 token）没有否决权 ——
+        否则一块水表会把同组的电和汽一起抹成 `--`，且该类永久无数据；
+        它们改由告警引擎如实报「未接入」。
+      · 中途才接入的表只从自己首次出数的那一格起参与 —— 否则新装一块表
+        会让上周的图表整体倒退成空值。
+      · 接入之后某小时真的缺数，仍然整格 None（这是故障，不能悄悄少加一块表）。
     """
+    if not buckets:
+        return {}
+    if first_ok is None:
+        first_ok = first_data_map(meters)
+    connected = {mid for mid in first_ok}
+    if not connected:
+        # 整组一块都没接入过：不是「缺数」，是「还没接」
+        return {b: (None, Q_UNCONNECTED) for b in buckets}
+
     rows = EnergyHourly.objects.filter(
-        meter__in=meters, stat_date__gte=start, stat_date__lte=end
+        meter_id__in=connected, stat_date__gte=start, stat_date__lte=end
     ).values("stat_date", "stat_hour", "consumption", "quality", "meter_id")
 
     grouped: dict[tuple[date_cls, int], list[dict]] = {}
     for r in rows:
         grouped.setdefault((r["stat_date"], r["stat_hour"]), []).append(r)
 
-    need = len(meters)
     out: dict[tuple[date_cls, int], tuple[Decimal | None, str]] = {}
     for b in buckets:
-        got = grouped.get(b, [])
-        if len(got) < need:
+        exp = expected_ids(first_ok, meters, b)
+        if not exp:
+            # 这一格比组里任何表的接入时刻都早（区间前段还没装表）
+            out[b] = (None, Q_UNCONNECTED)
+            continue
+        got = [r for r in grouped.get(b, []) if r["meter_id"] in exp]
+        if len(got) < len(exp):
             out[b] = (None, EnergyHourly.Q_MISSING)
             continue
         bad = [r for r in got if r["quality"] in (EnergyHourly.Q_MISSING, EnergyHourly.Q_RESET)]
@@ -276,7 +320,7 @@ def _hour_matrix(meters: list[EnergyMeter], buckets: list[tuple[date_cls, int]],
             out[b] = (None, EnergyHourly.Q_PARTIAL)
             continue
         total = sum((r["consumption"] or Decimal(0) for r in usable), Decimal(0))
-        quality = EnergyHourly.Q_OK if len(usable) == len(got) else EnergyHourly.Q_PARTIAL
+        quality = EnergyHourly.Q_OK if len(usable) == len(exp) else EnergyHourly.Q_PARTIAL
         out[b] = (total, quality)
     return out
 
@@ -321,6 +365,7 @@ def _range_total_kwh(
     now: datetime | None = None,
     *,
     buckets: list[tuple[date_cls, int]] | None = None,
+    first_ok: dict[int, datetime] | None = None,
 ) -> Decimal | None:
     """严格口径的区间电量合计 —— 与图表序列**同一条规则**。
 
@@ -344,7 +389,7 @@ def _range_total_kwh(
         buckets = _hour_labels(start, end, now)
     if not buckets:
         return None
-    mat = _hour_matrix(meters, buckets, start, end)
+    mat = _hour_matrix(meters, buckets, start, end, first_ok=first_ok)
     total = Decimal(0)
     for b in buckets:
         val, _q = mat[b]
@@ -469,44 +514,69 @@ def usage_range(
     target_lines = _lines_scope(line_code) if want_lines else []
 
     if focused:
-        unit = focus_meters[0].unit if focus_meters else "kWh"
         hour_buckets: list[tuple[date_cls, int]] | None = None
+        buckets: list[tuple[date_cls, int]] = []
+        klist: list[str] = []
         if granularity == "hour":
             buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at, closed_only=True)
             hour_buckets = buckets
             labels = [f"{d:%m-%d} {h:02d}" for d, h in buckets]
-            mat = _hour_matrix(focus_meters, buckets, start, end) if focus_meters else {}
-            series.append(
-                {
-                    "key": "focus",
-                    "name": _focus_name(workshop, usage_type, device, node_code, kind),
-                    "unit": unit,
-                    "values": [_round_for(unit, mat[b][0]) for b in buckets] if focus_meters else [None for _ in buckets],
-                }
-            )
-            if focus_meters:
-                quality_series = [mat[b][1] for b in buckets]
         else:
             keys = _period_keys(dim, start, end, now)
             labels = [lab for _k, lab in keys]
             klist = [k for k, _ in keys]
-            vals: list[float | None] = []
-            for k in klist:
-                s, e = S.period_bounds(dim, k)
-                vals.append(_round_for(unit, _range_total_kwh(focus_meters, s, min(e, now.date()))))
+
+        # ★ 按能源类型拆开算。三级筛选没带 kind 时 `meters_of` 是不限类型的，
+        #   电表 + 水表 + 汽表会进同一个「全员可信才算数」的组 ——
+        #   水缺数就把电和汽一起抹成 None，这正是本次要消灭的连坐。
+        groups = split_by_kind(focus_meters)
+        first_ok = first_data_map(focus_meters)
+        util: dict[str, list[float | None]] = {"water": [], "steam": []}
+        base_name = _focus_name(workshop, usage_type, device, node_code, kind)
+
+        for code, gm in groups.items():
+            # 单位按能源类型定，不看「排序后的第一块表」
+            unit = unit_of(gm)
+            if granularity == "hour":
+                mat = _hour_matrix(gm, buckets, start, end, first_ok=first_ok)
+                vals: list[float | None] = [_round_for(unit, mat[b][0]) for b in buckets]
+                if code == EnergyType.ELECTRIC:
+                    quality_series = [mat[b][1] for b in buckets]
+            else:
+                vals = []
+                for k in klist:
+                    s, e = S.period_bounds(dim, k)
+                    vals.append(
+                        _round_for(
+                            unit,
+                            _range_total_kwh(gm, s, min(e, now.date()), first_ok=first_ok),
+                        )
+                    )
             series.append(
                 {
-                    "key": "focus",
-                    "name": _focus_name(workshop, usage_type, device, node_code, kind),
+                    "key": "focus" if len(groups) == 1 else f"focus:{code}",
+                    "name": base_name if len(groups) == 1 else f"{base_name} · {_kind_label(code)}",
                     "unit": unit,
                     "values": vals,
                 }
             )
-        util = {"water": [], "steam": []}
-        # 水/汽的合计走 unit=t / m³，不能塞进 kwh 字段（量纲会错）
-        # 传 hour_buckets 保证与上面 series 用的是同一批桶（逐格对齐）
-        kwh_total = None if _is_utility(focus_meters) else _range_total_kwh(
-            focus_meters, start, min(end, now.date()), now, buckets=hour_buckets
+            # 水/汽同时回填 utility.*：前端水页与汽页读的是 d.utility.water / .steam。
+            # 此前焦点通道把它硬写成空数组 ⇒ 两页恒空，还被 emptyHint 一律说成
+            # 「车间进水总表未接入」，把汽页也一起冤枉了；totals.waterT/steamT 也恒 None。
+            if code == EnergyType.WATER:
+                util["water"] = vals
+            elif code == EnergyType.STEAM:
+                util["steam"] = vals
+
+        # 电量合计只按电表算 —— 把水/汽的 m³ 累加进 kWh 是量纲错误
+        elec_meters = groups.get(EnergyType.ELECTRIC, [])
+        kwh_total = (
+            _range_total_kwh(
+                elec_meters, start, min(end, now.date()), now,
+                buckets=hour_buckets, first_ok=first_ok,
+            )
+            if elec_meters
+            else None
         )
         out_total = Decimal(0)
         prod_real = False
@@ -524,7 +594,7 @@ def usage_range(
         wmat = None
         if want_workshop:
             # 只算一次：既要值也要质量，重复计算会白白多扫一遍库
-            wmat = _hour_matrix(_workshop_meters(), buckets, start, end)
+            wmat = _hour_matrix(_workshop_meters(workshop), buckets, start, end)
             series.append(
                 {
                     "key": "workshop",
@@ -565,7 +635,7 @@ def usage_range(
                     vals.append(round_kwh(rows[k].kwh))
                     continue
                 s, e = S.period_bounds(dim, k)
-                vals.append(round_kwh(_range_total_kwh(_workshop_meters(), s, min(e, now.date()))))
+                vals.append(round_kwh(_range_total_kwh(_workshop_meters(workshop), s, min(e, now.date()))))
             series.append({"key": "workshop", "name": "车间合计", "unit": "kWh", "values": vals})
             quality_series = [rows[k].quality if k in rows else "computed" for k in klist]
 
@@ -588,22 +658,16 @@ def usage_range(
     # ── 合计 ──
     # ⚠ 口径必须与系列完全一致，否则会出现「series 全空但 totals 有数」——
     #   界面上一张空图配一个非零合计，用户只能得出「系统算错了」的结论。
-    #   焦点/非电通道的合计就是那批焦点点位；常规通道才是车间电力口径。
-    if focused:
-        meters = focus_meters
-        all_lines = list(ProductionLine.active_lines_qs())
-    else:
-        all_lines = list(ProductionLine.active_lines_qs())
-        if scope == "line" and line_code:
-            all_lines = [ln for ln in all_lines if ln.line_code == line_code.upper()]
-        meters = _workshop_meters() if scope in ("workshop", "all") else (
-            _line_meters(all_lines[0]) if all_lines else []
-        )
-    last_day = min(end, now.date())
-    # 电量走 kWh 求和；水/汽（非电）没有 kWh 概念，合计交给 totals.waterT/steamT
-    kwh_total = None if (focused and _is_utility(meters)) else _range_total_kwh(
-        meters, start, last_day, now, buckets=hour_buckets
+    #   焦点通道（三级筛选 / 水 / 汽）在上面已经按能源类型分别算完并 return 了，
+    #   走到这里只剩常规通道：合计就是车间电力口径。
+    all_lines = list(ProductionLine.active_lines_qs())
+    if scope == "line" and line_code:
+        all_lines = [ln for ln in all_lines if ln.line_code == line_code.upper()]
+    meters = _workshop_meters(workshop) if scope in ("workshop", "all") else (
+        _line_meters(all_lines[0]) if all_lines else []
     )
+    last_day = min(end, now.date())
+    kwh_total = _range_total_kwh(meters, start, last_day, now, buckets=hour_buckets)
     out_total = _range_output(all_lines, start, last_day)
     prod_real = (
         ProductionHourly.objects.filter(
@@ -619,15 +683,13 @@ def usage_range(
     )
 
 
-def _is_utility(meters: list[EnergyMeter]) -> bool:
-    """这批点位是不是水/汽（非电）。
-
-    用于决定合计该不该填 kWh —— 水表的累计值是 m³，拿它当 kWh 求和
-    会得到一个量纲错误的数字（比如把 380 吨水显示成 380 kWh）。
-    """
-    return bool(meters) and all(
-        m.energy_type.type_code != EnergyType.ELECTRIC for m in meters
-    )
+def _kind_label(type_code: str) -> str:
+    """库内能源编码 → 中文短名（序列名与提示文案共用）。"""
+    return {
+        EnergyType.ELECTRIC: "电",
+        EnergyType.WATER: "水",
+        EnergyType.STEAM: "汽",
+    }.get(str(type_code).upper(), str(type_code))
 
 
 def _focus_name(
@@ -662,23 +724,17 @@ def _focus_name(
 def _meter_coverage(meters: list[EnergyMeter], start: date_cls, end: date_cls) -> dict:
     """统计「本次查询应参与的计量点里，有几个在本区间真的出过数」。
 
-    为什么要有它：车间合计在按「全部表都有可信值才算数」的口径下，
-    只要有**一块表从没接入过**，整条合计就永远是 `--`。
-    这本身是对的（不返回偏小值），但界面只看到一条空线 + 一堆有数的产线，
-    第一反应是「系统坏了」。所以把「缺的是哪几块表」如实报出来。
+    为什么要有它：车间合计按「参与取数的表都有可信值才算数」的口径下，
+    一块表没数就会让整条合计变 `--`。这本身是对的（不返回偏小值），
+    但界面只看到一条空线 + 一堆有数的产线，第一反应是「系统坏了」。
+    所以把缺的是哪几块表如实报出来，并且**分成两类**——
 
-    返回：{total, covered, missing: [code...]}
+      missing      已接入、本区间却没出数  → 真故障，要修要告警
+      unconnected  从未出过可信值          → 还没接线/没给 token，不参与合计
+
+    两类对现场的处理动作完全不同（修表 vs 去接线），混成一个列表就等于没说。
     """
-    total = len(meters)
-    if not total:
-        return {"total": 0, "covered": 0, "missing": []}
-    have = set(
-        EnergyHourly.objects.filter(
-            meter__in=meters, stat_date__gte=start, stat_date__lte=end
-        ).values_list("meter_id", flat=True)
-    )
-    missing = [m.code for m in meters if m.id not in have]
-    return {"total": total, "covered": total - len(missing), "missing": missing}
+    return C.coverage_of(meters, start, end)
 
 
 def _range_payload(

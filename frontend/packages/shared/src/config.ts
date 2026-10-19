@@ -121,7 +121,8 @@ export const dataConfig = {
    *
    * 已实现（不在本列表里）：energy.*、admin.overview / lines / gateways /
    *                          meters / quality / collect-logs /
-   *                          params（系统参数，v1.4.0）/ readings（仪表读数，v1.4.0）
+   *                          params（系统参数，v1.4.0）/ readings（仪表读数，v1.4.0）/
+   *                          alarms（告警引擎 + 告警表，v1.5.3）
    */
   mockOnly: [
     'auth',
@@ -129,7 +130,6 @@ export const dataConfig = {
     'admin.roles',
     'admin.menus',
     'admin.dicts',
-    'admin.alarms',
     'admin.logs.operation',
     'admin.logs.login',
     'admin.reports'

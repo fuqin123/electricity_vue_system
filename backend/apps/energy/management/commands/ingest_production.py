@@ -58,7 +58,7 @@ def write_production(
     obj, _created = ProductionHourly.objects.update_or_create(
         line=line,
         stat_date=day,
-        hour=int(hour),
+        stat_hour=int(hour),
         defaults={
             "output": output,
             "quality": quality,
@@ -101,7 +101,7 @@ class Command(BaseCommand):
         row = write_production(opts["line"], day, opts["hour"], value)
         self.stdout.write(
             self.style.SUCCESS(
-                f"已写入 {row.line_id} {row.date} {row.hour:02d}时 "
+                f"已写入 {row.line_id} {row.stat_date} {row.stat_hour:02d}时 "
                 f"产量 {row.output if row.output is not None else 'null'} 瓶 "
                 f"[{row.quality}/{row.source}]"
             )

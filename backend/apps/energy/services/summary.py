@@ -44,6 +44,7 @@ from ..models import (
     ProductionHourly,
     ProductionLine,
 )
+from . import coverage as C
 
 logger = logging.getLogger(__name__)
 
@@ -545,7 +546,12 @@ def period_rows(
             quality = _quality_from(covered, expected)
 
         # ── 水 / 汽（只有车间级有）──
-        # 多个车间时**逐车间累加**：任一车间缺数则整段为 None（缺数不补 0）。
+        # 逐车间累加，但**只累加登记了该类总表的车间**。
+        # 旧口径是「任一车间缺 ⇒ 全厂该类 None」，而它压根没区分两种「缺」：
+        #   · 该车间根本没登记这块表（新车间先接电表、后接水表）→ 不该否决别人；
+        #   · 登记了却没出数 → 是真缺数，仍然要让本车间这一格不成立。
+        # 写入侧对没表的车间根本不落行（见 _rollup_lines 的 exists() 判断），
+        # 所以旧写法会让「碳水车间有水表」这件事被「制造车间没水表」拖成 None。
         water = steam = None
         if workshop_lines:
             for code, holder in ((EnergyType.WATER, "water"), (EnergyType.STEAM, "steam")):
@@ -555,15 +561,17 @@ def period_rows(
                 parts: list[Decimal] = []
                 missing = False
                 for ws in workshop_lines:
-                    meters = EnergyMeter.objects.filter(
-                        line=ws, energy_type=etype, enabled=True
+                    meters = list(
+                        EnergyMeter.objects.filter(line=ws, energy_type=etype, enabled=True)
                     )
-                    meter = meters.first()
+                    if not meters:
+                        continue  # 本车间没登记这类总表：不参与，也不否决
                     val: Decimal | None = None
                     if open_period or live_fallback:
-                        # 多块总表时求和（如车间进水 + 车间回用）
+                        # 多块总表时求和（如车间进水 + 车间回用）；
+                        # 从未接入的那块先排除，否则它会永久否决本车间
                         subtotal = None
-                        for m in meters:
+                        for m in C.participating(meters):
                             v = _one_type_metrics(m, start, end)[0]
                             if v is None:
                                 subtotal = None

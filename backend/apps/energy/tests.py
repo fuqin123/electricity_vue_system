@@ -10,15 +10,19 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from decimal import Decimal
+from io import StringIO
 from unittest import mock
 
+from django.core.management import call_command
 from django.test import Client, RequestFactory, TestCase
 
 from apps.energy.collectors.base import BaseCollector, CollectResult, get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
 from apps.energy.management.commands import collect
+from apps.energy.management.commands.ingest_production import write_production
 from apps.energy import api
 from apps.energy.models import (
+    EnergyAlarm,
     EnergyGateway,
     EnergyCollectLog,
     EnergyHourly,
@@ -31,6 +35,7 @@ from apps.energy.models import (
     ProductionLine,
     SystemParam,
 )
+from apps.energy.services import alerts
 from apps.energy.services import ranges, registry, slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
@@ -1969,12 +1974,16 @@ class WorkshopHierarchyTests(TestCase):
         # 按节点收窄
         self.assertEqual([m.code for m in ranges.meters_of(node_code="A1")], ["E-H2-LINE"])
 
-    def test_缺一块表时合计为空而不是偏小值(self):
-        """★ 核心不变量：车间合计序列求和 与 totals.kwh 必须同时为空或相等。
+    def test_已接入的表缺采时合计为空而不是偏小值(self):
+        """★ 核心不变量（加了未接入豁免后**依然成立**）：接入过的表缺采 → 合计必须为空。
 
-        修这个函数前，totals 用 `Sum(consumption)`（有几块算几块），
-        而序列用 `_hour_matrix`（全表可信才算）—— 于是出现
-        「图表全空、合计 16000 kWh」，用户只能得出「系统算错了」。
+        修这个函数前，totals 用 `Sum(consumption)`（有几块算几块），而序列用
+        `_hour_matrix`（全表可信才算）—— 于是出现「图表全空、合计 16000 kWh」，
+        用户只能得出「系统算错了」。
+
+        ⚠ m2 在前一天出过可信值 = 已接入，本区间却缺采 → 这是真故障，必须继续
+          否决整格。「豁免未接入的表」绝不能顺手把缺采也放过去，否则又回到偏小
+          的部分和 —— 这条测试存在的意义就是卡住这个边界。
         """
         gw = EnergyGateway.objects.create(
             code="GW-I", name="一致性", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
@@ -1984,12 +1993,18 @@ class WorkshopHierarchyTests(TestCase):
             scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
             slave=1, register=1000, usage_type="生产线用电",
         )
-        EnergyMeter.objects.create(
+        m2 = EnergyMeter.objects.create(
             code="E-I-2", name="表2", energy_type=etype(),
             scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
             slave=2, register=1000, usage_type="生产线用电",
         )
         day = datetime(2026, 9, 20).date()
+        # m2 前一天正常出过数 —— 它是「已接入」的表，因此有否决权
+        EnergyHourly.objects.create(
+            meter=m2, line=self.line, energy_type=m2.energy_type,
+            stat_date=datetime(2026, 9, 19).date(), stat_hour=8,
+            consumption=Decimal("7.0"), quality=EnergyHourly.Q_OK,
+        )
         # 只给 m1 数据、m2 整天空缺 → 严格口径下合计必须为空
         # ⚠ energy_hourly 的 line / energy_type 是必填外键（不是从 meter 反推的），
         #   漏传会直接 IntegrityError: Column 'line_id' cannot be null
@@ -2005,9 +2020,146 @@ class WorkshopHierarchyTests(TestCase):
         )
         vals = [v for v in data["series"][0]["values"] if v is not None]
         self.assertIsNone(
-            data["totals"]["kwh"], "缺一块表时合计必须是 None，不能是偏小的部分和"
+            data["totals"]["kwh"], "已接入的表缺采时合计必须是 None，不能是偏小的部分和"
         )
-        self.assertEqual(vals, [], "缺表时序列也应全空（口径一致）")
+        self.assertEqual(vals, [], "缺采时序列也应全空（口径一致）")
+        cov = data["coverage"]
+        self.assertEqual(cov["missing"], ["E-I-2"], "缺采的表要报进 missing")
+        self.assertEqual(cov["unconnected"], [], "它已接入，不该被归成未接入")
+
+    def test_从未接入的表不否决同组其它表(self):
+        """★ 新增不变量：登记了但从未出过可信值的表没有否决权。
+
+        现场真实形态：车间进水总表登记了却还没接线 / 还没给 token，
+        aggregate 每小时给它写一行 missing。旧口径下这块表让所在组永久全 None ——
+        水没有数，一旦与电混进同一组（三级筛选未带 kind）电和汽也一起没有。
+
+        新口径把它排除出参采集合，如实记进 coverage.unconnected，
+        由告警引擎单独报「未接入」，而不是让它污染数字。
+        """
+        gw = EnergyGateway.objects.create(
+            code="GW-K", name="未接入", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        m1 = EnergyMeter.objects.create(
+            code="E-K-1", name="在跑的表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电",
+        )
+        EnergyMeter.objects.create(
+            code="E-K-2", name="还没接线的表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=2, register=1000, usage_type="生产线用电",
+        )
+        day = datetime(2026, 9, 20).date()
+        # 喂满整天 24 格：hour 粒度会生成 24 个桶，只喂几小时的话剩下的格子
+        # 按严格口径就是「已接入却缺采」→ 合计必须 None（那是正确行为，
+        # 会让本测试在验证一件根本没发生的事）
+        for h in range(24):
+            EnergyHourly.objects.create(
+                meter=m1, line=self.line, energy_type=m1.energy_type,
+                stat_date=day, stat_hour=h,
+                consumption=Decimal("10.0"), quality=EnergyHourly.Q_OK,
+            )
+        data = ranges.usage_range(
+            day, day, granularity="hour", scope="workshop", kind="elec",
+            workshop="WS-CARB", node_code="A1",
+        )
+        vals = data["series"][0]["values"]
+        self.assertEqual(
+            [v for v in vals if v is not None], [10.0] * 24,
+            "未接入的表不该否决在跑的表",
+        )
+        self.assertEqual(data["totals"]["kwh"], 240.0, "合计 = 已接入表的和")
+        cov = data["coverage"]
+        self.assertEqual(cov["unconnected"], ["E-K-2"], "未接入要能单独报出来")
+        self.assertEqual(cov["missing"], [])
+        self.assertEqual(cov["connected"], 1)
+
+    def test_中途接入的表不倒退否决历史(self):
+        """只从「首次出可信值」那一格起参与合计。
+
+        否则新装一块表会让上周的图表整体倒退成空值 —— 现场一定会当成
+        「系统把历史数据弄丢了」。
+        """
+        gw = EnergyGateway.objects.create(
+            code="GW-N", name="中途接入", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        m1 = EnergyMeter.objects.create(
+            code="E-N-1", name="老表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电",
+        )
+        m2 = EnergyMeter.objects.create(
+            code="E-N-2", name="新装表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=2, register=1000, usage_type="生产线用电",
+        )
+        day = datetime(2026, 9, 20).date()
+        for h in range(24):
+            EnergyHourly.objects.create(
+                meter=m1, line=self.line, energy_type=m1.energy_type,
+                stat_date=day, stat_hour=h,
+                consumption=Decimal("10.0"), quality=EnergyHourly.Q_OK,
+            )
+        # m2 从第 3 小时起才接入（其余格子没有它的行）
+        for h in range(3, 24):
+            EnergyHourly.objects.create(
+                meter=m2, line=self.line, energy_type=m2.energy_type,
+                stat_date=day, stat_hour=h,
+                consumption=Decimal("5.0"), quality=EnergyHourly.Q_OK,
+            )
+        data = ranges.usage_range(
+            day, day, granularity="hour", scope="workshop", kind="elec",
+            workshop="WS-CARB", node_code="A1",
+        )
+        vals = data["series"][0]["values"]
+        self.assertEqual(vals[:3], [10.0] * 3, "m2 接入前的格子不该被它否决")
+        self.assertEqual(vals[3:], [15.0] * 21, "接入后两块表一起算")
+        self.assertEqual(data["totals"]["kwh"], 30.0 + 15.0 * 21, "合计含两段")
+
+    def test_水未接入不连坐电与汽(self):
+        """★ 跨能源类型必须互不否决：三级筛选未带 kind 时最易爆发。
+
+        `meters_of` 不传 kind 时是「不限类型」的，旧实现把电表 + 水表 + 汽表
+        丢进同一个「全员可信才算数」的矩阵 —— 一块没接的水表能让电也整段变 None，
+        而且序列单位还跟着 `focus_meters[0].unit` 串成 m³。
+        """
+        gw = EnergyGateway.objects.create(
+            code="GW-M", name="混组", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
+        )
+        em = EnergyMeter.objects.create(
+            code="E-M-1", name="电表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=gw,
+            slave=1, register=1000, usage_type="生产线用电", device_name="生产线",
+        )
+        EnergyMeter.objects.create(
+            code="W-M-1", name="水表", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=self.ws, gateway=gw,
+            slave=2, register=1000, unit="m\u00b3", usage_type="车间进水", device_name="生产线",
+        )
+        day = datetime(2026, 9, 20).date()
+        for h in range(24):
+            EnergyHourly.objects.create(
+                meter=em, line=self.line, energy_type=em.energy_type,
+                stat_date=day, stat_hour=h,
+                consumption=Decimal("10.0"), quality=EnergyHourly.Q_OK,
+            )
+        # 只按设备筛、不带 kind → 电与水会同时进焦点集合
+        data = ranges.usage_range(
+            day, day, granularity="hour", scope="all", device="生产线"
+        )
+        by_unit = {s["unit"]: s for s in data["series"]}
+        self.assertIn("kWh", by_unit, "电表应单独成一条序列")
+        self.assertEqual(
+            [v for v in by_unit["kWh"]["values"] if v is not None], [10.0] * 24,
+            "水未接入不该把电抹空",
+        )
+        self.assertEqual(data["totals"]["kwh"], 240.0)
+        self.assertIn("m\u00b3", by_unit, "水也要有自己的序列，而不是混进电的组")
+        self.assertTrue(
+            all(v is None for v in by_unit["m\u00b3"]["values"]), "水仍未接入 → 一律 None"
+        )
+        self.assertEqual(data["totals"]["waterT"], None)
 
     def test_电量一位小数_与大屏同源(self):
         """B-524 同族：本模块曾用 3 位小数，大屏用 1 位，同一格 24.812 / 24.8。"""
@@ -2335,3 +2487,214 @@ class GatewayTestEvidenceTests(TestCase):
         self.gw.last_ok_at = datetime.now() - timedelta(minutes=1)
         self.gw.save(update_fields=["last_ok_at", "last_fail_at"])
         self.assertTrue(decide(), "更早的失败不该推翻更新的成功")
+
+
+class AlarmEngineTests(TestCase):
+    """告警引擎：去重、自愈、确认，以及「读路径兜底」。
+
+    这一族测试盯的是同一类风险 —— 告警系统很容易变成两种没用的东西：
+      · 每 5 分钟为同一件事新增一条 → 变成噪音源，没人再看；
+      · 只在采集正常时才工作 → 采集停了就静默，变成新的盲区。
+    """
+
+    NOW = datetime(2026, 9, 23, 13, 30)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(
+            line_code="A9", line_name="九线", node_type=ProductionLine.NODE_LINE
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-ALM", name="告警测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-A9-01", name="九线电表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+
+    def setUp(self):
+        self.client = Client()
+
+    def test_未接入的表生成未接入告警(self):
+        """表被排除出合计口径的同时必须被报出来，否则就成了隐式行为。"""
+        alerts.evaluate()
+        row = EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_METER_UNCONNECTED).first()
+        self.assertIsNotNone(row, "登记了却从未出数的表已被排除出合计，不报出来就是隐式行为")
+        self.assertEqual(row.meter_id, self.meter.id)
+        self.assertIn("E-A9-01", row.content)
+
+    def test_重复评估只累加次数不新增行(self):
+        """同一件事反复检测到只能更新一条 —— 否则告警页会被刷爆。"""
+        alerts.evaluate()
+        alerts.evaluate()
+        code = f"METER-UNCONNECTED:{self.meter.code}"
+        self.assertEqual(EnergyAlarm.objects.filter(code=code).count(), 1, "同一件事不该新增第二行")
+        self.assertEqual(EnergyAlarm.objects.get(code=code).repeat, 2, "应当以 repeat 累加")
+
+    def test_表开始出数后未接入告警自动恢复(self):
+        alerts.evaluate()
+        code = f"METER-UNCONNECTED:{self.meter.code}"
+        EnergyHourly.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            stat_date=self.NOW.date(), stat_hour=8,
+            consumption=Decimal("10.0"), quality=EnergyHourly.Q_OK,
+        )
+        alerts.evaluate()
+        row = EnergyAlarm.objects.get(code=code)
+        self.assertEqual(row.status, EnergyAlarm.STATUS_RESOLVED, "接入后该条必须自动关闭")
+        self.assertIsNotNone(row.resolved_at)
+
+    def test_确认后同一问题不重新打开(self):
+        """否则「确认」等于只静音一轮，值班人员会开始忽略整个告警页。"""
+        alerts.evaluate()
+        row = EnergyAlarm.objects.get(code=f"METER-UNCONNECTED:{self.meter.code}")
+        row.status = EnergyAlarm.STATUS_ACKED
+        row.acked_by = "张三"
+        row.save(update_fields=["status", "acked_by"])
+        alerts.evaluate()
+        row.refresh_from_db()
+        self.assertEqual(row.status, EnergyAlarm.STATUS_ACKED, "确认后不该被下一轮评估改回未处理")
+        self.assertEqual(row.acked_by, "张三")
+
+    def test_刚重启还没有完整小时不该被误判为未接入(self):
+        """判据必须是「设备读得到数」，不是「算得出完整小时差值」。
+
+        停机几天再拉起时，本小时还没有上一秒的端点读数，小时行一律是 missing。
+        若按「有过 ok 的小时差值」判接入，这一刻会把所有正常在采的表全部误判成
+        未接入 —— 既踢出合计，又刷出几十条假告警，告警系统本身变成噪音源。
+        """
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=self.NOW, reading=Decimal("1234.5"), ok=True,
+        )
+        EnergyHourly.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            stat_date=self.NOW.date(), stat_hour=13,
+            consumption=None, quality=EnergyHourly.Q_MISSING,
+        )
+        alerts.evaluate()
+        self.assertFalse(
+            EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_METER_UNCONNECTED).exists(),
+            "读得到数就是已接入，跟能不能算出整点差值无关",
+        )
+
+    def test_读路径兜底会生成停摆告警(self):
+        """采集进程死了就没人评估告警 —— 而「采集停了」恰是最该看见的一条。
+
+        所以大屏读路径必须能自己把这一条兜出来（规则实现仍只有 alerts 里那一份）。
+        """
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 9, 23, 10, 4), reading=Decimal("1"), ok=True,
+        )
+        self.assertEqual(EnergyAlarm.objects.count(), 0, "前置：还没评估过")
+        build_overview(self.NOW)  # 13:30 看大屏，最新读数停在 10:04 → 超 2 小时阈值
+        self.assertTrue(
+            EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_COLLECT_STALE).exists(),
+            "只打开大屏就要能报出停摆，不能依赖采集进程还活着",
+        )
+
+    def test_读路径兜底不污染重复次数(self):
+        alerts.evaluate()
+        code = "COLLECT-STALE:ALL"
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 9, 23, 10, 4), reading=Decimal("1"), ok=True,
+        )
+        before = EnergyAlarm.objects.get(code=code).repeat
+        build_overview(self.NOW)
+        build_overview(self.NOW)
+        self.assertEqual(
+            EnergyAlarm.objects.get(code=code).repeat, before,
+            "大屏每 30 秒刷新一次，不该把 repeat 刷成「被查询次数」",
+        )
+
+    def test_告警接口按状态与级别筛选(self):
+        alerts.evaluate()
+        body = json.loads(self.client.get("/api/admin/alarms", {"status": "active"}).content)
+        self.assertTrue(body["list"], "未处理列表应有内容")
+        self.assertTrue(all(r["status"] == "active" for r in body["list"]))
+        body = json.loads(self.client.get("/api/admin/alarms", {"level": "major"}).content)
+        self.assertTrue(all(r["level"] == "major" for r in body["list"]))
+
+    def test_确认接口写入确认人与时间(self):
+        alerts.evaluate()
+        alarm = EnergyAlarm.objects.get(code=f"METER-UNCONNECTED:{self.meter.code}")
+        res = self.client.post(
+            f"/api/admin/alarms/{alarm.id}/ack",
+            data=json.dumps({"by": "李四"}),
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 200)
+        alarm.refresh_from_db()
+        self.assertEqual(alarm.status, EnergyAlarm.STATUS_ACKED)
+        self.assertEqual(alarm.acked_by, "李四")
+        self.assertIsNotNone(alarm.acked_at)
+
+    def test_确认不存在的告警给404(self):
+        self.assertEqual(self.client.post("/api/admin/alarms/999999/ack").status_code, 404)
+
+    def test_大屏告警与接口同源(self):
+        """大屏的告警条与 /api/admin/alarms 必须来自同一张表。
+
+        否则「大屏说没事、告警页挂着 3 条」这种分歧又要现场自己去对。
+        """
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 9, 23, 10, 4), reading=Decimal("1"), ok=True,
+        )
+        texts = [a["text"] for a in build_overview(self.NOW)["workshop"]["alerts"]]
+        rows = EnergyAlarm.objects.filter(
+            status__in=(EnergyAlarm.STATUS_ACTIVE, EnergyAlarm.STATUS_ACKED)
+        )
+        for t in texts:
+            if "产量数据源未接入" in t:
+                continue  # 数据源状态说明，按设计不落告警表
+            self.assertTrue(
+                any(t == r.content for r in rows),
+                f"大屏出现了一条告警表里没有的文案：{t}",
+            )
+
+
+class ProductionIngestTests(TestCase):
+    """产量入库命令的字段名回归测试。
+
+    `ingest_production` 此前把 `stat_hour` 写成 `hour`，而模型上没有 `hour` 字段 ——
+    也就是说正式写入与 --demo-null 两条路径**从来没跑通过**，产量表实际是空的。
+    没有任何测试覆盖它，所以这个 bug 一直活着。这里补上，防止接口「看起来有、
+    实际不能用」地被带到产量改造那天。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(
+            line_code="A1", line_name="一线", node_type=ProductionLine.NODE_LINE
+        )
+
+    def test_写入某线某小时产量(self):
+        call_command(
+            "ingest_production",
+            line="A1", date="2026-09-22", hour=10, output="26800",
+            stdout=StringIO(),
+        )
+        row = ProductionHourly.objects.get(line=self.line, stat_date=DAY, stat_hour=10)
+        self.assertEqual(row.output, Decimal("26800"))
+        self.assertEqual(row.quality, ProductionHourly.Q_OK)
+
+    def test_演示占位写null而不是0(self):
+        """0 会被读成「确实没产出」，null 才是「还没接数据」。"""
+        call_command("ingest_production", demo_null=True, days=1, stdout=StringIO())
+        rows = ProductionHourly.objects.all()
+        self.assertTrue(rows.exists(), "--demo-null 必须能跑通")
+        self.assertTrue(all(r.output is None for r in rows))
+        self.assertTrue(all(r.source == ProductionHourly.SOURCE_DEMO for r in rows))
+        self.assertTrue(all(r.quality == ProductionHourly.Q_NODATA for r in rows))
+
+    def test_重复写入是更新而不是新增(self):
+        write_production("A1", DAY, 3, Decimal("100"))
+        write_production("A1", DAY, 3, Decimal("180"))
+        self.assertEqual(ProductionHourly.objects.filter(stat_date=DAY, stat_hour=3).count(), 1)
+        self.assertEqual(
+            ProductionHourly.objects.get(line=self.line, stat_date=DAY, stat_hour=3).output,
+            Decimal("180"),
+        )

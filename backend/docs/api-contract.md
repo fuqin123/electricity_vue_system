@@ -32,7 +32,8 @@
 | `GET /api/energy/production` | ✅ 已实现 | 产量采集尚未改造：**如实返回 null + available=false**（不是 501，不是 0） |
 | `GET/POST/PUT/DELETE /api/admin/gateways*` `meters*` | ✅ v1.2.1 已实现 | 网关 / 计量点后台增删改；`POST …/{id}/test` 连接测试与试采（返回**真实读数**） |
 | `GET /api/admin/overview` `lines` `quality` `collect-logs` | ✅ v1.2.1 已实现 | 后台看板 / 产线主数据 / 数据质量 / 采集日志 |
-| `/api/admin/*` 其余（系统管理、告警、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`） |
+| `GET /api/admin/alarms` `POST /api/admin/alarms/{id}/ack` | ✅ v1.5.3 已实现 | 告警列表与确认，读 `energy_alarm` 表（由告警引擎生成） |
+| `/api/admin/*` 其余（系统管理、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`）；**告警已移出该清单，不再有演示数据** |
 
 > ⚠ v1.2.1 修复：admin 组接口曾误挂在 `/api/energy/admin/*` 下导致前端 404（B-404），
 > 现已按本契约挂到 **`/api/admin/*`**；旧地址 `/api/energy/admin/*` 兼容保留但不再推荐。
@@ -877,27 +878,59 @@ Authorization: Bearer <token>
 }
 ```
 
-### 4.4 告警
+### 4.4 告警（v1.5.3 已实现）
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| GET | `/api/admin/alarms` | 支持 `status`（active/acked/resolved）与 `level`（critical/major/minor/info）筛选 |
-| POST | `/api/admin/alarms/{id}/ack` | 确认告警，**必须写操作审计日志** |
+| GET | `/api/admin/alarms` | 分页列表。支持 `status`（active/acked/resolved）与 `level`（critical/major/minor/info）筛选；**不传 status 返回全部**（历史页要看已恢复的） |
+| POST | `/api/admin/alarms/{id}/ack` | 确认告警。请求体 `{ "by": "张三" }`，可省略（记为「未署名」） |
+
+响应是统一分页壳：`{ "list": [AlarmRecord...], "total": 17, "page": 1, "pageSize": 10 }`。
 
 **`AlarmRecord` 字段：**
 
 ```jsonc
 {
-  "id": 1, "code": "ALM-20260922-0001",
-  "level": "critical",                       // critical | major | minor | info
-  "source": "A4 生产线",
-  "content": "单位电耗超告警上限",
-  "value": "10.24", "threshold": "9.60",     // 字符串，可能为「+12.4%」等非纯数值
+  "id": 1,
+  "code": "METER-UNCONNECTED:S-WS-01",       // 稳定标识：同一件事反复检测到只更新本条
+  "level": "major",                          // critical | major | minor | info
+  "category": "meter_unconnected",           // 见下表，决定「该找谁处理」
+  "categoryLabel": "计量点未接入",
+  "source": "碳水车间蒸汽表1#",
+  "content": "计量点 S-WS-01 已登记但从未采到可信数据，未参与合计",
+  "value": "0/1", "threshold": "24/24",      // 一律字符串（可能是「+12.4%」这类非数值）
   "status": "active",                        // active | acked | resolved
-  "occurredAt": "2026-09-22 09:12:00",
+  "occurredAt": "2026-10-16 10:51:41",       // 首次
+  "lastAt":    "2026-10-16 11:10:00",        // 最近一次仍在
+  "repeat":    19,                           // 被评估命中的次数
+  "resolvedAt": "",
   "ackedBy": "", "ackedAt": ""
 }
 ```
+
+**已实现的规则**（引擎：`apps/energy/services/alerts.py`）：
+
+| category | 触发条件 | 级别 |
+| :--- | :--- | :--- |
+| `meter_unconnected` | 已登记启用，但**从未成功采到读数**（不参与合计，故必须显式报出） | major |
+| `meter_collect_fail` | 最近一轮采集失败（`last_ok=false`），带出错误原因 | critical |
+| `gateway_offline` | 该网关最近一轮点位**全部失败**（0/N）。⚠ 与网关列表页的「在线」徽标是两件事 | critical |
+| `collect_stale` | 最新成功读数超过 `collect.stale_alert_hours` 未更新，或尚无任何数据 | critical |
+| `hour_quality` | 近 24 小时出现 `reset`（换表/清零）或 `spike`（尖峰）。**不含 missing** —— 缺数由覆盖率与采集失败覆盖，重复报会把告警页刷成流水账 | major |
+| `coverage_low` | 昨日日汇总 `covered_count < expected_count`，即日合计少算了若干小时 | minor |
+
+⚠ **操作审计日志尚未实现**：契约原先要求「确认必须写审计日志」，而操作日志表还没建，
+所以 `ack` 目前只写 `acked_by` / `acked_at` 两列。接口实现处有同样的注释，
+不要以为已经在记审计。
+
+**自愈与幂等约定**（前端与巡检都依赖它）：
+
+- 同一 `code` 重复检测到只更新 `lastAt` / `repeat`，**不新增行**；
+- 问题消失后下一轮评估自动转 `resolved`（只在本轮确实评估过该 category 时才判定）；
+- 已 `acked` 的告警不会被下一轮改回 `active`，否则「确认」等于只静音一轮；
+- 大屏 `/api/energy/overview` 的 `workshop.alerts` 读的是**同一张表**
+  （级别映射 critical/major→err、minor→warn、info→info），
+  另加一条按设计现算的「产量数据源未接入」说明 —— 它是数据源状态而非计量故障。
 
 ### 4.5 日志
 

@@ -114,7 +114,7 @@ docker compose up -d --build
 # 拷到目标机：tar xzf 包 && cd */runtime && ./load-and-run.sh
 ```
 
-服务组成、验证清单（6 步 curl）、排障对照表见 `docker/README.md`。
+服务组成、部署后验证清单（8 步 curl）、排障对照表见 `docker/README.md`。
 
 ### 挂载配置文件
 

@@ -31,6 +31,7 @@ from django.db.models import Max, Sum
 from eep import conf
 
 from ..models import (
+    EnergyAlarm,
     EnergyHourly,
     EnergyMeter,
     EnergyRaw,
@@ -40,6 +41,10 @@ from ..models import (
     ProductionLine,
 )
 from .aggregate import current_hour_usage
+# 用具体函数名导入而不是 `from . import alerts`：本模块下面有个局部变量就叫
+# alerts（大屏的告警条列表），会把模块名遮掉 —— 报 'list' object has no attribute
+from .alerts import evaluate as evaluate_alerts
+from .coverage import Q_UNCONNECTED, expected_ids, first_data_map
 from . import summary as S
 
 logger = logging.getLogger(__name__)
@@ -115,13 +120,25 @@ def hourly_cells(
     meters = list(meters)
     cells: dict[int, HourCell] = {}
 
-    if not meters:
+    # 「登记了但从未接线」的表没有否决权（口径与 ranges._hour_matrix 同源，
+    # 见 coverage 模块）。不这么处理时，一块未接入的水表会让它所在组的
+    # 24 格全部变 None —— 大屏水/汽整条断掉，混组时连电一起断。
+    first_ok = first_data_map(meters) if meters else {}
+    connected = [m for m in meters if m.id in first_ok]
+
+    future_flag = not closed and day == now.date()
+    if not connected:
+        # 有登记但一块都没接入过 → unconnected（区别于「查了但没有表」的 missing）
         return {
-            h: HourCell(None, EnergyHourly.Q_MISSING, future=(not closed and h > now.hour and day == now.date()))
+            h: HourCell(
+                None,
+                Q_UNCONNECTED if meters else EnergyHourly.Q_MISSING,
+                future=(future_flag and h > now.hour),
+            )
             for h in range(24)
         }
 
-    rows = EnergyHourly.objects.filter(meter__in=meters, stat_date=day)
+    rows = EnergyHourly.objects.filter(meter__in=connected, stat_date=day)
     grouped: dict[int, list[EnergyHourly]] = defaultdict(list)
     for row in rows:
         grouped[row.stat_hour].append(row)
@@ -129,7 +146,7 @@ def hourly_cells(
     is_today = day == now.date()
     for hour in range(24):
         if closed:
-            cells[hour] = _finished_hour_cell(meters, grouped.get(hour, []))
+            cells[hour] = _finished_hour_cell(connected, grouped.get(hour, []), first_ok, (day, hour))
             continue
         if day > now.date():
             cells[hour] = HourCell(None, "future", future=True)
@@ -139,15 +156,32 @@ def hourly_cells(
             continue
 
         if is_today and hour == now.hour:
-            cells[hour] = _current_hour_cell(meters, now)
+            cells[hour] = _current_hour_cell(connected, now)
             continue
 
-        cells[hour] = _finished_hour_cell(meters, grouped.get(hour, []))
+        cells[hour] = _finished_hour_cell(connected, grouped.get(hour, []), first_ok, (day, hour))
 
     return cells
 
 
-def _finished_hour_cell(meters: list[EnergyMeter], rows: list[EnergyHourly]) -> HourCell:
+def _finished_hour_cell(
+    meters: list[EnergyMeter],
+    rows: list[EnergyHourly],
+    first_ok: dict[int, datetime] | None = None,
+    bucket: tuple[date_cls, int] | None = None,
+) -> HourCell:
+    """一格的合计与质量。`meters` 必须是已接入的表，`rows` 是本小时的行。
+
+    应有集合按小时算：中途才接入的表不该否决它接入之前的小时，
+    否则新装一块表会让历史图表整体倒退。
+    """
+    if first_ok and bucket:
+        exp = expected_ids(first_ok, meters, bucket)
+        meters = [m for m in meters if m.id in exp]
+    if not meters:
+        # 这一格比组里任何表的接入时刻都早
+        return HourCell(None, Q_UNCONNECTED)
+
     if not rows:
         return HourCell(None, EnergyHourly.Q_MISSING)
 
@@ -682,8 +716,17 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
     w_today_out = sum(int(ln["today"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
     w_y_out = sum(int(ln["yesterday"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
 
-    # 车间告警：只保留「采集异常」提示（告警引擎后续接入）
-    alerts = []
+    # 车间告警条。
+    #
+    # 「产量未接入」是**数据源状态说明**而不是计量故障，仍按现算给 ——
+    # 它不该以采集节奏往告警表里反复灌条目。其余一律读告警表：
+    # 大屏与后台必须共用同一份告警，否则「大屏说没事、告警页挂着 3 条」
+    # 这种分歧又会变成要现场自己核对的谜题。
+    #
+    # ⚠ 旧实现在这里现算点位失败，用的是 `last_ok=False .exclude(last_at=None)`，
+    #   恰好把「从没成功过的表」整批漏掉（那正是最该报的一类），并且 [:10] 截断。
+    #   这两条现在由告警引擎的「未接入」与「采集失败」规则分别覆盖。
+    alerts: list[dict] = []
     if not real_any:
         alerts.append(
             {
@@ -692,39 +735,29 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
                 "time": "--:--:--",
             }
         )
-    for meter in EnergyMeter.objects.filter(enabled=True, last_ok=False).exclude(last_at=None)[:10]:
-        alerts.append(
-            {
-                "level": "err",
-                "text": f"{meter.name} 采集失败：{meter.last_error or '未知原因'}",
-                "time": meter.last_at.strftime("%H:%M:%S") if meter.last_at else "--:--:--",
-            }
-        )
 
-    # 采集整体停摆提示（B-511）。
-    # 为什么单独做这一条：采集若整体停掉（计划任务被停、机器重启后没恢复、网络断），
-    # 每个点位的 `last_ok` 都还停在上次成功时的 True —— 上面那条失败告警不会触发，
-    # 大屏于是安静地显示**冻结的旧值**，现场只会觉得「今天的数怎么不动」。
-    # 每小时节奏下最新读数最旧也是约 1 小时前，所以阈值给 2 小时足够宽松。
-    stale_hours = int(conf.get("collect.stale_alert_hours", 2) or 2)
-    newest = EnergyRaw.objects.filter(meter__enabled=True).aggregate(m=Max("collect_time"))["m"]
-    if newest is None:
+    # 读路径兜底：只评估「采集停摆」这一条规则。
+    # 为什么必须由读路径触发：采集进程一旦死掉，collect / summarize 都不会再跑，
+    # 那条「采集停了」的告警反而没人去生成了 —— 而它恰恰是最该被看见的一条
+    # （B-511 的原始动机就是「停摆时界面不会有任何提示」）。
+    # 规则实现仍然只有 alerts 里那一份，这里只是触发，不另写一套判定。
+    evaluate_alerts(now=now, categories={EnergyAlarm.CAT_COLLECT_STALE}, bump=False)
+
+    # 告警表用的是契约四级，大屏只有三档灯：严重/重要 → err，次要 → warn
+    _to_screen_level = {
+        EnergyAlarm.LEVEL_CRITICAL: "err",
+        EnergyAlarm.LEVEL_MAJOR: "err",
+        EnergyAlarm.LEVEL_MINOR: "warn",
+        EnergyAlarm.LEVEL_INFO: "info",
+    }
+    for a in EnergyAlarm.objects.filter(
+        status__in=(EnergyAlarm.STATUS_ACTIVE, EnergyAlarm.STATUS_ACKED)
+    ).order_by("-last_at")[:12]:
         alerts.append(
             {
-                "level": "err",
-                "text": "尚无任何采集数据 —— 请确认计划任务 EEP-Collect 是否在运行",
-                "time": "--:--:--",
-            }
-        )
-    elif (now - newest).total_seconds() > stale_hours * 3600:
-        alerts.append(
-            {
-                "level": "err",
-                "text": (
-                    f"采集疑似中断：最新读数停留在 {newest:%m-%d %H:%M}"
-                    f"（已超过 {stale_hours} 小时未更新），请检查计划任务 EEP-Collect"
-                ),
-                "time": newest.strftime("%H:%M:%S"),
+                "level": _to_screen_level.get(a.level, "info"),
+                "text": a.content,
+                "time": a.last_at.strftime("%H:%M:%S") if a.last_at else "--:--:--",
             }
         )
 

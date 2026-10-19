@@ -33,6 +33,7 @@ from datetime import datetime
 from django.core.management.base import BaseCommand
 
 from apps.energy.services.aggregate import aggregate_recent
+from apps.energy.services import alerts
 from apps.energy.services.collect import collect_round
 from apps.energy.models import EnergyMeter, PeriodSummary, EnergyRaw
 from apps.energy.services import slots
@@ -93,6 +94,16 @@ class Command(BaseCommand):
         if options["summarize"] and not options["dry_run"]:
             written = S.refresh_rollups(datetime.now())
             self.stdout.write(f"周期总计：刷新昨天 + 今天 + 近 2 月 + 今年，共 {len(written)} 条")
+
+        # 告警评估 —— ⚠ 必须放在「有失败就返回非 0」之前。
+        # 部分失败的那一轮恰恰是最该生成告警的一轮；放在后面就等于
+        # 「只在一切正常时才工作的告警系统」，那是没有意义的。
+        if not options["dry_run"]:
+            res = alerts.evaluate()
+            if not options["json"]:
+                self.stdout.write(
+                    f"告警：新增 {res['created']}、恢复 {res['resolved']}、未处理 {res['active']}"
+                )
 
         # 有失败时返回非 0，方便计划任务判定
         if summary["fail"]:

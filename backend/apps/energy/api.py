@@ -54,6 +54,7 @@ from eep import conf
 
 from .collectors import build_collector
 from .models import (
+    EnergyAlarm,
     EnergyYearly,
     EnergyMonthly,
     EnergyDaily,
@@ -1273,8 +1274,14 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
                 }
                 for ln in ws["lines"]
             ],
-            # 告警引擎尚未接入，先如实给空数组（后台页面会显示「暂无」而不是假数据）
-            "latestAlarms": [],
+            # 最近 5 条未处理告警 —— 与上面的 activeAlarms 同源（都读 energy_alarm 表）。
+            # 以前这里恒返回 []，而 KPI 却有数字，两处口径分叉本身就是个误导。
+            "latestAlarms": [
+                alarm_json(a)
+                for a in EnergyAlarm.objects.filter(
+                    status__in=(EnergyAlarm.STATUS_ACTIVE, EnergyAlarm.STATUS_ACKED)
+                )[:5]
+            ],
             "dataSource": {
                 "productionAvailable": any(
                     ProductionHourly.objects.filter(stat_date=now.date())
@@ -1286,6 +1293,83 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
             },
         }
     )
+
+
+# ── 告警 ────────────────────────────────────────────────────
+
+
+def alarm_json(a: EnergyAlarm) -> dict:
+    """告警行 —— 字段与 `docs/api-contract.md` §4.4 的 `AlarmRecord` 一一对应。
+
+    ⚠ `level` / `status` 的取值不要自创：前端 `AlarmLevelTag.vue` 的颜色映射、
+      告警两页的筛选下拉都是按契约那套枚举（critical/major/minor/info、
+      active/acked/resolved）写死的，改一处就要连带改三处。
+    """
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return {
+        "id": a.id,
+        "code": a.code,
+        "level": a.level,
+        "category": a.category,
+        "categoryLabel": a.get_category_display(),
+        "source": a.source,
+        "content": a.content,
+        "value": a.value,
+        "threshold": a.threshold,
+        "status": a.status,
+        "occurredAt": a.occurred_at.strftime(fmt) if a.occurred_at else "",
+        "lastAt": a.last_at.strftime(fmt) if a.last_at else "",
+        "repeat": a.repeat,
+        "resolvedAt": a.resolved_at.strftime(fmt) if a.resolved_at else "",
+        "ackedBy": a.acked_by,
+        "ackedAt": a.acked_at.strftime(fmt) if a.acked_at else "",
+    }
+
+
+@require_GET
+def admin_alarms(request: HttpRequest) -> JsonResponse:
+    """告警列表。
+
+    筛选：`level`（critical/major/minor/info）、`status`（active/acked/resolved）。
+    **不传 status 时返回全部** —— 「历史告警」页要看已恢复的条目，
+    而「实时告警」页显式传 active；默认只给 active 会让历史页永远空白。
+    """
+    qs = EnergyAlarm.objects.all()
+    level = str(request.GET.get("level", "") or "").strip()
+    status = str(request.GET.get("status", "") or "").strip()
+    if level:
+        qs = qs.filter(level=level)
+    if status:
+        qs = qs.filter(status=status)
+    rows = [alarm_json(a) for a in qs[:2000]]
+    return json_ok(_paged(request, rows))
+
+
+@require_http_methods(["POST"])
+def admin_alarm_ack(request: HttpRequest, pk: int) -> JsonResponse:
+    """确认一条告警。确认后不再出现在「实时告警」，但同一问题复发会重新打开。
+
+    ⚠ 契约里这条要求「必须写操作审计日志」，而操作日志表尚未建（后台那一页现在
+      还是演示数据）。这里如实只落 acked_by / acked_at，**不假装写了审计日志** ——
+      等审计表落地时在这一处补上，而不是留一句做不到的注释。
+    """
+    alarm = EnergyAlarm.objects.filter(pk=pk).first()
+    if alarm is None:
+        return json_err(f"告警不存在：id={pk}", 404)
+    if alarm.status == EnergyAlarm.STATUS_RESOLVED:
+        return json_err("该告警已自动恢复，无需确认", 400)
+
+    body: dict = {}
+    if request.body:
+        try:
+            body = json.loads(request.body.decode("utf-8")) or {}
+        except (ValueError, UnicodeDecodeError):
+            body = {}
+    alarm.status = EnergyAlarm.STATUS_ACKED
+    alarm.acked_by = str(body.get("by") or "").strip()[:32] or "未署名"
+    alarm.acked_at = datetime.now()
+    alarm.save(update_fields=["status", "acked_by", "acked_at"])
+    return json_ok(alarm_json(alarm))
 
 
 @require_GET

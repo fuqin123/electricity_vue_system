@@ -776,3 +776,105 @@ class SystemParam(models.Model):
     def number(self) -> Decimal | None:
         """取值：未标定为 None（调用方必须区分 None 与 0）。"""
         return self.value
+
+
+class EnergyAlarm(models.Model):
+    """能源计量告警 —— 「数据没被正确计量」这件事的落库记录。
+
+    为什么要落库，而不是像以前那样在快照里现算一条报一条：
+
+      · **确认（ack）必须有状态**。现算的话值班人员点了「确认」，下一轮采集
+        又把同一条重新算出来挂回列表 —— 那等于没有确认功能，只能靠屏蔽解决，
+        而屏蔽会让人开始忽略整个告警页。
+      · **恢复要能自动关闭**。问题消失后还挂着 active，就是「狼来了」，
+        几次之后告警就没人看了。
+      · **首次/最近/次数**是现场判断严重程度的依据：一块表「今天抖了 3 次」
+        和「连续挂了 6 小时」处理方式完全不同，现算只留得下最后一帧。
+
+    `code` 是**稳定标识**（如 `METER-FAIL:E-A1-01`），同一件事反复检测到
+    只更新 `last_at` / `repeat`，不新增行 —— 采集每 5 分钟跑一轮，
+    不去重的话一块坏表能把告警页刷成垃圾堆。
+
+    ⚠ `level` / `status` 的取值必须与 `docs/api-contract.md` §4.4 一致：
+      前端 `AlarmLevelTag.vue` 的颜色映射和告警页的筛选下拉都是按那套枚举写的。
+    """
+
+    # 级别：与契约、前端标签组件同源（不要另发明一套）
+    LEVEL_CRITICAL = "critical"
+    LEVEL_MAJOR = "major"
+    LEVEL_MINOR = "minor"
+    LEVEL_INFO = "info"
+    LEVEL_CHOICES = (
+        (LEVEL_CRITICAL, "严重"),
+        (LEVEL_MAJOR, "重要"),
+        (LEVEL_MINOR, "次要"),
+        (LEVEL_INFO, "提示"),
+    )
+
+    STATUS_ACTIVE = "active"
+    STATUS_ACKED = "acked"
+    STATUS_RESOLVED = "resolved"
+    STATUS_CHOICES = (
+        (STATUS_ACTIVE, "未处理"),
+        (STATUS_ACKED, "已确认"),
+        (STATUS_RESOLVED, "已恢复"),
+    )
+
+    # 告警类别 —— 决定「该找谁处理」，也是去重 code 的前缀
+    CAT_METER_UNCONNECTED = "meter_unconnected"
+    CAT_METER_FAIL = "meter_collect_fail"
+    CAT_HOUR_QUALITY = "hour_quality"
+    CAT_GATEWAY_OFFLINE = "gateway_offline"
+    CAT_COLLECT_STALE = "collect_stale"
+    CAT_COVERAGE = "coverage_low"
+    CATEGORY_CHOICES = (
+        (CAT_METER_UNCONNECTED, "计量点未接入"),
+        (CAT_METER_FAIL, "计量点采集失败"),
+        (CAT_HOUR_QUALITY, "小时数据异常"),
+        (CAT_GATEWAY_OFFLINE, "网关离线"),
+        (CAT_COLLECT_STALE, "采集停摆"),
+        (CAT_COVERAGE, "周期覆盖率不足"),
+    )
+
+    code = models.CharField("告警标识", max_length=120, db_index=True, help_text="稳定标识，用于去重与自动恢复")
+    category = models.CharField("类别", max_length=32, choices=CATEGORY_CHOICES, db_index=True)
+    level = models.CharField("级别", max_length=16, choices=LEVEL_CHOICES, default=LEVEL_MAJOR)
+    status = models.CharField("状态", max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True)
+
+    source = models.CharField("来源", max_length=120, help_text="归属对象的显示名，如「A4 生产线」「一期配电房串口服务器1口」")
+    content = models.CharField("告警内容", max_length=200)
+    value = models.CharField("触发值", max_length=60, blank=True, default="")
+    threshold = models.CharField("阈值", max_length=60, blank=True, default="")
+
+    # 归属对象：能定位到表/网关/产线就定位，方便点进去直接处理；用 SET_NULL
+    # 是为了「台账里删掉一块表」不该把历史告警一起抹掉（那是审计证据）。
+    meter = models.ForeignKey(
+        EnergyMeter, on_delete=models.SET_NULL, null=True, blank=True, related_name="alarms", verbose_name="计量点"
+    )
+    gateway = models.ForeignKey(
+        EnergyGateway, on_delete=models.SET_NULL, null=True, blank=True, related_name="alarms", verbose_name="网关"
+    )
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.SET_NULL, null=True, blank=True, related_name="alarms", verbose_name="产线"
+    )
+
+    occurred_at = models.DateTimeField("首次发生")
+    last_at = models.DateTimeField("最近发生", db_index=True)
+    repeat = models.PositiveIntegerField("重复次数", default=1)
+    resolved_at = models.DateTimeField("恢复时间", null=True, blank=True)
+
+    acked_by = models.CharField("确认人", max_length=32, blank=True, default="")
+    acked_at = models.DateTimeField("确认时间", null=True, blank=True)
+
+    class Meta:
+        db_table = "energy_alarm"
+        ordering = ["-last_at"]
+        verbose_name = "计量告警"
+        verbose_name_plural = "计量告警"
+        indexes = [
+            # 列表页固定是「先看未处理、按时间倒序」，没有这个索引会随历史行增长变慢
+            models.Index(fields=("status", "-last_at"), name="alarm_status_time_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.level}] {self.source} {self.content}"

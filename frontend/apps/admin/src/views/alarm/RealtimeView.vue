@@ -33,7 +33,7 @@ async function ack(row: AlarmRecord) {
     return;
   }
   await adminApi.ackAlarm(row.id);
-  ElMessage.success('已确认，记录已写入操作审计日志');
+  ElMessage.success('已确认，该告警不再出现在未处理列表'); // 审计日志尚未实现，不谎称写了
 }
 </script>
 

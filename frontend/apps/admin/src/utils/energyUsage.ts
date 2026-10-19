@@ -262,22 +262,49 @@ export function useEnergyUsage(energy: UsageEnergy) {
 
   const missingBuckets = computed(() => values.value.filter((v) => v === null || v === undefined).length);
 
-  /** 有值但整段为空时给一句话说明，避免「图是空的」被读成「系统坏了」 */
-  const emptyHint = computed(() => (values.value.length && !missingBuckets.value ? '' : values.value.length === 0 || missingBuckets.value === values.value.length ? meta.emptyHint : ''));
+  /**
+   * 整段没数时给一句话说明，避免「图是空的」被读成「系统坏了」。
+   *
+   * ⚠ 不能无条件用写死文案：水页那句是「车间进水总表未接入」，
+   *   可表一旦接好、只是本区间缺采，这句话就会把人支去做错的事
+   *   （去查接线，而真正该查的是链路）。所以优先按 coverage 判定。
+   */
+  const emptyHint = computed(() => {
+    const v = values.value;
+    if (!v.length) return '';
+    const allMissing = v.every((x) => x === null || x === undefined);
+    if (!allMissing) return '';
+    const cov = data.value?.coverage;
+    if (cov && cov.connected === 0) return `${meta.name}计量点尚未接入 —— 请接线 / 补全配置`;
+    return allMissing && cov?.missing.length ? `${meta.name}本区间无可信数据（已接入点位缺采）` : meta.emptyHint;
+  });
 
   /**
-   * 覆盖度说明 —— 车间合计为空但下面各线有数时，最需要这句话。
+   * 覆盖度说明 —— 把「多少块表在算这个数」和「还有几块表根本没接」说清。
    *
-   * 合计口径是「全部参与表都有可信值才算数」，因此只要有一块表还没接入，
-   * 合计就恒为 `--`；界面不点破，用户只会得出「系统坏了」的结论。
+   * 口径变更：合计现在只按**已接入**的表算，所以留空只可能是缺采（要查链路），
+   * 不再可能是「某块表压根没接线」。未接入的表单独列一句，提示去接线 / 补 token，
+   * 它不参与合计、也不该被当成故障。
    */
   const coverageHint = computed(() => {
     const cov = data.value?.coverage;
     if (!cov || cov.total === 0) return '';
-    if (cov.missing.length === 0) return `本区间 ${cov.covered}/${cov.total} 个计量点均有数据`;
-    const shown = cov.missing.slice(0, 6).join('、');
-    const more = cov.missing.length > 6 ? ` 等 ${cov.missing.length} 个` : '';
-    return `本区间仅 ${cov.covered}/${cov.total} 个计量点有数据，合计按「全部可信才算数」口径留空。未出数：${shown}${more}`;
+    const parts: string[] = [];
+    if (cov.missing.length) {
+      const shown = cov.missing.slice(0, 6).join('、');
+      const more = cov.missing.length > 6 ? ` 等 ${cov.missing.length} 个` : '';
+      parts.push(
+        `本区间 ${cov.covered}/${cov.connected} 个已接入计量点有数据，合计按「全部可信才算数」口径留空。缺采：${shown}${more}`
+      );
+    } else {
+      parts.push(`本区间 ${cov.covered}/${cov.connected} 个已接入计量点均有数据`);
+    }
+    if (cov.unconnected.length) {
+      const shown = cov.unconnected.slice(0, 6).join('、');
+      const more = cov.unconnected.length > 6 ? ` 等 ${cov.unconnected.length} 个` : '';
+      parts.push(`未接入（不参与合计）：${shown}${more}`);
+    }
+    return parts.join('；');
   });
 
   const chartOption = computed(() => {

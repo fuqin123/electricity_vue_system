@@ -13,9 +13,11 @@
  *     后端实现后把它从数组里删掉即可，**不用改别处代码**。
  *
  * 已接真实后端：energy.*、admin.overview / lines / gateways / meters /
- *              quality / collect-logs
- * 仍走演示数据：admin.users / roles / menus / params / dicts / alarms /
+ *              quality / collect-logs / params / readings / alarms（v1.5.3 告警引擎）
+ * 仍走演示数据：admin.users / roles / menus / dicts /
  *              logs.operation / logs.login / reports
+ * ⚠ 这个清单必须与下面 config.ts 的 dataConfig.mockOnly 一致 ——
+ *   两处各说一套，改代码的人就会按错的那份办事。
  *
  * ⚠ 大屏快照有个额外的安全网：后端不可达时**降级为演示数据，并把 `source`
  *   标成 'mock'、带上 `notice`** —— 界面必须显示这个提示。
@@ -25,7 +27,6 @@
 import { dataConfig } from '../config';
 import {
   mockAdminOverview,
-  mockAlarms,
   mockCollectLogs,
   mockDicts,
   mockGateways,
@@ -519,12 +520,14 @@ export const adminApi = {
     return request<DataQualityRow[]>('/api/admin/quality');
   },
 
-  /* ── 告警（后端未实现，仍用演示数据）── */
+  /* ── 告警（读后端告警表，不再有演示数据）── */
   async getAlarms(query: PageQuery = { page: 1, pageSize: 10 }): Promise<PageResult<AlarmRecord>> {
-    if (!useApi('admin.alarms')) return delay(page(mockAlarms(), query));
+    // 演示模式给空列表而不是编几条假告警：告警的含义是「系统检测到这里有问题」，
+    // 假的告警会让人以为问题正在被监控，比没有告警更糟。
+    if (!useApi('admin.alarms')) return delay({ list: [], total: 0, page: 1, pageSize: 10 }, 160);
     return request<PageResult<AlarmRecord>>('/api/admin/alarms', { params: query as Record<string, string> });
   },
-  /** 确认告警（真实模式下由后端写入审计日志） */
+  /** 确认告警（写 acked_by / acked_at；操作审计日志尚未实现，不假装写了） */
   async ackAlarm(id: number): Promise<void> {
     if (!useApi('admin.alarms')) return delay(undefined, 260);
     await request(`/api/admin/alarms/${id}/ack`, { method: 'POST' });
@@ -646,13 +649,23 @@ export interface UsageRangeResult {
   /** 本次查询命中的计量点数（焦点通道用于显示「本范围 N 个点位」） */
   meterCount?: number;
   /**
-   * 计量点覆盖度 —— 解释「为什么合计是空的」。
+   * 计量点覆盖度 —— 解释「这一段的数是从多少块表来的」。
    *
-   * 车间合计的口径是「全部参与表都有可信值才算数」，所以只要有一块表
-   * 从没接入过，整条合计就恒为 `--`。这是对的（不返回偏小值），
-   * 但界面必须说清缺的是哪几块，否则用户会以为系统坏了。
+   * 两类「没数」必须分开，因为现场的处理动作完全不同：
+   *   · missing      已接入、本区间却没出数 → 真故障，要查链路 / 看告警
+   *   · unconnected  登记了但从未出过可信值 → 还没接线 / 没给 token
+   *
+   * ⚠ 口径变更：unconnected 的表**不再参与合计**（旧口径下一块没接的表会把
+   *   整组永久否决，混类型时连电和汽一起抹空）。它们改由告警引擎报「未接入」。
+   *   所以合计为 `--` 现在只可能是 missing 造成的，不再可能是 unconnected。
    */
-  coverage?: { total: number; covered: number; missing: string[] };
+  coverage?: {
+    total: number;
+    connected: number;
+    covered: number;
+    missing: string[];
+    unconnected: string[];
+  };
   /** 服务器认为的「参考日」（YYYY-MM-DD），用于跨零点校准日期控件 */
   serverDate?: string;
   /** 实际生效的区间端点（精确到小时文本），比 from/to 更准 */

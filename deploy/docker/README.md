@@ -103,6 +103,11 @@ curl -s http://127.0.0.1/api/energy/overview | head -c 200
 # ⑥ 采集是否在跑（现场最需要看这个）
 docker compose logs --tail=30 collector
 
+# ⑧ 告警是否对应真实问题（v1.5.3 起有告警表）
+docker compose exec backend python manage.py check_alerts
+curl -s http://127.0.0.1:8080/api/admin/alarms?status=active | head -c 200
+#    每条都应能对应到现场的实事（未接入 / 网关不通 / 昨日没结算）
+
 # ⑦ 周期结算是否跑过（漏了它，大屏「近 30 日 / 近 12 月」会静默停在最后一次结算那天）
 docker compose logs --tail=6 rollup
 #    期望看到「滚动窗口结算完成…：N 条」与「[rollup] 距下次结算还有 N 分钟」
