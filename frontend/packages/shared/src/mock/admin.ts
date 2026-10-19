@@ -240,6 +240,8 @@ export function mockMeters(): MeterPoint[] {
       register,
       registers: 2,
       funcCode: 3,
+      dataType: 'uint32',
+      byteOrder: 'big',
       wordOrder: 'big',
       urlPath: '',
       params: {},
@@ -260,9 +262,13 @@ export function mockMeters(): MeterPoint[] {
   });
 
   // 车间总表：蒸汽已接入（HTTP API）；水表接口地址待现场提供，故停用
+  // ⚠ HTTP API 网关的读数由 JSON 直接给出，dataType / byteOrder 对它无意义，
+  //   这里只是补齐 MeterPoint 的必填字段（演示数据不造假口径）。
   const totalBase = {
     registers: 2,
     funcCode: 3,
+    dataType: 'uint32' as const,
+    byteOrder: 'big' as const,
     wordOrder: 'big' as const,
     gatewayId: 5,
     gatewayCode: 'GW-API-DJ',

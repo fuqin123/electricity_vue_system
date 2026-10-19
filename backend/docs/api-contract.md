@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.5.0 ｜ 最后更新：2026-10-09
+> 版本：v1.5.3 ｜ 最后更新：2026-10-12
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -86,6 +86,7 @@
 | 网关 `ip` | `host` | ⚠ 名字不同，**必须走别名**。漏了它 IP 写不进去 |
 | 网关 `baseUrl` / `timeoutMs` / `intervalSeconds` | `base_url` / `timeout_ms` / `interval_seconds` | camelCase → snake_case |
 | 计量点 `factor` | `scale` | ⚠ 名字不同，**必须走别名**。漏了它倍率被默认值 1 顶掉 |
+| 计量点 `dataType` / `byteOrder` | `data_type` / `byte_order` | ⚠ 名字不同，**必须走别名**（v1.5.3）。漏了它水表仍按 32 位整数解 |
 | 计量点 `funcCode` / `wordOrder` / `urlPath` / `valuePath` / `timePath` / `maxHourly` / `assetNo` / `installDate` | 对应 snake_case | 同上 |
 | 计量点 `kind` / `scope` / `role` / `lineCode` / `gatewayId` | 由 `_save_meter` 直接读 `data` | 不走 `_apply`，但**改名字要同时改 `_save_meter`** |
 
@@ -483,6 +484,60 @@
 
 ⚠ 只有**部分**点位读通仍算网关可达（设备是活的）—— 单点参数写错属于点位问题，
 不该把整台网关判离线。
+
+---
+
+## 〇·补八、v1.5.3 变更（计量点寄存器数据类型）★ 换表 / 接入新表必读
+
+### 1) `MeterPoint` 新增 `dataType` / `byteOrder`
+
+| 字段 | 取值 | 说明 |
+| :--- | :--- | :--- |
+| `dataType` | `uint16` / `int16` / `uint32` / `int32` / `float32` / `float64` | 默认 `uint32`。决定拼出整数还是浮点，**以及要读几个寄存器** |
+| `byteOrder` | `big` / `little` | 单个寄存器**内部**的字节顺序，默认 `big` |
+
+`wordOrder` 语义不变（**寄存器之间**的顺序），两者组合出工业通用的四种排布：
+
+| 排布 | `byteOrder` | `wordOrder` | 现场 |
+| :--- | :--- | :--- | :--- |
+| **ABCD** | big | big | ✔ 13 块电表 + 市政水表 |
+| CDAB | big | little | |
+| BADC | little | big | |
+| DCBA | little | little | |
+
+⚠ 现场并非所有表都是 32 位整数：**碳水市政水表 `W-CARB-CITY-1`
+（`GW-WATER-CTY`、从站 5、起始地址 68）是 4 寄存器 IEEE754 double**。
+按 `uint32` 拼出来是一个完全无关的大整数 —— 不报错，只是数字荒谬。
+
+### 2) `registers` 降级为**只读推导值**
+
+- 读取长度由 `dataType` 决定（16 位→1、32 位→2、64 位→4），
+  响应里的 `registers` 恒等于该推导值。
+- **提交时不要传 `registers`**：即便传了也会被后端按 `dataType` 覆盖。
+  手填会让「配置的读取长度」与「按什么类型解码」脱钩，而脱钩不报错、只给错数。
+- 强制点在模型 `EnergyMeter.save()`，因此 `seed_registry`、后台 admin
+  与任何 ORM 直写路径都走同一条规则（不只在接口层）。
+
+### 3) 未知数据类型一律 **400**，不静默存下
+
+`dataType` 不在上表取值内时返回 `400 {"detail": "数据类型不支持：…"}`。
+理由与 `unit` 一致：这类字段**不参与校验、只影响解码**，静默存下一个错误值的后果
+是「点位能存进去、却永远读到一个离谱的数」，比直接报错难查得多。
+
+### 4) 配置文件写法（`settings.yaml` 的 `meters[]`）
+
+```yaml
+- code: W-CARB-CITY-1
+  kind: water
+  gateway: GW-WATER-CTY
+  slave: 5
+  register: 68
+  data_type: float64     # ← 水表：4 寄存器 double
+  byte_order: big        # ABCD
+  word_order: big
+```
+
+未写 `data_type` 时按 `uint32` 登记（现场 13 块电表的既有口径，行为不变）。
 
 ---
 

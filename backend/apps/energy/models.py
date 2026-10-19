@@ -316,6 +316,44 @@ class EnergyMeter(models.Model):
     SOURCE_ADMIN = "admin"
     SOURCE_CHOICES = [(SOURCE_CONFIG, "配置文件"), (SOURCE_ADMIN, "后台维护")]
 
+    # ── 寄存器数据类型（v1.5.3）────────────────────────────────
+    # 为什么必须有这一列：现场并非所有表都是「32 位无符号整数」。
+    # 例：碳水市政水表（`W-CARB-CITY-1`）起始地址 68、**4 个寄存器、
+    # IEEE754 双精度（double）**，按 32 位整数拼出来的是一个完全无关的大整数 ——
+    # 采集不报错、小时差值照算，只有数字荒谬（现场核对时表现为「水表读数不对」）。
+    #
+    # 类型决定两件事，且**只有这一个真值来源**：
+    #   ① 拼出来是什么数（整数 / 浮点）；
+    #   ② 要读几个寄存器（16 位→1、32 位→2、64 位→4）。
+    # `registers` 列保留为**兼容镜像**，由 `sync_registers()` 与本节保持同步。
+    DT_UINT16 = "uint16"
+    DT_INT16 = "int16"
+    DT_UINT32 = "uint32"
+    DT_INT32 = "int32"
+    DT_FLOAT32 = "float32"
+    DT_FLOAT64 = "float64"
+
+    DATA_TYPE_CHOICES = [
+        (DT_UINT16, "16 位无符号整数（1 个寄存器）"),
+        (DT_INT16, "16 位有符号整数（1 个寄存器）"),
+        (DT_UINT32, "32 位无符号整数（2 个寄存器）"),
+        (DT_INT32, "32 位有符号整数（2 个寄存器）"),
+        (DT_FLOAT32, "32 位浮点数 IEEE754（2 个寄存器）"),
+        (DT_FLOAT64, "64 位双精度 IEEE754 / double（4 个寄存器）"),
+    ]
+    #: 数据类型 → 寄存器个数。**唯一来源**：读取长度由此推导，不看 `registers` 列。
+    REGISTERS_BY_TYPE = {
+        DT_UINT16: 1, DT_INT16: 1,
+        DT_UINT32: 2, DT_INT32: 2, DT_FLOAT32: 2,
+        DT_FLOAT64: 4,
+    }
+    #: 默认值 = 现场 13 块电表的既有口径（32 位无符号），保证老配置行为不变。
+    DATA_TYPE_DEFAULT = DT_UINT32
+
+    BYTE_BIG = "big"
+    BYTE_LITTLE = "little"
+    BYTE_ORDER_CHOICES = [(BYTE_BIG, "大端（寄存器内高字节在前）"), (BYTE_LITTLE, "小端（寄存器内低字节在前）")]
+
     code = models.CharField("计量点编号", max_length=32, unique=True)
     name = models.CharField("计量点名称", max_length=64)
     energy_type = models.ForeignKey(
@@ -342,10 +380,22 @@ class EnergyMeter(models.Model):
     # ── 串口服务器（Modbus）参数 ──
     slave = models.PositiveSmallIntegerField("从站号", null=True, blank=True)
     register = models.PositiveIntegerField("寄存器起始地址", null=True, blank=True)
-    registers = models.PositiveSmallIntegerField("寄存器数量", default=2)
+    registers = models.PositiveSmallIntegerField(
+        "寄存器数量", default=2,
+        help_text="兼容镜像：由「数据类型」推导，保存时自动同步；改它不生效",
+    )
     func_code = models.PositiveSmallIntegerField("功能码", default=3, help_text="读保持寄存器用 03")
+    data_type = models.CharField(
+        "数据类型", max_length=10, choices=DATA_TYPE_CHOICES, default=DATA_TYPE_DEFAULT,
+        help_text="决定拼出整数还是浮点数，以及要读几个寄存器。水表（double）选 float64",
+    )
+    byte_order = models.CharField(
+        "字节序", max_length=8, choices=BYTE_ORDER_CHOICES, default=BYTE_BIG,
+        help_text="单个寄存器内部的字节顺序；与「字序」一起决定 4 种组合（现场电表为 大端+高字在前）",
+    )
     word_order = models.CharField(
-        "32 位字序", max_length=8, default="big", choices=[("big", "高字在前"), ("little", "低字在前")]
+        "字序", max_length=8, default="big",
+        choices=[("big", "高字在前（ABCD）"), ("little", "低字在前（CDAB）")],
     )
     asset_no = models.CharField("资产编号", max_length=64, blank=True, default="")
     install_date = models.DateField("安装日期", null=True, blank=True)
@@ -419,6 +469,49 @@ class EnergyMeter(models.Model):
             self.usage_type or "",
             self.device_name or self.name,
         )
+
+    @property
+    def expected_registers(self) -> int:
+        """按数据类型推出的寄存器个数（16 位→1、32 位→2、64 位→4）。
+
+        ⚠ 采集侧读几个寄存器**只看这里**，不看 `registers` 列 ——
+          两个来源并存必然出现「配的是 float64、却只读了 2 个寄存器」这类错配，
+          而它不会报错，只会给出一个数值离谱的读数（v1.5.2「同一指标只能有一条规则」）。
+        """
+        return self.REGISTERS_BY_TYPE.get(self.data_type, 2)
+
+    def sync_registers(self) -> bool:
+        """把兼容镜像列 `registers` 对齐到 `expected_registers`；有变化返回 True。
+
+        只为「后台列表 / 接口 / 前端表单」显示用，采集不读它。
+        """
+        want = self.expected_registers
+        if self.registers != want:
+            self.registers = want
+            return True
+        return False
+
+    def save(self, *args, **kwargs):
+        """写库前强制对齐 `registers`（单点，覆盖所有写入路径）。
+
+        ⚠ 为什么放在 `save()` 而不是只放在接口层：`objects.create()`、
+          `seed_registry`、Django admin 都能**绕过接口层**直接写库，
+          而那些路径同样必须保持「读几个寄存器」与「按什么类型解」一致。
+          放在这里才叫「一个真值来源」；只放在 `_save_meter` 里，
+          任何一条新写入路径都可能重新引入漂移（本次就是被一条直连 create 的
+          测试用例照出来的：类型 float64、镜像列却还是 2）。
+        """
+        update_fields = kwargs.get("update_fields")
+        if update_fields is None:
+            self.sync_registers()
+        else:
+            fields = set(update_fields)
+            # 改数据类型、或本身就在写 registers 时，把推导结果一并写下去
+            if "registers" in fields or "data_type" in fields:
+                self.sync_registers()
+                fields.add("registers")
+                kwargs["update_fields"] = fields
+        super().save(*args, **kwargs)
 
 
 class EnergyRaw(models.Model):

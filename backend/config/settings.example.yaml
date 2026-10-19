@@ -232,7 +232,14 @@ meters:
   #
   # ⚠ 市政水表**起始地址是 68，不是 1000** —— 现场接口表明确写了
   #   「起始地址取决于对应仪表的起始地址，跟仪表走」。这条也是本项目
-  #   唯一一块走 Modbus TCP 的水表（其余水/汽走 HTTP API）。
+  #   唯一一块走 Modbus 的水表（其余水/汽走 HTTP API）。
+  #
+  # ★★ 数据类型：**这块表是 double（IEEE754 双精度），不是整数**（v1.5.3）
+  #   现场实测脚本验证：读 4 个寄存器、按 **ABCD（字序高字在前 + 字节序大端）**
+  #   解析得到的才是准确值；按 32 位整数拼出来的是一个完全无关的大整数。
+  #   所以 `data_type: float64`，`registers` 由数据类型推导为 4（不用手写）。
+  #   另外两种常见形式也一并列出，若现场表型号变了可直接改这两项：
+  #     字节序 little + 字序 big → BADC ；两者都 little → DCBA
   - code: W-CARB-CITY-1
     name: 碳水市政水表1
     kind: water
@@ -244,11 +251,13 @@ meters:
     gateway: GW-WATER-CTY
     slave: 5
     register: 68
-    registers: 2
+    data_type: float64
+    byte_order: big
+    word_order: big
     scale: 0.1
     unit: m³
     max_hourly: 500
-    remark: 起始地址 68（非 1000）；倍率 0.1 待现场核对水表铭牌后确认
+    remark: 起始地址 68（非 1000）；double 型读数（4 寄存器 / ABCD）；倍率 0.1 待现场核对铭牌后确认
 
   # 车间蒸汽表：**沿用现场既有编号 S-WS-01**（已有历史读数，换编号会断链）。
   - code: S-WS-01

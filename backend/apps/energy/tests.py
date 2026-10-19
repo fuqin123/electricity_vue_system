@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from datetime import datetime, timedelta
 from decimal import Decimal
 from io import StringIO
@@ -17,7 +18,7 @@ from django.core.management import call_command
 from django.test import Client, RequestFactory, TestCase
 
 from apps.energy.collectors.base import BaseCollector, CollectResult, get_path
-from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector
+from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector, decode_registers
 from apps.energy.management.commands import collect
 from apps.energy.management.commands.ingest_production import write_production
 from apps.energy import api
@@ -2698,3 +2699,273 @@ class ProductionIngestTests(TestCase):
             ProductionHourly.objects.get(line=self.line, stat_date=DAY, stat_hour=3).output,
             Decimal("180"),
         )
+
+class _FakeRegisters:
+    """替身：只实现 read_one 用到的那两个接口。"""
+
+    def __init__(self, regs, error=False):
+        self.registers = list(regs)
+        self._error = error
+
+    def isError(self):
+        return self._error
+
+
+class _FakeModbusClient:
+    def __init__(self, regs, error=False):
+        self._all = list(regs)
+        self._error = error
+        self.calls: list[dict] = []
+
+    def read_holding_registers(self, address=None, count=None, **kw):
+        self.calls.append({"address": address, "count": count, **kw})
+        return _FakeRegisters(self._all[:count], self._error)
+
+    def close(self):
+        pass
+
+
+def _swap16(x: int) -> int:
+    """16 位字节对调。"""
+    return int.from_bytes(x.to_bytes(2, "big"), "little")
+
+
+class MeterDataTypeTests(TestCase):
+    """v1.5.3：计量点的寄存器**数据类型**（现场水表是 double，不是 32 位整数）。
+
+    背景：碳水市政水表 `W-CARB-CITY-1`（`GW-WATER-CTY` 10.114.1.71:10123、
+    从站 5、起始地址 68）是 **4 个寄存器、IEEE754 双精度**。此前所有点位都按
+    「32 位无符号整数」拼，于是水表读出来是一个完全无关的大整数 ——
+    采集不报错、小时差值照算，只有数字荒谬，现场表现为「水表读数不对」。
+
+    现场用试读脚本确认：**ABCD（字序高字在前 + 寄存器内大端）** 解析的才是准确值。
+    注意 ABCD 与 13 块电表的字节/字序**相同**，区别只在数据类型，
+    所以本组测试重点锁「类型驱动的解码」与「寄存器个数由类型推导」。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A7", line_name="七线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-DT", name="类型测试网关",
+            kind=EnergyGateway.KIND_MODBUS, host="10.0.0.7", port=8888,
+        )
+
+    # ── ① 解码：四种排布都要能解回原值 ──────────────────────
+    def test_double四种排布各自解回原值(self):
+        """按某种排布发出来的寄存器，必须能被对应配置解回原值。
+
+        四种排布＝字节序（寄存器内）× 字序（寄存器之间）：
+        ABCD / CDAB / BADC / DCBA。
+        """
+        value = 1234.5678
+        words = list(struct.unpack(">4H", struct.pack(">d", value)))
+        cases = {
+            "ABCD": (words, "big", "big"),
+            "CDAB": (list(reversed(words)), "big", "little"),
+            "BADC": ([_swap16(w) for w in words], "little", "big"),
+            "DCBA": ([_swap16(w) for w in reversed(words)], "little", "little"),
+        }
+        for name, (regs, byte_order, word_order) in cases.items():
+            with self.subTest(layout=name):
+                got = decode_registers(
+                    regs, data_type=EnergyMeter.DT_FLOAT64,
+                    byte_order=byte_order, word_order=word_order,
+                )
+                self.assertAlmostEqual(got, value, places=9)
+
+    def test_float32两种排布(self):
+        value = 234.5
+        words = list(struct.unpack(">2H", struct.pack(">f", value)))
+        self.assertAlmostEqual(
+            decode_registers(words, data_type=EnergyMeter.DT_FLOAT32), value, places=4
+        )
+        self.assertAlmostEqual(
+            decode_registers(
+                [_swap16(w) for w in words],
+                data_type=EnergyMeter.DT_FLOAT32, byte_order="little",
+            ),
+            value, places=4,
+        )
+
+    def test_现场脚本组合1与本实现逐位一致(self):
+        """现场试读脚本的组合 1（byteorder=big + wordorder=big）＝ ABCD。
+
+        这条是本次改动的**验收锚点**：脚本里的组合 1 打印出来的是准确值，
+        本实现必须给出完全相同的数。
+
+        ⚠ 脚本的组合 3/4 不要拿来对齐：它们在 byteorder='little' 时既对调寄存器内
+          字节、又用 `'<d'` 整体按小端解释，等于把字节序用了两次，
+          打印出来的并不是标准 BADC/DCBA（脚本里那两行只是探索用）。
+        """
+        def parse_double_combo1(regs):
+            data = b"".join(r.to_bytes(2, "big") for r in regs)
+            return struct.unpack(">d", data)[0]
+
+        for value in (0.0, 1.0, 1234.5678, 987654.321, -5.25):
+            regs = list(struct.unpack(">4H", struct.pack(">d", value)))
+            with self.subTest(value=value):
+                self.assertEqual(
+                    decode_registers(
+                        regs, data_type=EnergyMeter.DT_FLOAT64,
+                        byte_order="big", word_order="big",
+                    ),
+                    parse_double_combo1(regs),
+                )
+
+    def test_整数类型与旧口径逐位一致(self):
+        """回归保护：13 块电表（32 位无符号）的解码结果必须一位都不变。"""
+        for regs in ([0x03C3, 0x3B79], [0x0000, 0x0001], [0xFFFF, 0xFFFF]):
+            for word_order in ("big", "little"):
+                with self.subTest(regs=regs, word_order=word_order):
+                    self.assertEqual(
+                        decode_registers(
+                            regs, data_type=EnergyMeter.DT_UINT32,
+                            byte_order="big", word_order=word_order,
+                        ),
+                        ModbusRtuOverTcpCollector._combine(regs, word_order),
+                    )
+
+    def test_有符号与16位类型(self):
+        self.assertEqual(decode_registers([0xFFFF, 0xFFFF], data_type=EnergyMeter.DT_INT32), -1)
+        self.assertEqual(decode_registers([0xFFFF, 0xFFFF], data_type=EnergyMeter.DT_UINT32), 0xFFFFFFFF)
+        self.assertEqual(decode_registers([0x1234], data_type=EnergyMeter.DT_UINT16), 0x1234)
+        self.assertEqual(decode_registers([0xFFFE], data_type=EnergyMeter.DT_INT16), -2)
+
+    def test_寄存器不够时解码报错而不是猜(self):
+        """给少了必须报错：猜出来的数不会报错，只会是一个数值离谱的读数。"""
+        with self.assertRaises(ValueError):
+            decode_registers([0x4093, 0x4A45], data_type=EnergyMeter.DT_FLOAT64)
+        with self.assertRaises(ValueError):
+            decode_registers([0x4093], data_type=EnergyMeter.DT_UINT32)
+        with self.assertRaises(ValueError):
+            decode_registers([1, 2], data_type="uint8")
+
+    # ── ② 类型驱动读取长度 ────────────────────────────────
+    def test_寄存器个数由数据类型推导(self):
+        m = EnergyMeter(
+            code="X-1", name="x", energy_type=etype(), gateway=self.gw, line=self.line,
+            data_type=EnergyMeter.DT_FLOAT64, registers=2,
+        )
+        self.assertEqual(m.expected_registers, 4)
+        self.assertTrue(m.sync_registers(), "推导值与镜像列不一致时应被纠正")
+        self.assertEqual(m.registers, 4)
+
+    def test_采集按数据类型决定读几个寄存器(self):
+        """float64 必须真的去读 4 个寄存器 —— 读 2 个只会得到半个 double。"""
+        m = EnergyMeter.objects.create(
+            code="W-DT-1", name="水表", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=ProductionLine.default_workshop(),
+            gateway=self.gw, slave=5, register=68,
+            data_type=EnergyMeter.DT_FLOAT64, byte_order="big", word_order="big",
+            scale=Decimal("1"), unit="m\u00b3",
+        )
+        m.sync_registers()
+        m.save(update_fields=["registers"])
+        regs = list(struct.unpack(">4H", struct.pack(">d", 1234.5678)))
+
+        collector = ModbusRtuOverTcpCollector(self.gw, timeout_ms=1000, retry_times=0)
+        collector.client = _FakeModbusClient(regs)
+        res = collector.read_one(m)
+
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(collector.client.calls[0]["count"], 4, "必须按类型读 4 个寄存器")
+        self.assertEqual(res.value, Decimal("1234.5678"))
+        self.assertIn("float64", res.raw, "报文留档要写清按什么类型读的")
+
+    def test_float64解码不引入二进制尾巴(self):
+        """Decimal(str(float)) 而非 Decimal(float)：否则 1234.5678 会变成
+        1234.5678000000000346... 一路带进小时差值。"""
+        regs = list(struct.unpack(">4H", struct.pack(">d", 1234.5678)))
+        m = EnergyMeter.objects.create(
+            code="W-DT-2", name="水表2", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=ProductionLine.default_workshop(),
+            gateway=self.gw, slave=5, register=68,
+            data_type=EnergyMeter.DT_FLOAT64, scale=Decimal("1"), unit="m\u00b3",
+        )
+        m.sync_registers()
+        m.save(update_fields=["registers"])
+        collector = ModbusRtuOverTcpCollector(self.gw, timeout_ms=1000, retry_times=0)
+        collector.client = _FakeModbusClient(regs)
+        self.assertEqual(collector.read_one(m).value, Decimal("1234.5678"))
+
+    def test_浮点NaN判为采集失败而不是入库(self):
+        """表故障或字节序配错时常读到 NaN/Inf。
+        Decimal('nan') 能构造出来但会在比较与入库时到处炸，且差值毫无意义 ——
+        必须判失败并说清原因，不把一个「数字形状的错误」放进库里。"""
+        nan_regs = list(struct.unpack(">4H", struct.pack(">d", float("nan"))))
+        m = EnergyMeter.objects.create(
+            code="W-DT-3", name="水表3", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=ProductionLine.default_workshop(),
+            gateway=self.gw, slave=5, register=68,
+            data_type=EnergyMeter.DT_FLOAT64, scale=Decimal("1"), unit="m\u00b3",
+        )
+        m.sync_registers()
+        m.save(update_fields=["registers"])
+        collector = ModbusRtuOverTcpCollector(self.gw, timeout_ms=1000, retry_times=0)
+        collector.client = _FakeModbusClient(nan_regs)
+        res = collector.read_one(m)
+        self.assertFalse(res.ok)
+        self.assertIn("浮点读数非法", res.error)
+
+    # ── ③ 接口与契约 ──────────────────────────────────────
+    def test_接口返回数据类型与字节序(self):
+        EnergyMeter.objects.create(
+            code="W-DT-4", name="水表4", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=ProductionLine.default_workshop(),
+            gateway=self.gw, slave=5, register=68,
+            data_type=EnergyMeter.DT_FLOAT64, byte_order="big", unit="m\u00b3",
+        )
+        res = Client().get("/api/admin/meters", {"pageSize": 200})
+        self.assertEqual(res.status_code, 200)
+        row = next(r for r in res.json()["list"] if r["code"] == "W-DT-4")
+        self.assertEqual(row["dataType"], "float64")
+        self.assertEqual(row["byteOrder"], "big")
+        self.assertEqual(row["registers"], 4, "镜像列应等于按类型推导的个数")
+
+    def test_新增点位时寄存器个数被推导而不是照抄前端(self):
+        """前端只提交 dataType；registers 由后端推导 —— 否则「配的 double、读的 2 个寄存器」。"""
+        res = Client().post(
+            "/api/admin/meters",
+            data=json.dumps({
+                "code": "W-DT-5", "name": "水表5", "kind": "water",
+                "scope": "workshop", "gatewayId": self.gw.id,
+                "slave": 5, "register": 68,
+                "dataType": "float64", "byteOrder": "big",
+                "unit": "m\u00b3", "factor": 1,
+                "registers": 2,          # 前端若误传，后端必须无视
+            }),
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+        m = EnergyMeter.objects.get(code="W-DT-5")
+        self.assertEqual(m.data_type, "float64")
+        self.assertEqual(m.registers, 4)
+
+    def test_未知数据类型返回400而不是静默存下(self):
+        res = Client().post(
+            "/api/admin/meters",
+            data=json.dumps({
+                "code": "W-DT-6", "name": "水表6", "kind": "water",
+                "scope": "workshop", "gatewayId": self.gw.id,
+                "slave": 5, "register": 68, "dataType": "uint8",
+            }),
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("数据类型", res.json()["detail"])
+        self.assertFalse(EnergyMeter.objects.filter(code="W-DT-6").exists())
+
+    def test_前端契约自检覆盖数据类型字段(self):
+        """漏登记别名 = 字段被静默丢弃（B-535 同族）：
+        现场选了 float64 保存后仍是 uint32，水表继续给出荒谬的大整数。"""
+        self.assertIn("dataType", api.FRONTEND_METER_KEYS)
+        self.assertIn("byteOrder", api.FRONTEND_METER_KEYS)
+        self.assertEqual(api.assert_alias_covers_frontend(), [])
+
+    def test_登记表同步按数据类型推导寄存器个数(self):
+        """seed_registry 也要走同一条规则，否则配置写 float64、库里仍读 2 个寄存器。"""
+        self.assertEqual(registry._data_type_for(None), EnergyMeter.DATA_TYPE_DEFAULT)
+        self.assertEqual(registry._data_type_for("float64"), "float64")
+        with self.assertRaises(ValueError):
+            registry._data_type_for("float128")

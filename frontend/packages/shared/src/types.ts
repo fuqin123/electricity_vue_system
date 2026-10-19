@@ -315,6 +315,42 @@ export interface LineMaster {
  *   ③ 最近状态（lastValue / lastOk / todayUsage）—— 便于现场核对。
  * 与后端 `apps/energy/api.py` 的 `meter_json()` **一一对应**，改一边必须改另一边。
  */
+/**
+ * 寄存器数据类型（v1.5.3）。
+ *
+ * 它同时决定两件事，且是**唯一真值来源**：
+ *   ① 拼出来是整数还是浮点数；
+ *   ② 要读几个寄存器（16 位→1、32 位→2、64 位→4）。
+ * 后端 `registers` 列是由它推导的兼容镜像，前端不要手填。
+ */
+export type MeterDataType =
+  | 'uint16'
+  | 'int16'
+  | 'uint32'
+  | 'int32'
+  | 'float32'
+  | 'float64';
+
+/** 数据类型 → 寄存器个数（与后端 `EnergyMeter.REGISTERS_BY_TYPE` 一致，仅用于界面提示） */
+export const REGISTERS_BY_DATA_TYPE: Record<MeterDataType, number> = {
+  uint16: 1,
+  int16: 1,
+  uint32: 2,
+  int32: 2,
+  float32: 2,
+  float64: 4
+};
+
+/** 数据类型下拉的可选项（界面与提示文案的唯一来源） */
+export const METER_DATA_TYPE_OPTIONS: { value: MeterDataType; label: string }[] = [
+  { value: 'uint16', label: '16 位无符号整数（1 个寄存器）' },
+  { value: 'int16', label: '16 位有符号整数（1 个寄存器）' },
+  { value: 'uint32', label: '32 位无符号整数（2 个寄存器）' },
+  { value: 'int32', label: '32 位有符号整数（2 个寄存器）' },
+  { value: 'float32', label: '32 位浮点数 IEEE754（2 个寄存器）' },
+  { value: 'float64', label: '64 位双精度 IEEE754 / double（4 个寄存器）' }
+];
+
 export interface MeterPoint {
   /* ① 列表展示 */
   id: number;
@@ -339,8 +375,23 @@ export interface MeterPoint {
   slave: number | null;
   /** 寄存器起始地址（串口服务器类型必填） */
   register: number | null;
+  /**
+   * 寄存器数量（v1.5.3 起是**推导值**，由 `dataType` 决定，后端保存时自动同步）。
+   * 界面上只读展示，不要当作可编辑项 —— 手填会与读取长度冲突，
+   * 而冲突的后果是「读少了寄存器」：不报错，只给出一个荒谬的读数。
+   */
   registers: number;
   funcCode: number;
+  /**
+   * 寄存器数据类型（v1.5.3）。决定拼出整数还是浮点数，以及要读几个寄存器。
+   *
+   * ⚠ 现场并非所有表都是 32 位整数：碳水市政水表是 **IEEE754 双精度（float64）**，
+   *   按 uint32 拼出来的是一个完全无关的大整数（不报错，只是数字荒谬）。
+   */
+  dataType: MeterDataType;
+  /** 单个寄存器内部的字节序；与 `wordOrder` 共同决定 ABCD / CDAB / BADC / DCBA 四种排布 */
+  byteOrder: 'big' | 'little';
+  /** 字序（寄存器之间）：big 高字在前（ABCD）/ little 低字在前（CDAB） */
   wordOrder: 'big' | 'little';
   /** HTTP API 类型的接口路径 */
   urlPath: string;

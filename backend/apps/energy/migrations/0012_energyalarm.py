@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('energy', '0010_v152_gateway_test_evidence'),
+        ('energy', '0011_v153_meter_data_type'),
     ]
 
     operations = [

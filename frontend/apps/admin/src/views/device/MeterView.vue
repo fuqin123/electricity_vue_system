@@ -15,7 +15,7 @@
  */
 import { computed, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { adminApi, type Gateway, type LineMaster, type MeterPoint } from '@eep/shared';
+import { adminApi, METER_DATA_TYPE_OPTIONS, REGISTERS_BY_DATA_TYPE, type Gateway, type LineMaster, type MeterDataType, type MeterPoint } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
@@ -52,6 +52,8 @@ const columns: TableColumn<MeterPoint>[] = [
   { prop: 'lineCode', label: '所属产线', width: 92 },
   { prop: 'gatewayCode', label: '网关', width: 116 },
   { prop: 'address', label: '地址 / 从站 / 寄存器', minWidth: 260 },
+  // v1.5.3：数据类型直接列出来 —— 读数离谱时第一件事就是核对这一格
+  { prop: 'dataType', label: '数据类型', width: 96 },
   { prop: 'factor', label: '倍率', width: 74, mono: true },
   { prop: 'unit', label: '单位', width: 66 },
   { prop: 'lastValue', label: '最近累计值', width: 130, mono: true, formatter: (r) => fmtNum(r.lastValue) },
@@ -83,7 +85,9 @@ function blankForm() {
     gatewayId: null as number | null,
     slave: 1 as number | null,
     register: 1000 as number | null,
-    registers: 2,
+    // 默认 = 现场既有口径（32 位无符号整数、高字在前、寄存器内大端）＝ 13 块电表的读法
+    dataType: 'uint32' as MeterDataType,
+    byteOrder: 'big' as MeterPoint['byteOrder'],
     funcCode: 3,
     wordOrder: 'big' as MeterPoint['wordOrder'],
     urlPath: '',
@@ -135,9 +139,20 @@ function defaultNodeCode(): string {
 const currentGateway = computed(() => gateways.value.find((g) => g.id === form.gatewayId) ?? null);
 const isModbus = computed(() => currentGateway.value?.kind !== 'http_api');
 
-/** 类别与单位联动：换类别时给一个合理默认值，避免忘填单位 */
-const UNIT_BY_KIND: Record<MeterPoint['kind'], string> = { elec: 'kWh', water: 't', steam: 't' };
+/**
+ * 类别与单位联动：换类别时给一个合理默认值，避免忘填单位。
+ *
+ * ⚠ 水的单位是 **m³**（不是 t）—— 与后端 `EnergyType.DEFAULT_UNIT` 保持一致。
+ *   市政水表的读数就是体积；写成 t 等于给它安了一个它没有的物理量
+ *   （质量要另经密度换算，本项目没有这一步）。
+ */
+const UNIT_BY_KIND: Record<MeterPoint['kind'], string> = { elec: 'kWh', water: 'm³', steam: 't' };
 const CATEGORY_BY_KIND: Record<MeterPoint['kind'], string> = { elec: '电', water: '水', steam: '汽' };
+
+/** 数据类型 → 寄存器个数（只读展示；真值在后端，见 MeterPoint.registers 的说明） */
+function registersOf(t: MeterDataType): number {
+  return REGISTERS_BY_DATA_TYPE[t] ?? 2;
+}
 
 function openCreate() {
   Object.assign(form, blankForm());
@@ -160,7 +175,9 @@ function openEdit(row: MeterPoint) {
     gatewayId: row.gatewayId,
     slave: row.slave,
     register: row.register,
-    registers: row.registers,
+    // 老数据可能没有 dataType（接口未升级时），兜到既有口径，避免表单显示空白
+    dataType: (row.dataType ?? 'uint32') as MeterDataType,
+    byteOrder: row.byteOrder ?? 'big',
     funcCode: row.funcCode,
     wordOrder: row.wordOrder,
     urlPath: row.urlPath,
@@ -221,7 +238,9 @@ async function submit() {
         gatewayId: form.gatewayId,
         slave: form.slave,
         register: form.register,
-        registers: form.registers,
+        // ⚠ 不提交 registers：它是后端由 dataType 推导的镜像列（手填会与读取长度冲突）
+        dataType: form.dataType,
+        byteOrder: form.byteOrder,
         funcCode: form.funcCode,
         wordOrder: form.wordOrder,
         urlPath: form.urlPath.trim(),
@@ -447,11 +466,23 @@ void (async () => {
           </el-form-item>
           <el-form-item label="寄存器地址" required>
             <el-input-number v-model="form.register" :min="0" :max="65535" controls-position="right" />
-            <span class="form-hint">累计值起始地址（现场当前为 1000）</span>
+            <span class="form-hint">累计值起始地址（现场电表多为 1000，市政水表为 68）</span>
+          </el-form-item>
+          <!-- ★ v1.5.3：数据类型决定「拼出整数还是浮点」与「读几个寄存器」 -->
+          <el-form-item label="数据类型" required>
+            <el-select v-model="form.dataType" style="width: 100%">
+              <el-option
+                v-for="opt in METER_DATA_TYPE_OPTIONS"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
           </el-form-item>
           <el-form-item label="寄存器数量">
-            <el-input-number v-model="form.registers" :min="1" :max="10" controls-position="right" />
-            <span class="form-hint">32 位累计值填 2</span>
+            <!-- 推导值：由「数据类型」决定，只读展示（后端保存时同步），避免与读取长度冲突 -->
+            <el-input :model-value="String(registersOf(form.dataType))" disabled style="width: 140px" />
+            <span class="form-hint">由数据类型推导，无需手填</span>
           </el-form-item>
           <el-form-item label="功能码">
             <el-select v-model="form.funcCode" style="width: 200px">
@@ -459,11 +490,16 @@ void (async () => {
               <el-option :value="4" label="04 读输入寄存器" />
             </el-select>
           </el-form-item>
-          <el-form-item label="32 位字序">
-            <el-radio-group v-model="form.wordOrder">
-              <el-radio-button value="big">高字在前（常用）</el-radio-button>
-              <el-radio-button value="little">低字在前</el-radio-button>
-            </el-radio-group>
+          <el-form-item label="字序 / 字节序">
+            <el-select v-model="form.wordOrder" style="width: 170px">
+              <el-option value="big" label="高字在前（ABCD，常用）" />
+              <el-option value="little" label="低字在前（CDAB）" />
+            </el-select>
+            <el-select v-model="form.byteOrder" style="width: 170px; margin-left: 8px">
+              <el-option value="big" label="寄存器内大端（AB）" />
+              <el-option value="little" label="寄存器内小端（BA）" />
+            </el-select>
+            <span class="form-hint">现场电表与市政水表均为「高字在前 + 大端」</span>
           </el-form-item>
         </template>
 
