@@ -2657,6 +2657,95 @@ class AlarmEngineTests(TestCase):
             )
 
 
+class CoverageAlarmTests(TestCase):
+    """覆盖率告警只能基于「日终结算后重算过」的日汇总行（B-553）。
+
+    日结算是每天 00:30 写的，而那只是「到此刻」的快照；凌晨 00:01 的采集
+    评估如果直接读它，就会把所有计量数据误报成「昨日仅结算 0/24」。
+    另一面：真实缺数的告警不能因为换了一天就自动变成「已恢复」。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(
+            line_code="A9", line_name="九线", node_type=ProductionLine.NODE_LINE
+        )
+        cls.etype = etype()
+
+    def _daily(self, day, covered, computed_at):
+        """造一条日汇总行，并把 auto_now 的 computed_at 改成指定时刻。"""
+        row = EnergyDaily.objects.create(
+            line=self.line,
+            energy_type=self.etype,
+            stat_date=day,
+            consumption=None,
+            unit="kWh",
+            covered_count=covered,
+            expected_count=24,
+            quality=(
+                EnergyDaily.Q_OK
+                if covered >= 24
+                else (EnergyDaily.Q_MISSING if covered == 0 else EnergyDaily.Q_PARTIAL)
+            ),
+        )
+        EnergyDaily.objects.filter(pk=row.pk).update(computed_at=computed_at)
+        return row
+
+    def _evaluate(self, now):
+        return alerts.evaluate(now=now, categories={EnergyAlarm.CAT_COVERAGE})
+
+    def _alarm(self):
+        return EnergyAlarm.objects.get(
+            code=f"COVERAGE:2026-09-22:{self.line.id}:{self.etype.id}"
+        )
+
+    def test_结算前读到当天快照不产生覆盖率告警(self):
+        """09-22 00:30 写的当天快照（0/24）在次日凌晨还不是结论。"""
+        self._daily(datetime(2026, 9, 22).date(), 0, datetime(2026, 9, 22, 0, 30))
+        self._evaluate(datetime(2026, 9, 23, 0, 1, 44))
+        self.assertFalse(
+            EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_COVERAGE).exists(),
+            "日终后还没重算过的日行只是当天快照，不能据此报「昨日少算了 24 小时」",
+        )
+
+    def test_零点后结算时刻前重算的快照也不报(self):
+        """rollup 容器在 00:10 重启会立刻补跑一次，但昨天的边界读数可能还没到。
+
+        此时日行已经是「今天写的」，只按日期会误以为它是对完整一天的结论；
+        门槛必须落在 00:30 的固定结算时刻。
+        """
+        self._daily(datetime(2026, 9, 22).date(), 23, datetime(2026, 9, 23, 0, 10))
+        self._evaluate(datetime(2026, 9, 23, 0, 11))
+        self.assertFalse(
+            EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_COVERAGE).exists(),
+            "00:30 前重启触发的结算仍可能缺最后一小时，不能当成日终结论",
+        )
+
+    def test_日终后重算仍缺数才产生覆盖率告警(self):
+        self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 0, 30))
+        self._evaluate(datetime(2026, 9, 23, 0, 31))
+        alarm = self._alarm()
+        self.assertEqual(alarm.value, "18/24")
+        self.assertEqual(alarm.threshold, "24/24")
+        self.assertIn("少 6 个小时", alarm.content)
+
+    def test_真实缺数告警不会被换日误恢复(self):
+        """数据没补回来，告警不能因为规则改看新的一天就自愈。"""
+        self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 0, 30))
+        self._evaluate(datetime(2026, 9, 23, 0, 31))
+        self._evaluate(datetime(2026, 9, 24, 0, 1))
+        self.assertEqual(self._alarm().status, EnergyAlarm.STATUS_ACTIVE)
+
+    def test_缺数补齐后才会自动恢复(self):
+        row = self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 0, 30))
+        self._evaluate(datetime(2026, 9, 23, 0, 31))
+        EnergyDaily.objects.filter(pk=row.pk).update(
+            covered_count=24, quality=EnergyDaily.Q_OK, computed_at=datetime(2026, 9, 23, 12, 0)
+        )
+        self._evaluate(datetime(2026, 9, 24, 0, 1))
+        self.assertEqual(self._alarm().status, EnergyAlarm.STATUS_RESOLVED)
+
+
 class ProductionIngestTests(TestCase):
     """产量入库命令的字段名回归测试。
 

@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.5.4 ｜ 最后更新：2026-10-16
+> 版本：v1.5.5 ｜ 最后更新：2026-10-22
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -972,7 +972,7 @@ Authorization: Bearer <token>
 | `gateway_offline` | 该网关最近一轮点位**全部失败**（0/N）。⚠ 与网关列表页的「在线」徽标是两件事 | critical |
 | `collect_stale` | 最新成功读数超过 `collect.stale_alert_hours` 未更新，或尚无任何数据 | critical |
 | `hour_quality` | 近 24 小时出现 `reset`（换表/清零）或 `spike`（尖峰）。**不含 missing** —— 缺数由覆盖率与采集失败覆盖，重复报会把告警页刷成流水账 | major |
-| `coverage_low` | 昨日日汇总 `covered_count < expected_count`，即日合计少算了若干小时 | minor |
+| `coverage_low` | 昨日日汇总 `covered_count < expected_count`，即日合计少算了若干小时。**只判日终结算后重算过的行**（`computed_at` ≥ 次日 00:30）：00:30 结算前的当天快照不是结论（含 00:00–00:30 重启触发的补跑）；仍挂着的历史告警所属日期也会一并复核，避免换日被误判为恢复（B-553） | minor |
 
 ⚠ **操作审计日志尚未实现**：契约原先要求「确认必须写审计日志」，而操作日志表还没建，
 所以 `ack` 目前只写 `acked_by` / `acked_at` 两列。接口实现处有同样的注释，

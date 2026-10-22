@@ -52,7 +52,7 @@ MySQL 首次建数据卷要 30~60 秒，期间 backend 会停在「等待数据�
 cd deploy/docker
 cp .env.example .env            # build 阶段 compose 也要校验必填项
 ./build-offline-bundle.sh
-# 产物：dist/eep-docker-bundle-v1.5.4-<日期>.tar.gz
+# 产物：dist/eep-docker-bundle-v1.5.5-<日期>.tar.gz
 # Docker Hub 不通时加加速前缀（只影响 mysql 这类公共基础镜像）：
 #   REGISTRY_MIRROR=docker.m.daocloud.io ./build-offline-bundle.sh
 ```

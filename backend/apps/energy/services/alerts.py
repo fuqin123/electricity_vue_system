@@ -28,7 +28,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date as date_cls
+from datetime import datetime, time, timedelta
 
 from django.db import transaction
 from django.db.models import Count, Max
@@ -54,6 +55,12 @@ QUALITY_LOOKBACK_HOURS = 24
 #: 单轮最多落多少条同规则告警。现场 30 多块表，正常量级在个位数；
 #: 设上限是为了「采集整体停摆」时不要一次灌进几百条把告警页埋掉。
 MAX_PER_RULE = 50
+
+#: 日终结算时刻。覆盖率规则只认在此之后重算过的日汇总行：00:30 是 EEP-Rollup
+#: 的固定结算点，也是跨日边界读数重试后最迟落库的时刻。不能只要求「过了零点」——
+#: rollup 容器在 00:00–00:30 之间重启会立刻补跑一次 summarize，那一刻昨天的
+#: 最后一小时（等今天 00:xx 的边界读数）可能还没算出来，日行同样是残缺快照。
+COVERAGE_SETTLED_AT = time(0, 30)
 
 
 def _fmt(dt: datetime | None) -> str:
@@ -264,36 +271,69 @@ def _rule_stale(col: _Collector, now: datetime) -> None:
         )
 
 
+def _coverage_days(now: datetime) -> set[date_cls]:
+    """本轮要复核的日汇总日期：昨天 + 仍挂着的覆盖率告警所属日期。
+
+    只复核昨天会让「换日」变成一次隐式恢复：某天真实缺数 6 小时，第二天凌晨
+    规则改看新的一天，旧告警从 live 集合里消失、被标成已恢复 —— 但数据并没有
+    被补回来。把仍挂着的历史日期一起复核，恢复才代表问题真的修好了。
+    """
+    days = {(now - timedelta(days=1)).date()}
+    codes = EnergyAlarm.objects.filter(
+        category=EnergyAlarm.CAT_COVERAGE,
+        status__in=(EnergyAlarm.STATUS_ACTIVE, EnergyAlarm.STATUS_ACKED),
+    ).values_list("code", flat=True)
+    for code in codes:
+        # code = COVERAGE:YYYY-MM-DD:line_id:energy_type_id
+        parts = code.split(":")
+        if len(parts) != 4:
+            continue
+        try:
+            days.add(datetime.strptime(parts[1], "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    return days
+
+
 def _rule_coverage(col: _Collector, now: datetime) -> None:
     """已结算周期（昨天）覆盖率不足 —— 日合计里少算了几个小时。
 
     为什么不靠小时级告警代替：小时告警会随下一轮采集自愈，而「昨天只结算到
     18/24 小时」是既成事实，那个偏小的日合计会一直留在报表里。
 
-    只判昨天及更早：今天还在走，覆盖率天然不满，报了就是噪音。
+    只判已经「在日终结算后重算过」的日行：`refresh_rollups` 每天 00:30 会写一条
+    当天行，那只是「到此刻」的快照（当天刚起步时就是 0/24）。次日 00:30 之前
+    采集侧每轮都会评估告警，若直接读这一行，每天凌晨都会把所有计量数据误报成
+    「昨日仅结算 0/24」，半小时后又自动恢复 —— 告警页会变成日历（B-553）。
+    `computed_at` 是「这一行最后一次被重算」的时间，只有它晚于次日 00:30 的
+    结算时刻，这一行才是对完整一天的结算结果（门槛为什么不取零点，见
+    `COVERAGE_SETTLED_AT` 的说明）。
     """
-    yesterday = (now - timedelta(days=1)).date()
-    rows = EnergyDaily.objects.filter(stat_date=yesterday).select_related("energy_type", "line")
-    for r in rows:
-        expected = int(r.expected_count or 0)
-        covered = int(r.covered_count or 0)
-        if expected <= 0 or covered >= expected:
-            continue
-        name = r.energy_type.type_name if r.energy_type_id else "能源"
-        where = r.line.line_name if r.line_id else "全厂"
-        col.add(
-            EnergyAlarm.CAT_COVERAGE,
-            f"COVERAGE:{r.stat_date:%Y-%m-%d}:{r.line_id or 'ALL'}:{r.energy_type_id}",
-            level=EnergyAlarm.LEVEL_MINOR,
-            source=f"{where} · {name}",
-            content=(
-                f"{where}的{name}昨日仅结算 {covered}/{expected} 小时，"
-                f"日合计比真实值少 {expected - covered} 个小时"
-            ),
-            value=f"{covered}/{expected}",
-            threshold=f"{expected}/{expected}",
-            line_id=r.line_id,
-        )
+    for day in sorted(_coverage_days(now)):
+        settled_after = datetime.combine(day + timedelta(days=1), COVERAGE_SETTLED_AT)
+        rows = EnergyDaily.objects.filter(stat_date=day).select_related("energy_type", "line")
+        for r in rows:
+            if r.computed_at is None or r.computed_at < settled_after:
+                continue
+            expected = int(r.expected_count or 0)
+            covered = int(r.covered_count or 0)
+            if expected <= 0 or covered >= expected:
+                continue
+            name = r.energy_type.type_name if r.energy_type_id else "能源"
+            where = r.line.line_name if r.line_id else "全厂"
+            col.add(
+                EnergyAlarm.CAT_COVERAGE,
+                f"COVERAGE:{r.stat_date:%Y-%m-%d}:{r.line_id or 'ALL'}:{r.energy_type_id}",
+                level=EnergyAlarm.LEVEL_MINOR,
+                source=f"{where} · {name}",
+                content=(
+                    f"{where}的{name}昨日仅结算 {covered}/{expected} 小时，"
+                    f"日合计比真实值少 {expected - covered} 个小时"
+                ),
+                value=f"{covered}/{expected}",
+                threshold=f"{expected}/{expected}",
+                line_id=r.line_id,
+            )
 
 
 # ── 入口 ────────────────────────────────────────────────────
