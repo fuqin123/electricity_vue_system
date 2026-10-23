@@ -132,22 +132,17 @@ services:
       - -c
       - |
         interval=$${EEP_COLLECT_INTERVAL:-300}
-        # 启动先试一轮：已经过了本小时的采样点就立刻补（保持原行为）；
-        # 未到点则跳过，再对齐到下一个 interval 刻度（整 5 分钟）。
+        # 启动先试一轮：已经过了本小时的采样点就立刻补（保持原行为）。
         python manage.py collect --aggregate --if-due || true
-        # 对齐后，同一份代码下测试环境把 hourly_offset_seconds 设为 600，
-        # 就会在第一个 :10 刻度采集；生产保持原偏移、每 5 分钟一轮，互不撞点。
-        now=$$(date +%s)
-        next=$$(( (now / interval + 1) * interval ))
-        sleep $$((next - now))
+        # 之后**每一轮都对齐到下一个 interval 刻度**（整 5 分钟）。
+        # 同一份代码下：测试环境 hourly_offset_seconds=600 会在 :10 采；
+        # 生产保持原偏移、每 5 分钟一轮。失败也只在下一个刻度重试，
+        # 避免测试环境对同一批设备每分钟重试、和生产抢通讯。
         while true; do
-          if python manage.py collect --aggregate --if-due; then
-            sleep $$interval
-          else
-            # 一轮失败不能干等一个周期：数据库短暂抖动时错过整点就丢一小时数据。
-            # 重试间隔可配，测试环境设 300，避免对同一批设备高频重试。
-            sleep $${EEP_COLLECT_RETRY_INTERVAL:-60}
-          fi
+          now=$$(date +%s)
+          next=$$(( (now / interval + 1) * interval ))
+          sleep $$((next - now))
+          python manage.py collect --aggregate --if-due || true
         done
     volumes:
       - *eep-settings-mount
