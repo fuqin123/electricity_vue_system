@@ -20,6 +20,25 @@ from ..models import EnergyGateway, EnergyMeter, EnergyType, ProductionLine
 
 logger = logging.getLogger(__name__)
 
+#: v1.6.0 产线编号迁移的**过渡别名**：现场挂载的 settings.local.yaml 可能还是
+#: 旧的 A1—A6，而库里已经原地改成 W 码。seed 时先归一化，避免按旧码新建
+#: 6 条线、把历史留在旧 id 上。新配置应直接写 W 码；别名不改变 API / 前端口径。
+LINE_CODE_ALIASES = {
+    "A1": "W103",
+    "A2": "W101",
+    "A3": "W102",
+    "A4": "W301",
+    "A5": "W104",
+    "A6": "W105",
+}
+
+
+def normalize_line_code(code: str | None) -> str | None:
+    if code is None:
+        return None
+    text = str(code)
+    return LINE_CODE_ALIASES.get(text.upper(), text)
+
 
 def _dec(value, default="1") -> Decimal:
     try:
@@ -141,7 +160,7 @@ def sync_registry(*, force: bool = False) -> dict:
     for item in conf.get("lines", []) or []:
         parent = _find_workshop(item.get("workshop"))
         ProductionLine.objects.update_or_create(
-            line_code=item["code"],
+            line_code=normalize_line_code(item["code"]),
             defaults={
                 "line_name": item.get("name", item["code"]),
                 "node_type": ProductionLine.NODE_LINE,
@@ -278,19 +297,20 @@ def _resolve_node(item: dict, line_map: dict[str, ProductionLine]) -> Production
     ⚠ `node` 是新写法，现场接口表里辅机类的「线别」列写的是设备组合名
       （「1号高压机+3台低压机…」），不是一个产线编码，必须能挂到 aux 节点上。
     """
-    node_code = item.get("node")
+    node_code = normalize_line_code(item.get("node"))
     if node_code:
         node = line_map.get(node_code) or ProductionLine.objects.filter(line_code=node_code).first()
         if node is None:
             raise ValueError(f"计量点 {item.get('code')} 引用了不存在的节点：{node_code}")
         return node
 
-    if item.get("line"):
-        line = line_map.get(item["line"]) or ProductionLine.objects.filter(
-            line_code=item["line"]
+    line_code = normalize_line_code(item.get("line"))
+    if line_code:
+        line = line_map.get(line_code) or ProductionLine.objects.filter(
+            line_code=line_code
         ).first()
         if line is None:
-            raise ValueError(f"计量点 {item.get('code')} 引用了不存在的产线：{item['line']}")
+            raise ValueError(f"计量点 {item.get('code')} 引用了不存在的产线：{line_code}")
         return line
 
     if item.get("scope") == EnergyMeter.SCOPE_WORKSHOP:

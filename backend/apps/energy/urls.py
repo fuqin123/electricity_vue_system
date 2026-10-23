@@ -43,6 +43,7 @@ _ADMIN_ROUTES = [
     ("alarms/<int:pk>/ack", api.admin_alarm_ack, "admin-alarm-ack"),
     ("params", api.admin_params, "admin-params"),
     ("params/<int:pk>", api.admin_param_detail, "admin-param-detail"),
+    ("standard-units", api.admin_standard_units, "admin-standard-units"),
     ("gateways", api.admin_gateways, "admin-gateways"),
     ("gateways/<int:pk>", api.admin_gateway_detail, "admin-gateway-detail"),
     ("gateways/<int:pk>/test", api.admin_gateway_test, "admin-gateway-test"),

@@ -102,7 +102,7 @@ class ProductionLine(models.Model):
         既有代码全按它分支，多车间上线时不必逐处改。
       · `node_type`  —— **新分类字段**，三值：
           `workshop` 车间（碳水车间 / 制造车间）—— 挂车间总表
-          `line`     产线（A1—A6）—— 挂生产线电表，参与产量与达成率
+          `line`     产线（W103 / W101 / W102 / W301 / W104 / W105）—— 挂生产线电表，参与产量与达成率
           `aux`      辅助计量单元（辅机 / 瓶胚 / 调配）—— 挂辅机类电表，
                      **不参与**产量与分摊分母，但属于车间合计
       两者由 `sync_line_type()` 保持一致（`node_type='workshop' ⟺ line_type='workshop'`），
@@ -869,6 +869,48 @@ class SystemParam(models.Model):
     def number(self) -> Decimal | None:
         """取值：未标定为 None（调用方必须区分 None 与 0）。"""
         return self.value
+
+
+class StandardUnitConsumption(models.Model):
+    """标准单耗：按**产线 × 能源类型**维护，单位统一为「能源单位 / 千瓶」。
+
+    为什么要独立一张表，而不是塞进 SystemParam：
+      · 参数键会随产线增删而漂移（`std.W103.electric`），既没有外键也没有
+        组合唯一约束，删一条产线后旧键会永久留在参数表里；
+      · 前后端都需要稳定的「线 × 能源」矩阵，外键 + unique(line, energy_type)
+        才表达得了这件事。
+    成本单价 / 箱规仍留在 SystemParam（它们是全厂参数，不是按线参数）。
+
+    `value = NULL` 表示**未标定**，与 0 是两回事：界面显示 `--`，不要画成 0。
+    水 / 汽目前只有车间总表，没有分线实测；这两列仍允许配置（为后续分线计量
+    留位置），但界面必须标注「无分线实测」。
+    """
+
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.CASCADE, related_name="standard_units", verbose_name="产线"
+    )
+    energy_type = models.ForeignKey(
+        EnergyType, on_delete=models.CASCADE, related_name="standard_units", verbose_name="能源类型"
+    )
+    value = models.DecimalField(
+        "标准单耗", max_digits=14, decimal_places=4, null=True, blank=True,
+        help_text="每千瓶消耗量；NULL=未标定",
+    )
+    remark = models.CharField("说明", max_length=200, blank=True, default="")
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+    updated_by = models.CharField("更新人", max_length=32, blank=True, default="")
+
+    class Meta:
+        db_table = "energy_standard_unit"
+        ordering = ["line__sort", "line__line_code", "energy_type__type_code"]
+        verbose_name = "标准单耗"
+        verbose_name_plural = "标准单耗"
+        constraints = [
+            models.UniqueConstraint(fields=("line", "energy_type"), name="uniq_standard_line_energy"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.line.line_code} {self.energy_type.type_code}={self.value}"
 
 
 class EnergyAlarm(models.Model):

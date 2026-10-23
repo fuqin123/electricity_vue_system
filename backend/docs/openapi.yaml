@@ -92,8 +92,8 @@ paths:
           description: 产线编号
           schema:
             type: string
-            example: A1
-            enum: [A1, A2, A3, A4, A5, A6]
+            example: W103
+            enum: [W103, W101, W102, W301, W104, W105]
       responses:
         '200':
           description: 成功
@@ -139,7 +139,7 @@ paths:
                   type: object
                   required: [lineId, hour, reported]
                   properties:
-                    lineId: { type: string, example: A1 }
+                    lineId: { type: string, example: W103 }
                     hour: { type: integer, minimum: 0, maximum: 23, example: 9 }
                     output: { type: integer, nullable: true, description: 产量（瓶） }
                     kwh: { type: number, nullable: true, description: 电量（kWh） }
@@ -633,7 +633,9 @@ components:
       type: object
       required: [hour, future]
       properties:
-        hour: { type: integer, minimum: 0, maximum: 23 }
+        hour: { type: integer, minimum: 0, maximum: 23, description: '生产日序号：0=06:00，18=次日00:00' }
+        clock: { type: integer, minimum: 0, maximum: 23, description: '实际时钟小时' }
+        dayOffset: { type: integer, enum: [0, 1], description: '1=次日 00—05' }
         output:
           type: integer
           nullable: true
@@ -678,17 +680,18 @@ components:
       required: [level, text, time]
       properties:
         level: { type: string, enum: [err, warn, info], description: 'err 严重 / warn 警告 / info 提示' }
-        text: { type: string, example: 'A4 线本小时预计产量 16.6 千瓶，低于额定 75%' }
+        text: { type: string, example: '四线本小时预计产量 16.6 千瓶，低于额定 75%' }
         time: { type: string, example: '09:00:00' }
 
     LineData:
       type: object
       required: [id, name, rated, product, status, hours, today, yesterday, daily30, heat, heatDays, month, year, dayOfYear]
       properties:
-        id: { type: string, example: A1 }
-        name: { type: string, example: 'A1 生产线' }
+        id: { type: string, example: W103 }
+        name: { type: string, example: '一线' }
         rated: { type: integer, description: 额定产能（瓶/小时）, example: 30000 }
         product: { type: string, example: '冰红茶 500ml' }
+        standardUnitKwh: { type: number, nullable: true, description: '标准电单耗 kWh/千瓶；未标定为 null', example: 8.2 }
         status:
           type: string
           enum: [running, slow, stopped]
@@ -697,7 +700,7 @@ components:
         dayOfYear: { type: integer, example: 265 }
         hours:
           type: array
-          description: 长度固定 24，下标 = 小时
+          description: '长度固定 24，下标 = 生产日序号（0=06:00）'
           items: { $ref: '#/components/schemas/HourPoint' }
         today:
           type: object
@@ -796,11 +799,11 @@ components:
           properties:
             water: { $ref: '#/components/schemas/UtilityMetric' }
             steam: { $ref: '#/components/schemas/UtilityMetric' }
-        targetUnitKwh: { type: number, example: 8.2 }
+        targetUnitKwh: { type: number, nullable: true, example: 8.2 }
         alerts:
           type: array
           items: { $ref: '#/components/schemas/AlertItem' }
-        currentHour: { type: integer, minimum: 0, maximum: 23 }
+        currentHour: { type: integer, minimum: 0, maximum: 23, description: '生产日序号锚点（0=06:00）' }
 
     EnergySnapshot:
       type: object
@@ -915,8 +918,8 @@ components:
       required: [id, code, name, rated]
       properties:
         id: { type: integer }
-        code: { type: string, example: A1 }
-        name: { type: string, example: 'A1 生产线' }
+        code: { type: string, example: W103 }
+        name: { type: string, example: '一线' }
         product: { type: string, example: '冰红茶 500ml' }
         rated: { type: integer, example: 30000 }
         workshop: { type: string, example: 灌装一车间 }
@@ -978,7 +981,7 @@ components:
         id: { type: integer }
         code: { type: string, example: ALM-20260922-0001 }
         level: { type: string, enum: [critical, major, minor, info] }
-        source: { type: string, example: 'A4 生产线' }
+        source: { type: string, example: '四线' }
         content: { type: string, example: 单位电耗超告警上限 }
         value: { type: string, description: 触发值。承载字符串以兼容「+12.4%」等非纯数值 }
         threshold: { type: string, description: 阈值 }

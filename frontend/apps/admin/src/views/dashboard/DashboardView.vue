@@ -25,6 +25,7 @@ import {
   big,
   energyApi,
   int,
+  productionDayStart,
   type AdminOverview,
   type DashboardResult,
   type DashboardEnergyBlock
@@ -45,7 +46,8 @@ function fmt(d: Date): string {
 
 function defaultRange(): [string, string] {
   const now = new Date();
-  return [fmt(new Date(now.getFullYear(), now.getMonth(), now.getDate())), fmt(now)];
+  // 生产日 06:00 → 现在；06:00 前 productionDayStart 会退到前一天 06:00
+  return [fmt(productionDayStart(now)), fmt(now)];
 }
 
 const range = ref<[string, string]>(defaultRange());
@@ -56,7 +58,7 @@ const overview = ref<AdminOverview | null>(null);
 
 const QUICK: { label: string; span: number; gran: 'hour' | 'day' }[] = [
   { label: '本小时起', span: 0, gran: 'hour' },
-  { label: '今日', span: 0, gran: 'hour' },
+  { label: '本生产日', span: 0, gran: 'hour' },
   { label: '近 3 日', span: 3, gran: 'hour' },
   { label: '近 30 日', span: 30, gran: 'day' }
 ];
@@ -66,7 +68,7 @@ function applyQuick(q: (typeof QUICK)[number]) {
   if (q.label === '本小时起') {
     range.value = [fmt(now), fmt(now)];
   } else if (q.span === 0) {
-    range.value = [fmt(new Date(now.getFullYear(), now.getMonth(), now.getDate())), fmt(now)];
+    range.value = [fmt(productionDayStart(now)), fmt(now)];
   } else {
     const from = new Date(now.getTime() - q.span * 86400000);
     range.value = [fmt(from), fmt(now)];
@@ -181,7 +183,7 @@ const steamOption = computed(() => {
 });
 
 const compareOption = computed(() =>
-  overview.value ? unitKwhCompareOption(overview.value.lineUnitKwh, 8.2) : null
+  overview.value ? unitKwhCompareOption(overview.value.lineUnitKwh, overview.value.targetUnitKwh) : null
 );
 
 /** 区间覆盖度：累计值吃进了几格可信数据（中断过的区间必须看得出来） */
@@ -357,7 +359,7 @@ const costNote = computed(() => {
       <div class="card">
         <div class="card__head">
           <h3 class="card__title">各产线单位电耗对标</h3>
-          <span class="card__extra">目标 8.20 kWh/千瓶</span>
+          <span class="card__extra">{{ overview?.targetUnitKwh == null ? '标准未标定' : `车间目标 ${overview.targetUnitKwh.toFixed(2)} kWh/千瓶` }}</span>
         </div>
         <ChartPanel v-if="!loading" title="" :option="compareOption" :height="260" class="chart-inner" />
         <el-skeleton v-else :rows="5" animated />

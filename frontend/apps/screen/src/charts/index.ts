@@ -4,7 +4,6 @@
  */
 import * as echarts from 'echarts';
 import {
-  energyModel,
   hexA,
   HOUR_QUALITY_LABEL,
   int as fmtInt,
@@ -162,7 +161,7 @@ function pickRows(
   return scope.yearly5;
 }
 function pickLabels(scope: { hours: HourPoint[] }, dim: TrendDim, rows: TrendRow[]): string[] {
-  if (dim === '时') return scope.hours.map((x) => `${pad2(x.hour)}:00`);
+  if (dim === '时') return scope.hours.map((x) => `${pad2(x.clock)}:00`);
   return rows.map((x) => x.label ?? '');
 }
 
@@ -241,8 +240,8 @@ export function overviewTrendOption(ws: WorkshopData, dim: TrendDim): echarts.EC
  * 大屏一 · 六条产线横向对比
  *
  * ⚠ 与单线趋势图同一套自适应口径（ADR-013）：
- *   · 产量已接入 → 条长＝今日产量（万瓶），右侧标单位电耗；
- *   · 产量未接入 → 条长＝今日用电量（kWh），右侧标「用电量 · 占车间合计比例」。
+ *   · 产量已接入 → 条长＝本生产日产量（万瓶），右侧标单位电耗；
+ *   · 产量未接入 → 条长＝本生产日用电量（kWh），右侧标「用电量 · 占车间合计比例」。
  * 原来只画产量：产量为 null 时柱子长度 0，**右侧标签也随柱子一起不渲染**，
  * 于是 958px 宽的面板只有最左边 40px 有线名，看起来像「图没对齐边界 / 图坏了」（B-515）。
  * 缺数时给「--」而不是把整条抹掉。
@@ -252,7 +251,7 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
   /** 条长用的原始值 */
   const raw = (l: LineData): number | null => (byOutput ? l.today.output : l.today.kwh);
   const ls = [...ws.lines].sort((a, b) => (raw(a) ?? 0) - (raw(b) ?? 0));
-  const cats = ls.map((l) => `${l.id} 线`);
+  const cats = ls.map((l) => l.name || l.id);
   /** 车间合计（只累加有可信值的线），用于「占车间」 */
   const kwhTotal = ws.lines.reduce((a, l) => a + (l.today.kwh ?? 0), 0);
   const data = ls.map((l) => {
@@ -280,12 +279,12 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
         return (
           `<b style="color:#fff">${(p as { name: string }).name}</b><br>` +
           (byOutput
-            ? `今日产量：<b style="font-family:monospace">${n(d.value, ' 万瓶')}</b><br>` +
+            ? `本生产日产量：<b style="font-family:monospace">${n(d.value, ' 万瓶')}</b><br>` +
               `计划产量：<b style="font-family:monospace">${n(d.plan, ' 万瓶')}</b><br>` +
               `达成率：<b style="font-family:monospace">${d.rate}%</b><br>`
-            : `今日用电：<b style="font-family:monospace">${n(d.kwh, ' kWh')}</b><br>` +
+            : `本生产日用电：<b style="font-family:monospace">${n(d.kwh, ' kWh')}</b><br>` +
               `占车间合计：<b style="font-family:monospace">${n(d.share, '%')}</b><br>` +
-              `今日产量：<b style="font-family:monospace">--</b>（产量未接入）<br>`) +
+              `本生产日产量：<b style="font-family:monospace">--</b>（产量未接入）<br>`) +
           `单位电耗：<b style="font-family:monospace">${d.unitKwh === null ? '--' : d.unitKwh.toFixed(2)}</b> kWh/千瓶`
         );
       }
@@ -340,13 +339,13 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
 }
 
 /* ══════════════════════════════════════════════════════════
-   今日分时产量与电耗（已产出实心 / 未到时段描边）
+   本生产日分时产量与电耗（已产出实心 / 未到时段描边）
    ══════════════════════════════════════════════════════════ */
 export function todayChartOption(hours: HourPoint[], ratedTotal: number, currentHour: number): echarts.EChartsOption {
-  const cats = hours.map((x) => pad2(x.hour));
-  const out = hours.map((x, i) => {
+  const cats = hours.map((x) => pad2(x.clock));
+  const out = hours.map((x) => {
     if (x.future) {
-      const plan = Math.round(ratedTotal * PLAN_RATE * PROFILE[i]);
+      const plan = Math.round(ratedTotal * PLAN_RATE * PROFILE[x.clock]);
       return {
         value: +(plan / 1000).toFixed(1),
         itemStyle: {
@@ -522,7 +521,7 @@ export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsO
   const outUnit = t.outUnit;
   const kwhUnit = t.kwhUnit;
   const hasUnitKwh = uq.some((v) => v !== null && v !== undefined);
-  const target = energyModel.targetUnitKwh;
+  const target = line.standardUnitKwh;
   const range = unitKwhRange(uq);
 
   /** 第二条曲线的名称 / 单位 / 数据（自适应） */
@@ -608,13 +607,13 @@ export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsO
                 [1, hexA(P.amber, 0)]
               ])
             },
-        markLine: hasUnitKwh
+        markLine: hasUnitKwh && target !== null
           ? {
               silent: true,
               symbol: 'none',
               lineStyle: { color: hexA(P.green, 0.55), type: [4, 4], width: 1.4 },
               data: [{ yAxis: target, name: '目标' }],
-              label: { color: P.green, fontSize: 9, position: 'insideEndTop', formatter: `目标 ${target}` }
+              label: { color: P.green, fontSize: 9, position: 'insideEndTop', formatter: `标准 ${target}` }
             }
           : undefined
       }
@@ -627,7 +626,7 @@ export function lineTrendOption(line: LineData, dim: TrendDim): echarts.EChartsO
    ══════════════════════════════════════════════════════════ */
 export function lineHeatmapOption(line: LineData): echarts.EChartsOption {
   const hours: string[] = [];
-  for (let i = 0; i < 24; i++) hours.push(pad2(i));
+  for (let i = 0; i < 24; i++) hours.push(pad2((6 + i) % 24));
   const daysAsc = [...line.heatDays].reverse(); // ECharts y 轴自下而上
   const data: [number, number, number][] = [];
   let max = 0;
@@ -648,7 +647,7 @@ export function lineHeatmapOption(line: LineData): echarts.EChartsOption {
       formatter: (p: unknown) => {
         const v = (p as { value: [number, number, number] }).value;
         return (
-          `<b style="color:#c9d0f5">${daysAsc[v[1]]}  ${pad2(v[0])}:00</b><br>` +
+          `<b style="color:#c9d0f5">${daysAsc[v[1]]}  ${hours[v[0]]}:00</b><br>` +
           `产量：<b style="font-family:monospace">${fmtInt(v[2] * 100)}</b> 瓶`
         );
       }

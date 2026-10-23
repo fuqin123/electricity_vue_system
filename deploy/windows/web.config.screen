@@ -5,7 +5,7 @@
 
   放置位置：C:\inetpub\eep\screen\web.config
 
-  大屏使用 hash 路由（#/overview、#/line/A1），
+  大屏使用 hash 路由（#/overview、#/line/W103），
   服务端**不需要任何 rewrite**，本文件只做 MIME 与缓存优化。
   ══════════════════════════════════════════════════════════════
 -->

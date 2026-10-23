@@ -5,7 +5,7 @@
  * 因此每次变更都必须写入操作审计日志。
  */
 import { onMounted, ref } from 'vue';
-import { adminApi, energyModel, thresholds, type PageQuery, type PageResult, type SysParam } from '@eep/shared';
+import { adminApi, thresholds, type PageQuery, type PageResult, type SysParam } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
@@ -49,7 +49,7 @@ const rows = ref<RuleRow[]>([
   { id: 7, code: 'R-UNIT-KWH-HIGH', name: '单位电耗超上限', target: '产线 / 车间', condition: `单位电耗 > ${thresholds.unitKwhHigh.toFixed(2)} kWh/千瓶`, level: '严重', levelType: 'danger', enabled: false, impl: '待产量接入' },
   { id: 8, code: 'R-OUTPUT-LOW', name: '本小时低产', target: '产线', condition: `整点预期产量 < 额定的 ${Math.round(thresholds.outputLowRate * 100)}%`, level: '警告', levelType: 'warning', enabled: false, impl: '待产量接入' },
   { id: 9, code: 'R-ZERO-OUTPUT', name: '整点无产量', target: '产线', condition: '整点产量 = 0 且电表有读数', level: '警告', levelType: 'warning', enabled: false, impl: '待产量接入' },
-  { id: 10, code: 'R-TARGET-DEV', name: '单位电耗偏离目标', target: '车间合计', condition: `单位电耗 > 目标 ${energyModel.targetUnitKwh.toFixed(2)} 的 105%`, level: '提示', levelType: 'info', enabled: false, impl: '待产量接入' }
+  { id: 10, code: 'R-TARGET-DEV', name: '单位电耗偏离目标', target: '车间合计', condition: '单位电耗 > 按线标准单耗的 105%', level: '提示', levelType: 'info', enabled: false, impl: '待产量接入' }
 ]);
 
 const columns: TableColumn[] = [

@@ -52,7 +52,7 @@ MySQL 首次建数据卷要 30~60 秒，期间 backend 会停在「等待数据�
 cd deploy/docker
 cp .env.example .env            # build 阶段 compose 也要校验必填项
 ./build-offline-bundle.sh
-# 产物：dist/eep-docker-bundle-v1.5.5-<日期>.tar.gz
+# 产物：dist/eep-docker-bundle-v1.6.0-<日期>.tar.gz
 # Docker Hub 不通时加加速前缀（只影响 mysql 这类公共基础镜像）：
 #   REGISTRY_MIRROR=docker.m.daocloud.io ./build-offline-bundle.sh
 ```
@@ -110,7 +110,7 @@ curl -s http://127.0.0.1:8080/api/admin/alarms?status=active | head -c 200
 
 # ⑦ 周期结算是否跑过（漏了它，大屏「近 30 日 / 近 12 月」会静默停在最后一次结算那天）
 docker compose logs --tail=6 rollup
-#    期望看到「滚动窗口结算完成…：N 条」与「[rollup] 距下次结算还有 N 分钟」
+#    期望看到「滚动窗口结算完成…：N 条」与「[rollup] 距下次结算还有 N 分钟」（生产日 06:00 结束后，06:30 结算）
 ```
 
 ---
@@ -131,6 +131,11 @@ docker compose build frontend && docker compose up -d frontend
 docker compose down          # 停容器，保留数据卷
 docker volume rm eep_mysql-data   # ← 真要把库删掉才执行（名字以 docker volume ls 为准）
 ```
+
+# v1.6.0 生产日口径升级：迁移后必须重算一次汇总（源小时数据不动）
+docker compose exec backend python manage.py migrate
+docker compose exec backend python manage.py rebuild_summaries --dry-run   # 先看范围
+docker compose exec backend python manage.py rebuild_summaries
 
 备份只有一个要紧的东西 —— 数据库：
 
@@ -161,7 +166,7 @@ docker exec eep-mysql sh -c 'exec mysqldump --single-transaction --no-tablespace
    单独起这三个服务时 compose 不会去碰 mysql。）
 3. 库不存在且账号有 `CREATE` 权限时，entrypoint 会自动建库（utf8mb4）；
    没权限就报一行明确的中文提示，让你先建库。
-4. 老库升级：`docker compose exec backend ./manage.py migrate`。
+4. 老库升级：`docker compose exec backend python manage.py migrate`。
 
 ⚠ 用外部 MySQL 时，`--default-time-zone=+08:00` 这条就不成立了。
 本系统 `USE_TZ=False`，时间字段按**本地朴素时间**读写，所以那台 MySQL 所在

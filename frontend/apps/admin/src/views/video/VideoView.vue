@@ -263,7 +263,7 @@ onMounted(() => {
         <el-descriptions-item label="⑤ 新增产线摄像头">
           先在 <span class="t-mono">go2rtc.yaml</span> 的 <span class="t-mono">streams</span> 下加一行
           （如 <span class="t-mono">a2: rtsp://...</span>），重启网关；
-          再把 <span class="t-mono">config.ts → videoConfig.channels.A2</span> 的
+          再把 <span class="t-mono">config.ts → videoConfig.channels.W101</span> 的
           <span class="t-mono">stream</span> 改为 <span class="t-mono">a2</span>、
           <span class="t-mono">enabled</span> 置为 <span class="t-mono">true</span>
         </el-descriptions-item>

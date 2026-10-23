@@ -44,6 +44,7 @@ from ..models import (
     ProductionHourly,
     ProductionLine,
 )
+from . import business_day as B
 from . import coverage as C
 
 logger = logging.getLogger(__name__)
@@ -88,21 +89,9 @@ def make_key(dim: str, day: date_cls) -> str:
     return day.strftime("%Y")
 
 
-def _hours_in(start: date_cls, end: date_cls, now: datetime) -> int:
-    """周期内**应该**有多少个小时（进行中的周期只算已经过去的部分）。"""
-    last = min(end, now.date())
-    if last < start:
-        return 0
-    hours = (last - start).days * 24
-    if last == now.date():
-        hours += now.hour + 1
-    else:
-        hours += 24
-    return hours
-
-
 def _days_in(start: date_cls, end: date_cls, now: datetime) -> int:
-    last = min(end, now.date())
+    """周期内应该有多少个生产日（进行中的周期只算已经开始的那些）。"""
+    last = min(end, B.production_day(now))
     if last < start:
         return 0
     return (last - start).days + 1
@@ -111,6 +100,28 @@ def _days_in(start: date_cls, end: date_cls, now: datetime) -> int:
 # ══════════════════════════════════════════════════════════════
 #  写：生成汇总行
 # ══════════════════════════════════════════════════════════════
+
+
+def production_total(
+    lines: list[ProductionLine], start: datetime, end: datetime, *, include_demo: bool = False
+) -> Decimal | None:
+    """生产日窗口内的产量合计（与电量窗口同一套 06:00—06:00 边界）。
+
+    默认排除演示占位；没有可信记录时返回 None，而不是 0。
+    """
+    if not lines:
+        return None
+    qs = ProductionHourly.objects.filter(
+        B.hour_q(start, end),
+        line__in=lines,
+        quality__in=ProductionHourly.TRUSTED,
+    )
+    if not include_demo:
+        qs = qs.exclude(
+            source__in=(ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE)
+        )
+    total = qs.aggregate(t=Sum("output"))["t"]
+    return Decimal(total) if total is not None else None
 
 
 def _quality_from(covered: int, expected: int) -> str:
@@ -138,11 +149,12 @@ def _period_value(dim: str, start: date_cls) -> object:
     return start.year
 
 
-def _elec_metrics(lines: list[ProductionLine], start: date_cls, end: date_cls) -> tuple[Decimal | None, int]:
-    """一组产线的电量合计，以及「所有电表都有可信数据」的小时数。
+def _elec_metrics(lines: list[ProductionLine], start: datetime, end: datetime) -> tuple[Decimal | None, int]:
+    """一组产线在生产日窗口内的电量合计，以及「所有电表都有可信数据」的小时数。
 
     「齐全」= 那个小时上这组产线**每一块电表**都有可信的小时行。
     只要有一块表缺数，这个小时就不算 covered —— 与小时级「宁可空白」的口径一致。
+    `start/end` 是生产日窗口（06:00 起止），不是自然日期。
     """
     meter_qs = EnergyMeter.objects.filter(
         line__in=lines, energy_type__type_code=EnergyType.ELECTRIC, enabled=True
@@ -151,9 +163,8 @@ def _elec_metrics(lines: list[ProductionLine], start: date_cls, end: date_cls) -
     if n_meters == 0:
         return None, 0
     rows = EnergyHourly.objects.filter(
+        B.hour_q(start, end),
         meter__in=meter_qs,
-        stat_date__gte=start,
-        stat_date__lte=end,
         quality__in=EnergyHourly.TRUSTED,
     )
     total = rows.aggregate(t=Sum("consumption"))["t"]
@@ -163,17 +174,13 @@ def _elec_metrics(lines: list[ProductionLine], start: date_cls, end: date_cls) -
     return (Decimal(total) if total is not None else None), covered
 
 
-def _one_type_metrics(meter: EnergyMeter, start: date_cls, end: date_cls) -> tuple[Decimal | None, int]:
-    """单个计量点（车间水/汽总表）在某周期的合计与覆盖小时数。"""
-
-    def _calc(s: date_cls, e: date_cls) -> tuple[Decimal | None, int]:
-        rows = EnergyHourly.objects.filter(
-            meter=meter, stat_date__gte=s, stat_date__lte=e, quality__in=EnergyHourly.TRUSTED
-        )
-        total = rows.aggregate(t=Sum("consumption"))["t"]
-        return (Decimal(total) if total is not None else None), rows.count()
-
-    return _calc(start, end)
+def _one_type_metrics(meter: EnergyMeter, start: datetime, end: datetime) -> tuple[Decimal | None, int]:
+    """单个计量点（车间水/汽总表）在生产日窗口内的合计与覆盖小时数。"""
+    rows = EnergyHourly.objects.filter(
+        B.hour_q(start, end), meter=meter, quality__in=EnergyHourly.TRUSTED
+    )
+    total = rows.aggregate(t=Sum("consumption"))["t"]
+    return (Decimal(total) if total is not None else None), rows.count()
 
 
 def _upsert(model, line: ProductionLine, etype: EnergyType, dim: str, start: date_cls, **fields) -> str:
@@ -189,12 +196,14 @@ def _upsert(model, line: ProductionLine, etype: EnergyType, dim: str, start: dat
 
 
 def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
-    """生成（或刷新）某一天的全部汇总行：每条产线 + 车间行 × 每种能源。
+    """生成（或刷新）某个**生产日**的全部汇总行：每条产线 + 车间行 × 每种能源。
 
+    `day` 是生产日开始日期；数据窗口 = 当天 06:00 → 次日 06:00（24 小时）。
     数据源是 `energy_hourly`（只取 quality=ok）。
     **不是**「日末读数 − 日初读数」—— 那样会静默吞掉采集中断的小时。
     """
     now = now or datetime.now()
+    window_start, window_end = B.day_start(day), B.day_end(day)
     # ⚠ 不能用 `.all()`：多车间后表里有 workshop / aux 节点，
     #   它们不是产线，逐条写「产线汇总行」会产出无意义的行（B-519 那类漏改）。
     #   车间级水/汽由下面的 workshop 分支单独处理。
@@ -217,7 +226,7 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                 total = Decimal(0)
                 covered = 0
                 for m in meters:
-                    sub_total, sub_covered = _one_type_metrics(m, day, day)
+                    sub_total, sub_covered = _one_type_metrics(m, window_start, window_end)
                     if sub_total is None:
                         total = None
                         covered = 0
@@ -241,7 +250,7 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
 
         # ── 产线节点：电力 ──
         for line in lines:
-            total, covered = _elec_metrics([line], day, day)
+            total, covered = _elec_metrics([line], window_start, window_end)
             etype = types.get(EnergyType.ELECTRIC)
             if etype is not None:
                 written.append(
@@ -263,7 +272,7 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
         # 挂到 aux 节点自己名下，这样「车间合计 = 产线 + 辅机」可以直接由
         # 本车间所有节点的日行相加得出，不必在查询时特判。
         for aux in ProductionLine.objects.filter(node_type=ProductionLine.NODE_AUX):
-            total, covered = _elec_metrics([aux], day, day)
+            total, covered = _elec_metrics([aux], window_start, window_end)
             etype = types.get(EnergyType.ELECTRIC)
             if etype is not None:
                 written.append(
@@ -329,43 +338,67 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
 
 
 def refresh_rollups(now: datetime | None = None) -> list[str]:
-    """**每天一次**的周期结算窗口：昨天 + 今天 + 近 2 月 + 今年。
+    """**每天一次**的周期结算窗口：上一个生产日 + 当前生产日 + 近 2 月 + 近 2 年。
 
-    入口是 `manage.py summarize --rollup`（建议配 00:30 的计划任务），
-    采集侧不再每小时刷（v1.4.2）。
+    入口是 `manage.py summarize --rollup`，计划任务固定在 **06:30**：
+    生产日 D 到 D+1 06:00 才结束，最后一小时要等 06:xx 的跨日边界读数，
+    00:30 已经不可能结算完整一天（v1.6.0）。
 
-    ⚠ 为什么必须带上昨天（B-523）：昨天 23 点的差值要等**今天 00:04** 采到
-    跨日边界读数才算得出来，而那一刻 `now.date()` 已经是今天了。
-    以前只刷今天，每一天的日总计都永远停在 23 个小时上
-    （实测 09-25/26/27 覆盖数恒为 23，日合计 377.4 对不上小时表的 385.5），
-    月 / 年又是按日行累加的，于是三个尺度一起偏小 —— 而大屏读的正是汇总表，
-    后台读的是小时表，两边就永远差最后一小时。
+    ⚠ 为什么必须带上上一个生产日（B-523）：D 的 05—06 点差值要等 D+1 06:xx
+    采到跨日边界读数才算得出来。只刷当前生产日会让每一天的日总计永远停在
+    23 个小时上，月 / 年按日行累加后三个尺度一起偏小。
+
+    `recent_years(2)` 而不是 1：1 月 1 日 06:30 结算时，刚结束的 12 月 31 日
+    属于**上一年**，只刷今年会把上一年的年行漏掉。
 
     返回写过的周期键列表（供命令打印条数）。
     """
     now = now or datetime.now()
+    current = B.production_day(now)
     written: list[str] = []
-    for d in (now.date() - timedelta(days=1), now.date()):
+    for d in (current - timedelta(days=1), current):
         written += summarize_days(d, now)
     written += summarize_periods(DIM_MONTH, recent_months(2, now), now)
-    written += summarize_periods(DIM_YEAR, recent_years(1, now), now)
+    written += summarize_periods(DIM_YEAR, recent_years(2, now), now)
     return written
 
 
+def refresh_just_closed_day(now: datetime | None = None) -> int:
+    """06:00—08:00 的采集轮次里，把刚结束的生产日重新结算一次。
+
+    06:30 的 rollup 是主结算；但如果 06:00 的跨日边界读数晚到（采集重试），
+    06:30 那次会得到 23/24，而日行要到下一个 06:30 才会再重算 —— 覆盖率告警
+    会挂一整天。这里在边界读数陆续到达的窗口内补算一次，让告警能在下一轮
+    评估时自动恢复。只重算一天，成本可忽略；08:00 后停止，避免整天反复写。
+    """
+    now = now or datetime.now()
+    if not (B.DAY_START_HOUR <= now.hour < B.DAY_START_HOUR + 2):
+        return 0
+    prev = B.production_day(now) - timedelta(days=1)
+    rows = list(EnergyDaily.objects.filter(stat_date=prev))
+    if rows and all(int(r.covered_count or 0) >= int(r.expected_count or 0) for r in rows):
+        return 0
+    written = summarize_days(prev, now)
+    logger.info("补算刚结束的生产日 %s：%s 条", prev, len(written))
+    return len(written)
+
+
 def recent_days(count: int, now: datetime | None = None) -> list[date_cls]:
-    """近 count 天（含今天），**时间正序**（末项 = 今天）。
+    """近 count 个生产日（含当前生产日），**时间正序**（末项 = 当前生产日）。
 
     ⚠ 顺序不能反：X 轴是「从左往右读时间」，倒序会把今天放在最左边（B-512）。
     """
     now = now or datetime.now()
-    return [now.date() - timedelta(days=i) for i in reversed(range(count))]
+    current = B.production_day(now)
+    return [current - timedelta(days=i) for i in reversed(range(count))]
 
 
 def recent_months(count: int, now: datetime | None = None) -> list[date_cls]:
-    """近 count 个月（含当月），返回每月第一天，**时间正序**。"""
+    """近 count 个月（含当前生产日所在月），返回每月第一天，**时间正序**。"""
     now = now or datetime.now()
+    anchor = B.production_day(now)
     out: list[date_cls] = []
-    y, m = now.year, now.month
+    y, m = anchor.year, anchor.month
     for _ in range(count):
         out.append(date_cls(y, m, 1))
         m -= 1
@@ -375,9 +408,10 @@ def recent_months(count: int, now: datetime | None = None) -> list[date_cls]:
 
 
 def recent_years(count: int, now: datetime | None = None) -> list[date_cls]:
-    """近 count 年（含今年），返回每年 1 月 1 日，**时间正序**。"""
+    """近 count 年（含当前生产日所在年），返回每年 1 月 1 日，**时间正序**。"""
     now = now or datetime.now()
-    return [date_cls(now.year - i, 1, 1) for i in reversed(range(count))]
+    year = B.production_day(now).year
+    return [date_cls(year - i, 1, 1) for i in reversed(range(count))]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -438,11 +472,11 @@ def _workshops() -> list[ProductionLine]:
 
 
 def _day_not_settled(dim: str, start: date_cls, now: datetime) -> bool:
-    """这个日级周期是否属于「可能还没被每日结算写完整」的那两天（今天 / 昨天）。
+    """这个日级周期是否属于「可能还没被每日结算写完整」的两个生产日。
 
-    每天 00:30 才结算昨天，所以 **00:00—00:30 这段时间里昨天的日行还是前天 00:30
-    写下的残缺值**（大屏刚跨零点翻页，「昨天那一根」就会先空一晚）。
-    只对今天与昨天开放「行不完整就现算」的回退，更早的周期一律读表 ——
+    每天 06:30 才结算上一个生产日，所以 **06:00—06:30 这段时间里上一个生产日
+    的日行还是前一天 06:30 写下的残缺值**（大屏刚翻页，「昨天那一根」会先空一格）。
+    只对当前与上一个生产日开放「行不完整就现算」的回退，更早的周期一律读表 ——
     回退一次要扫小时表，把它限制在两个周期内，`daily30` 这种长序列的成本才不会涨。
 
     另一层用处：`EEP-Rollup` 计划任务没注册或跑失败时，这里是**退化成现算**
@@ -450,7 +484,7 @@ def _day_not_settled(dim: str, start: date_cls, now: datetime) -> bool:
     """
     if dim != DIM_DAY:
         return False
-    return start >= now.date() - timedelta(days=1)
+    return start >= B.production_day(now) - timedelta(days=1)
 
 
 def is_open_period(dim: str, key: str, now: datetime | None = None) -> bool:
@@ -464,7 +498,7 @@ def is_open_period(dim: str, key: str, now: datetime | None = None) -> bool:
     未来的小时在 `energy_hourly` 里本来就没有行，现算出来的天然就是「截至此刻」。
     """
     now = now or datetime.now()
-    return make_key(dim, now.date()) == key
+    return make_key(dim, B.production_day(now)) == key
 
 
 def period_rows(
@@ -505,8 +539,11 @@ def period_rows(
 
     for key in keys:
         start, end = period_bounds(dim, key)
+        window_start, window_end = B.period_window(dim, key)
         open_period = is_open_period(dim, key, now)
-        expected = _hours_in(start, end, now) if dim == DIM_DAY else _days_in(start, end, now)
+        expected = (
+            B.started_hours(start, now) if dim == DIM_DAY else _days_in(start, end, now)
+        )
         # 每日结算（00:30）还没把「昨天」写完整的那段时间里，昨天也按当期现算 ——
         # 否则大屏零点后「昨天那一根」会先空一晚（见 _day_not_settled 的说明）
         unsettled_yesterday = _day_not_settled(dim, start, now)
@@ -518,7 +555,7 @@ def period_rows(
             quality = Q_MISSING
         elif open_period:
             # 当期：从小时表现算。已结束的周期才允许读汇总表（汇总表是每日结算的产物）
-            kwh, covered = _elec_metrics(agg_lines, start, end)
+            kwh, covered = _elec_metrics(agg_lines, window_start, window_end)
             quality = _quality_from(covered, expected)
         else:
             if dim == DIM_DAY:
@@ -542,7 +579,7 @@ def period_rows(
             # 昨天 / 今天还没被每日结算写完整 → 退回小时表现算（见 _day_not_settled）
             live_fallback = unsettled_yesterday and covered < expected
             if live_fallback:
-                kwh, covered = _elec_metrics(agg_lines, start, end)
+                kwh, covered = _elec_metrics(agg_lines, window_start, window_end)
             quality = _quality_from(covered, expected)
 
         # ── 水 / 汽（只有车间级有）──
@@ -572,7 +609,7 @@ def period_rows(
                         # 从未接入的那块先排除，否则它会永久否决本车间
                         subtotal = None
                         for m in C.participating(meters):
-                            v = _one_type_metrics(m, start, end)[0]
+                            v = _one_type_metrics(m, window_start, window_end)[0]
                             if v is None:
                                 subtotal = None
                                 break
@@ -612,17 +649,9 @@ def period_rows(
                         steam = total_val
 
         # ── 产量（不在汇总表里，按区间现算；24 行/天/线，开销可忽略）──
-        output = None
-        if agg_lines:
-            prod = ProductionHourly.objects.filter(
-                line__in=agg_lines,
-                stat_date__gte=start,
-                stat_date__lte=end,
-                quality__in=ProductionHourly.TRUSTED,
-            ).aggregate(t=Sum("output"))["t"]
-            # 没有**真实**产量记录时给 None（不是 0）：
-            # 0 表示「确实产出为 0」，None 表示「还没接入/没有可信记录」，语义相反。
-            output = Decimal(prod) if prod is not None else None
+        output = production_total(agg_lines, window_start, window_end, include_demo=True)
+        # 没有**真实**产量记录时给 None（不是 0）：
+        # 0 表示「确实产出为 0」，None 表示「还没接入/没有可信记录」，语义相反。
 
         unit_kwh = None
         if kwh is not None and output is not None and output > 0:

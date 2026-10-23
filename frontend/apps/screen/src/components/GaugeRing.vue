@@ -8,14 +8,16 @@ import { computed } from 'vue';
 
 const props = defineProps<{
   actual: number;
-  target: number;
+  target: number | null;
   yesterday: number;
 }>();
 
 const R = 58;
 const CIRC = 2 * Math.PI * R;
 
-const score = computed(() => (props.actual > 0 ? Math.min(props.target / props.actual, 1) : 0));
+const score = computed(() =>
+  props.actual > 0 && props.target !== null ? Math.min(props.target / props.actual, 1) : 0
+);
 
 const dashArray = computed(() => {
   const s = CIRC * score.value;
@@ -23,6 +25,7 @@ const dashArray = computed(() => {
 });
 
 const strokeColor = computed(() => {
+  if (props.target === null) return '';
   const band = props.target * 0.01;
   if (props.actual > props.target * 1.08) return '#ec48bd';
   if (props.actual > props.target + band) return '#ffb020';

@@ -38,6 +38,7 @@ from ..models import (
     ProductionHourly,
     ProductionLine,
 )
+from . import business_day as B
 from . import cost
 from . import coverage as C
 from . import summary as S
@@ -86,16 +87,22 @@ def parse_hour(raw: str | None, *, default: datetime) -> datetime:
     raise ValueError(f"时间格式无法解析：{raw}（期望 YYYY-MM-DD 或 YYYY-MM-DD HH）")
 
 
-def parse_hours(request) -> tuple[datetime, datetime]:
+def parse_hours(
+    request,
+    *,
+    default_start: datetime | None = None,
+    default_end: datetime | None = None,
+) -> tuple[datetime, datetime]:
     """取**精确到小时**的起止时点，缺省为「今天 00:00 → 现在」。
 
     与 `parse_range` 的区别只在精度：这里返回 datetime，调用方可以按小时裁桶。
     起止会被规范到整点（分秒归零），因为本项目的最小时间桶就是 1 小时。
+    用量查询会显式传入「当前生产日 06:00」作为缺省起点；仪表读数等
+    与生产日无关的查询仍沿用自然日缺省。
     """
     now = datetime.now()
-    today = now.date()
-    default_start = datetime.combine(today, time.min)
-    default_end = now.replace(minute=0, second=0, microsecond=0)
+    default_start = default_start or datetime.combine(now.date(), time.min)
+    default_end = default_end or now.replace(minute=0, second=0, microsecond=0)
     try:
         start = parse_hour(request.GET.get("from"), default=default_start)
         end = parse_hour(request.GET.get("to"), default=default_end)
@@ -148,7 +155,7 @@ def meters_of(
       workshop   车间编码（WS-CARB）—— 含该车间下的产线与辅助单元
       usage_type 用能类型（生产线用电 / 辅机用电 …）
       device     设备名，与 `node_code` 一起构成第三级
-      node_code  组织节点编码（产线 A1 / 辅助单元 AUX-CARB-AIR / 车间 WS-CARB）
+      node_code  组织节点编码（产线 W103 / 辅助单元 AUX-CARB-AIR / 车间 WS-CARB）
       kind       能源短码或编码；不传则不限
 
     ⚠ 任何一个维度都不传时就是不限（而不是「匹配空串」）—— 否则界面清空下拉
@@ -185,7 +192,7 @@ def _utility_hour_series_for(
     """给定一组计量点的小时序列（水/汽用）。"""
     if not meters:
         return [None for _ in buckets]
-    mat = _hour_matrix(meters, buckets, start, end)
+    mat = _hour_matrix(meters, buckets)
     return [_round(mat[b][0]) for b in buckets]
 
 
@@ -245,6 +252,8 @@ def _hour_labels(
     out: list[tuple[date_cls, int]] = []
     d = start
     while d <= end:
+        if d > now.date():
+            break
         last_hour = now.hour if d == now.date() else 23
         if d == now.date() and now.hour == 0:
             last_hour = 0
@@ -264,8 +273,6 @@ def _hour_labels(
 def _hour_matrix(
     meters: list[EnergyMeter],
     buckets: list[tuple[date_cls, int]],
-    start: date_cls,
-    end: date_cls,
     *,
     first_ok: dict[int, datetime] | None = None,
 ):
@@ -291,8 +298,10 @@ def _hour_matrix(
         # 整组一块都没接入过：不是「缺数」，是「还没接」
         return {b: (None, Q_UNCONNECTED) for b in buckets}
 
+    first_dt = datetime.combine(buckets[0][0], time(buckets[0][1]))
+    last_dt = datetime.combine(buckets[-1][0], time(buckets[-1][1])) + timedelta(hours=1)
     rows = EnergyHourly.objects.filter(
-        meter_id__in=connected, stat_date__gte=start, stat_date__lte=end
+        B.hour_q(first_dt, last_dt), meter_id__in=connected
     ).values("stat_date", "stat_hour", "consumption", "quality", "meter_id")
 
     grouped: dict[tuple[date_cls, int], list[dict]] = {}
@@ -336,20 +345,21 @@ def _summary_series(dim: str, scope: str, line: ProductionLine | None, keys: lis
 
 
 def _period_keys(dim: str, start: date_cls, end: date_cls, now: datetime) -> list[tuple[str, str]]:
-    """返回 [(period_key, label)]。进行中的周期只到「现在」为止。"""
+    """返回 [(period_key, label)]。日 / 月键都按**生产日**，进行中的周期只到「现在」。"""
     out: list[tuple[str, str]] = []
+    current = B.production_day(now)
     if dim == PeriodSummary.DIM_DAY:
         d = start
         while d <= end:
-            if d > now.date():
+            if d > current:
                 break
             out.append((d.strftime("%Y-%m-%d"), d.strftime("%m-%d")))
             d += timedelta(days=1)
         return out
 
-    # 月：从起始月枚举到结束月
+    # 月：从起始月枚举到当前生产日所在月
     y, m = start.year, start.month
-    while (y, m) <= (end.year, end.month):
+    while (y, m) <= (end.year, end.month) and (y, m) <= (current.year, current.month):
         out.append((f"{y}-{m:02d}", f"{y}-{m:02d}"))
         m += 1
         if m > 12:
@@ -358,11 +368,28 @@ def _period_keys(dim: str, start: date_cls, end: date_cls, now: datetime) -> lis
     return out
 
 
-def _range_total_kwh(
-    meters: list[EnergyMeter],
+def _query_window(
+    granularity: str,
     start: date_cls,
     end: date_cls,
-    now: datetime | None = None,
+    *,
+    klist: list[str] | None = None,
+    hour_buckets: list[tuple[date_cls, int]] | None = None,
+) -> tuple[datetime, datetime]:
+    """本次查询对应的生产日实际窗口（[start, end)）。"""
+    if hour_buckets:
+        first = datetime.combine(hour_buckets[0][0], time(hour_buckets[0][1]))
+        last = datetime.combine(hour_buckets[-1][0], time(hour_buckets[-1][1])) + timedelta(hours=1)
+        return first, last
+    if granularity == "month" and klist:
+        return B.period_window("month", klist[0])[0], B.period_window("month", klist[-1])[1]
+    return B.day_start(start), B.day_end(end)
+
+
+def _range_total_kwh(
+    meters: list[EnergyMeter],
+    start: datetime | None = None,
+    end: datetime | None = None,
     *,
     buckets: list[tuple[date_cls, int]] | None = None,
     first_ok: dict[int, datetime] | None = None,
@@ -385,11 +412,12 @@ def _range_total_kwh(
     if not meters:
         return None
     if buckets is None:
-        now = now or datetime.combine(end, time.max)
-        buckets = _hour_labels(start, end, now)
+        if start is None or end is None:
+            return None
+        buckets = B.window_hours(start, end)
     if not buckets:
         return None
-    mat = _hour_matrix(meters, buckets, start, end, first_ok=first_ok)
+    mat = _hour_matrix(meters, buckets, first_ok=first_ok)
     total = Decimal(0)
     for b in buckets:
         val, _q = mat[b]
@@ -400,10 +428,12 @@ def _range_total_kwh(
     return total
 
 
-def _range_output(lines: list[ProductionLine], start: date_cls, end: date_cls) -> Decimal:
+def _range_output(lines: list[ProductionLine], start: datetime, end: datetime) -> Decimal:
     total = (
         ProductionHourly.objects.filter(
-            line__in=lines, stat_date__gte=start, stat_date__lte=end, quality__in=ProductionHourly.TRUSTED
+            B.hour_q(start, end),
+            line__in=lines,
+            quality__in=ProductionHourly.TRUSTED,
         )
         .exclude(source__in=DEMO_SOURCES)
         .aggregate(t=Sum("output"))["t"]
@@ -431,14 +461,14 @@ def _utility_series(
 
     out: list[float | None] = []
     for key, _label in keys:
-        s, e = S.period_bounds(dim, key)
+        start, end = B.period_window(dim, key)
         row = _summary_series(dim, PeriodSummary.SCOPE_WORKSHOP, None, [key]).get(key)
         if row is not None:
             val = row.water_t if kind == EnergyType.WATER else row.steam_t
             out.append(float(val) if val is not None else None)
             continue
         agg = EnergyHourly.objects.filter(
-            meter__in=meters, stat_date__gte=s, stat_date__lte=min(e, now.date()), quality__in=EnergyHourly.TRUSTED
+            B.hour_q(start, end), meter__in=meters, quality__in=EnergyHourly.TRUSTED
         ).aggregate(t=Sum("consumption"))
         out.append(float(agg["t"]) if agg["t"] is not None else None)
     return out
@@ -489,6 +519,10 @@ def usage_range(
     else:
         granularity = "day"
         dim = PeriodSummary.DIM_DAY
+    # 小时桶按绝对时钟时间走（生产日只是把 06—次日05 归到同一个日桶），
+    # 所以起点/终点日期要取实际时间端点，而不是生产日键。
+    hour_start = start_at.date() if start_at else start
+    hour_end = end_at.date() if end_at else end
 
     # ── 焦点通道 ──
     # 两种情形都走「按点位集合直接取数、只出一条序列」：
@@ -507,6 +541,7 @@ def usage_range(
     labels: list[str] = []
     series: list[dict] = []
     quality_series: list[str] | None = None
+    klist: list[str] = []
 
     # ── 车间 ──
     want_workshop = scope in ("workshop", "all") and not focused
@@ -518,7 +553,7 @@ def usage_range(
         buckets: list[tuple[date_cls, int]] = []
         klist: list[str] = []
         if granularity == "hour":
-            buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at, closed_only=True)
+            buckets = _hour_labels(hour_start, hour_end, now, start_at=start_at, end_at=end_at, closed_only=True)
             hour_buckets = buckets
             labels = [f"{d:%m-%d} {h:02d}" for d, h in buckets]
         else:
@@ -538,18 +573,18 @@ def usage_range(
             # 单位按能源类型定，不看「排序后的第一块表」
             unit = unit_of(gm)
             if granularity == "hour":
-                mat = _hour_matrix(gm, buckets, start, end, first_ok=first_ok)
+                mat = _hour_matrix(gm, buckets, first_ok=first_ok)
                 vals: list[float | None] = [_round_for(unit, mat[b][0]) for b in buckets]
                 if code == EnergyType.ELECTRIC:
                     quality_series = [mat[b][1] for b in buckets]
             else:
                 vals = []
                 for k in klist:
-                    s, e = S.period_bounds(dim, k)
+                    start_dt, end_dt = B.period_window(dim, k)
                     vals.append(
                         _round_for(
                             unit,
-                            _range_total_kwh(gm, s, min(e, now.date()), first_ok=first_ok),
+                            _range_total_kwh(gm, start_dt, end_dt, first_ok=first_ok),
                         )
                     )
             series.append(
@@ -569,11 +604,17 @@ def usage_range(
                 util["steam"] = vals
 
         # 电量合计只按电表算 —— 把水/汽的 m³ 累加进 kWh 是量纲错误
+        win_start, win_end = _query_window(
+            granularity, start, end, klist=klist, hour_buckets=hour_buckets
+        )
         elec_meters = groups.get(EnergyType.ELECTRIC, [])
         kwh_total = (
             _range_total_kwh(
-                elec_meters, start, min(end, now.date()), now,
-                buckets=hour_buckets, first_ok=first_ok,
+                elec_meters,
+                win_start,
+                win_end,
+                buckets=hour_buckets,
+                first_ok=first_ok,
             )
             if elec_meters
             else None
@@ -582,19 +623,19 @@ def usage_range(
         prod_real = False
         return _range_payload(
             start, end, granularity, scope, line_code, labels, series, quality_series,
-            util, kwh_total, out_total, prod_real, focus_meters,
+            util, kwh_total, out_total, prod_real, focus_meters, win_start, win_end,
         )
 
     hour_buckets: list[tuple[date_cls, int]] | None = None
     if granularity == "hour":
         # closed_only：只到最后一个已结算整点 —— 正在走的这一小时算不出用量（见 _hour_labels）
-        buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at, closed_only=True)
+        buckets = _hour_labels(hour_start, hour_end, now, start_at=start_at, end_at=end_at, closed_only=True)
         hour_buckets = buckets
         labels = [f"{d:%m-%d} {h:02d}" for d, h in buckets]
         wmat = None
         if want_workshop:
             # 只算一次：既要值也要质量，重复计算会白白多扫一遍库
-            wmat = _hour_matrix(_workshop_meters(workshop), buckets, start, end)
+            wmat = _hour_matrix(_workshop_meters(workshop), buckets)
             series.append(
                 {
                     "key": "workshop",
@@ -604,7 +645,7 @@ def usage_range(
                 }
             )
         for ln in target_lines:
-            mat = _hour_matrix(_line_meters(ln), buckets, start, end)
+            mat = _hour_matrix(_line_meters(ln), buckets)
             series.append(
                 {
                     "key": ln.line_code,
@@ -634,8 +675,8 @@ def usage_range(
                     #   这里若不处理，同一天在两处会显示不同位数（B-524）
                     vals.append(round_kwh(rows[k].kwh))
                     continue
-                s, e = S.period_bounds(dim, k)
-                vals.append(round_kwh(_range_total_kwh(_workshop_meters(workshop), s, min(e, now.date()))))
+                start_dt, end_dt = B.period_window(dim, k)
+                vals.append(round_kwh(_range_total_kwh(_workshop_meters(workshop), start_dt, end_dt)))
             series.append({"key": "workshop", "name": "车间合计", "unit": "kWh", "values": vals})
             quality_series = [rows[k].quality if k in rows else "computed" for k in klist]
 
@@ -646,8 +687,8 @@ def usage_range(
                 if k in rows:
                     vals.append(round_kwh(rows[k].kwh))
                     continue
-                s, e = S.period_bounds(dim, k)
-                vals.append(round_kwh(_range_total_kwh(_line_meters(ln), s, min(e, now.date()))))
+                start_dt, end_dt = B.period_window(dim, k)
+                vals.append(round_kwh(_range_total_kwh(_line_meters(ln), start_dt, end_dt)))
             series.append({"key": ln.line_code, "name": ln.line_name, "unit": "kWh", "values": vals})
 
         util = {
@@ -666,20 +707,20 @@ def usage_range(
     meters = _workshop_meters(workshop) if scope in ("workshop", "all") else (
         _line_meters(all_lines[0]) if all_lines else []
     )
-    last_day = min(end, now.date())
-    kwh_total = _range_total_kwh(meters, start, last_day, now, buckets=hour_buckets)
-    out_total = _range_output(all_lines, start, last_day)
+    win_start, win_end = _query_window(
+        granularity, start, end, klist=klist, hour_buckets=hour_buckets
+    )
+    kwh_total = _range_total_kwh(meters, win_start, win_end, buckets=hour_buckets)
+    out_total = _range_output(all_lines, win_start, win_end)
     prod_real = (
-        ProductionHourly.objects.filter(
-            line__in=all_lines, stat_date__gte=start, stat_date__lte=last_day
-        )
+        ProductionHourly.objects.filter(B.hour_q(win_start, win_end), line__in=all_lines)
         .exclude(source__in=DEMO_SOURCES)
         .exists()
     )
 
     return _range_payload(
         start, end, granularity, scope, line_code, labels, series, quality_series,
-        util, kwh_total, out_total, prod_real, meters,
+        util, kwh_total, out_total, prod_real, meters, win_start, win_end,
     )
 
 
@@ -721,7 +762,7 @@ def _focus_name(
     return " · ".join(parts) or "选定范围"
 
 
-def _meter_coverage(meters: list[EnergyMeter], start: date_cls, end: date_cls) -> dict:
+def _meter_coverage(meters: list[EnergyMeter], start: datetime, end: datetime) -> dict:
     """统计「本次查询应参与的计量点里，有几个在本区间真的出过数」。
 
     为什么要有它：车间合计按「参与取数的表都有可信值才算数」的口径下，
@@ -739,7 +780,7 @@ def _meter_coverage(meters: list[EnergyMeter], start: date_cls, end: date_cls) -
 
 def _range_payload(
     start, end, granularity, scope, line_code, labels, series, quality_series,
-    util, kwh_total, out_total, prod_real, meters,
+    util, kwh_total, out_total, prod_real, meters, window_start, window_end,
 ) -> dict:
     """统一的返回体组装 —— 两条取数通道（焦点 / 常规）共用，避免结构漂移。"""
     return {
@@ -761,8 +802,10 @@ def _range_payload(
         "productionAvailable": prod_real,
         "bucketCount": len(labels),
         "meterCount": len(meters),
+        # 生产日口径：日 / 月桶标签仍是开始日期，实际窗口是 06:00—次日 06:00
+        "dayStartHour": B.DAY_START_HOUR,
         # 计量点覆盖度：界面据此解释「为什么合计是空的」
-        "coverage": _meter_coverage(meters, start, end),
+        "coverage": _meter_coverage(meters, window_start, window_end),
     }
 
 
@@ -770,7 +813,7 @@ def _utility_hour_series(kind: str, buckets, start: date_cls, end: date_cls) -> 
     meters = list(EnergyMeter.objects.filter(energy_type__type_code=kind, enabled=True))
     if not meters:
         return [None for _ in buckets]
-    mat = _hour_matrix(meters, buckets, start, end)
+    mat = _hour_matrix(meters, buckets)
     return [_round(mat[b][0]) for b in buckets]
 
 
@@ -806,10 +849,11 @@ def _sum_optional(values) -> float | None:
 
 
 def _day_list(start: date_cls, end: date_cls, now: datetime) -> list[date_cls]:
-    """[start, end] 内**已经到来**的日期（未来日期没有数据，不生成桶）。"""
+    """[start, end] 内**已经开始**的生产日（未来生产日没有数据，不生成桶）。"""
     out: list[date_cls] = []
+    current = B.production_day(now)
     d = start
-    while d <= end and d <= now.date():
+    while d <= end and d <= current:
         out.append(d)
         d += timedelta(days=1)
     return out
@@ -869,19 +913,10 @@ def _output_hour_series(lines: list[ProductionLine], buckets: list[tuple[date_cl
 
 
 def _output_day_series(lines: list[ProductionLine], days: list[date_cls]) -> list[float | None]:
-    """按天的真实产量（瓶）；未接入的天给 None。"""
+    """按生产日的真实产量（瓶）；未接入的生产日给 None。"""
     if not lines or not days:
         return [None for _ in days]
-    rows = (
-        ProductionHourly.objects.filter(
-            line__in=lines, stat_date__in=days, quality__in=ProductionHourly.TRUSTED
-        )
-        .exclude(source__in=DEMO_SOURCES)
-        .values("stat_date")
-        .annotate(t=Sum("output"))
-    )
-    got = {r["stat_date"]: r["t"] for r in rows}
-    return [_round(got[d], 0) if d in got else None for d in days]
+    return [_round(S.production_total(lines, B.day_start(d), B.day_end(d)), 0) for d in days]
 
 
 def dashboard_range(
@@ -907,6 +942,10 @@ def dashboard_range(
     now = now or datetime.now()
     granularity = granularity if granularity in ("hour", "day") else "hour"
     start, end = start_at.date(), end_at.date()
+    # 日粒度按生产日归集：结束时刻正好落在 06:00 时，06:00 属于**下一个**
+    # 生产日，而查询区间 [start_at, end_at) 并不包含它，所以要回退一瞬。
+    start_day = B.production_day(start_at)
+    end_day = B.production_day(end_at - timedelta(microseconds=1))
     lines = _lines_scope(line_code)
     meters = _line_meters(lines[0]) if (line_code and lines) else _workshop_meters()
     per_line = line_code is not None
@@ -914,7 +953,7 @@ def dashboard_range(
     if granularity == "hour":
         buckets = _hour_labels(start, end, now, start_at=start_at, end_at=end_at)
         labels = [f"{d:%m-%d} {h:02d}:00" for d, h in buckets]
-        emat = _hour_matrix(meters, buckets, start, end) if buckets else {}
+        emat = _hour_matrix(meters, buckets) if buckets else {}
         kwh_vals = [round_kwh(emat[b][0]) for b in buckets]
         out_vals = _output_hour_series(lines, buckets)
         if per_line:
@@ -924,17 +963,20 @@ def dashboard_range(
             water_vals = _utility_hour_series(EnergyType.WATER, buckets, start, end)
             steam_vals = _utility_hour_series(EnergyType.STEAM, buckets, start, end)
     else:
-        days = _day_list(start, end, now)
+        days = _day_list(start_day, end_day, now)
         labels = [d.strftime("%m-%d") for d in days]
-        kwh_vals = [round_kwh(_range_total_kwh(meters, d, d)) for d in days]
+        kwh_vals = [
+            round_kwh(_range_total_kwh(meters, B.day_start(d), B.day_end(d))) for d in days
+        ]
         out_vals = _output_day_series(lines, days)
         if per_line:
             water_vals = [None for _ in days]
             steam_vals = [None for _ in days]
         else:
             keys = [(d.strftime("%Y-%m-%d"), d.strftime("%m-%d")) for d in days]
-            water_vals = _utility_series(EnergyType.WATER, PeriodSummary.DIM_DAY, start, end, now, keys)
-            steam_vals = _utility_series(EnergyType.STEAM, PeriodSummary.DIM_DAY, start, end, now, keys)
+            water_vals = _utility_series(EnergyType.WATER, PeriodSummary.DIM_DAY, start_day, end_day, now, keys)
+            steam_vals = _utility_series(EnergyType.STEAM, PeriodSummary.DIM_DAY, start_day, end_day, now, keys)
+        start, end = start_day, end_day
 
     cp = cost.load_params()
     prod_real = any(v is not None for v in out_vals)
@@ -1010,6 +1052,7 @@ def dashboard_range(
             "blockers": blockers,
         },
         "productionAvailable": prod_real,
+        "dayStartHour": B.DAY_START_HOUR,
         "totals": {
             "kwh": _sum_optional(kwh_vals),
             "waterT": _sum_optional(water_vals),

@@ -106,6 +106,7 @@ export function mockMenus(): SysMenu[] {
     [25, 23, '角色管理', '/system/role', 'team', 'menu'],
     [26, 23, '菜单管理', '/system/menu', 'menu', 'menu'],
     [27, 23, '系统参数', '/system/param', 'param', 'menu'],
+    [29, 23, '标准单耗', '/system/standard-unit', 'param', 'menu'],
     [28, 23, '数据字典', '/system/dict', 'book', 'menu']
   ];
   return defs.map(([id, parentId, name, path, icon, type], i) => ({
@@ -191,19 +192,19 @@ export function mockMeters(): MeterPoint[] {
   type Def = [string, string, MeterPoint['kind'], string, string, number | null, number | null, number];
   const defs: Def[] = [
     // [网关编号, 名称, kind, 产线, 单位, 从站号, 寄存器, 倍率]
-    ['GW-PDB-1', '三线生产线1电表', 'elec', 'A3', 'kWh', 13, 1000, 0.1],
-    ['GW-PDB-1', '三线生产线2电表', 'elec', 'A3', 'kWh', 15, 1000, 0.1],
-    ['GW-PDB-1', '三线吹瓶机电表', 'elec', 'A3', 'kWh', 6, 1000, 0.1],
-    ['GW-PDB-1', '五线生产线电表', 'elec', 'A5', 'kWh', 8, 1000, 0.1],
-    ['GW-PDB-1', '五线吹瓶机电表', 'elec', 'A5', 'kWh', 7, 1000, 0.1],
-    ['GW-PDB-3', '二线生产线电表', 'elec', 'A2', 'kWh', 7, 1000, 0.1],
-    ['GW-PDB-3', '二线吹瓶机电表', 'elec', 'A2', 'kWh', 5, 1000, 0.1],
-    ['GW-PDB-4', '一线生产线电表', 'elec', 'A1', 'kWh', 8, 1000, 0.1],
-    ['GW-PDB-4', '一线吹瓶机电表', 'elec', 'A1', 'kWh', 6, 1000, 0.1],
-    ['GW-TASHI', '四线生产线电表', 'elec', 'A4', 'kWh', 11, 1000, 0.1],
-    ['GW-TASHI', '五线冰水机电表', 'elec', 'A5', 'kWh', 14, 1000, 0.1],
-    ['GW-TASHI', '六线生产线电表', 'elec', 'A6', 'kWh', 10, 1000, 0.1],
-    ['GW-TASHI', '六线吹瓶机电表', 'elec', 'A6', 'kWh', 7, 1000, 0.1]
+    ['GW-PDB-1', '三线生产线1电表', 'elec', 'W102', 'kWh', 13, 1000, 0.1],
+    ['GW-PDB-1', '三线生产线2电表', 'elec', 'W102', 'kWh', 15, 1000, 0.1],
+    ['GW-PDB-1', '三线吹瓶机电表', 'elec', 'W102', 'kWh', 6, 1000, 0.1],
+    ['GW-PDB-1', '五线生产线电表', 'elec', 'W104', 'kWh', 8, 1000, 0.1],
+    ['GW-PDB-1', '五线吹瓶机电表', 'elec', 'W104', 'kWh', 7, 1000, 0.1],
+    ['GW-PDB-3', '二线生产线电表', 'elec', 'W101', 'kWh', 7, 1000, 0.1],
+    ['GW-PDB-3', '二线吹瓶机电表', 'elec', 'W101', 'kWh', 5, 1000, 0.1],
+    ['GW-PDB-4', '一线生产线电表', 'elec', 'W103', 'kWh', 8, 1000, 0.1],
+    ['GW-PDB-4', '一线吹瓶机电表', 'elec', 'W103', 'kWh', 6, 1000, 0.1],
+    ['GW-TASHI', '四线生产线电表', 'elec', 'W301', 'kWh', 11, 1000, 0.1],
+    ['GW-TASHI', '五线冰水机电表', 'elec', 'W104', 'kWh', 14, 1000, 0.1],
+    ['GW-TASHI', '六线生产线电表', 'elec', 'W105', 'kWh', 10, 1000, 0.1],
+    ['GW-TASHI', '六线吹瓶机电表', 'elec', 'W105', 'kWh', 7, 1000, 0.1]
   ];
 
   const gwId: Record<string, number> = { 'GW-PDB-1': 1, 'GW-PDB-3': 2, 'GW-PDB-4': 3, 'GW-TASHI': 4, 'GW-API-DJ': 5 };
@@ -457,7 +458,7 @@ export function mockLoginLogs(): LoginLog[] {
 export function mockReports(): ReportTemplate[] {
   return [
     { id: 1, name: '车间能源日报', cycle: '日报', scope: '全车间', format: 'xlsx', enabled: true, lastGeneratedAt: priorTime(180) },
-    { id: 2, name: '产线单位电耗周报', cycle: '周报', scope: 'A1—A6', format: 'xlsx', enabled: true, lastGeneratedAt: priorTime(2880) },
+    { id: 2, name: '产线单位电耗周报', cycle: '周报', scope: 'W103—W105 / W301', format: 'xlsx', enabled: true, lastGeneratedAt: priorTime(2880) },
     { id: 3, name: '月度能源消耗分析', cycle: '月报', scope: '全车间', format: 'pdf', enabled: true, lastGeneratedAt: priorTime(14400) },
     { id: 4, name: '年度节能目标达成报告', cycle: '年报', scope: '全车间', format: 'pdf', enabled: false, lastGeneratedAt: priorTime(43200) },
     { id: 5, name: '原始小时明细导出', cycle: '日报', scope: '全车间', format: 'csv', enabled: true, lastGeneratedAt: priorTime(240) }
@@ -521,8 +522,10 @@ export function mockAdminOverview(now: Date = new Date()): AdminOverview {
       lineName: l.name,
       // unitKwh 为 null 时对标图单独显示「--」，不能按 0 参与排序
       unitKwh: l.today.unitKwh,
+      standardUnitKwh: l.standardUnitKwh,
       output: l.today.output
     })),
+    targetUnitKwh: ws.targetUnitKwh,
     latestAlarms: alarms.slice(0, 6).map((a) => ({
       ...a,
       // 首页仅做展示，加一点确定性抖动避免与列表页完全一致

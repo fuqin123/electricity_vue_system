@@ -182,8 +182,8 @@ export function outputKwhOption(
  *   否则算不出来的线会排在最前面，看起来像「能效最好的线」。
  */
 export function unitKwhCompareOption(
-  rows: { lineCode: string; lineName: string; unitKwh: number | null }[],
-  target: number,
+  rows: { lineCode: string; lineName: string; unitKwh: number | null; standardUnitKwh?: number | null }[],
+  target: number | null,
 ): EChartsOption {
   const sorted = [...rows].sort((a, b) => {
     if (a.unitKwh === null) return 1;
@@ -197,15 +197,23 @@ export function unitKwhCompareOption(
       ...tip(),
       trigger: "item",
       formatter: (p: unknown) => {
-        const d = p as { name: string; value: number | null };
+        const d = p as { name: string; value: number | null; data?: { standard?: number | null } };
         if (d.value === null || d.value === undefined) {
           return `<b style="color:${C.text}">${d.name}</b><br>单位电耗：<b>--</b>（产量未接入，算不出来）`;
         }
-        const diff = ((d.value - target) / target) * 100;
+        const std = d.data?.standard ?? target;
+        if (std === null || std === undefined) {
+          return (
+            `<b style="color:${C.text}">${d.name}</b><br>` +
+            `单位电耗：<b>${d.value.toFixed(2)}</b> kWh/千瓶<br>` +
+            `标准单耗未标定（后台「标准单耗」页维护）`
+          );
+        }
+        const diff = ((d.value - std) / std) * 100;
         return (
           `<b style="color:${C.text}">${d.name}</b><br>` +
           `单位电耗：<b>${d.value.toFixed(2)}</b> kWh/千瓶<br>` +
-          `目标 ${target.toFixed(2)} · 偏离 <b style="color:${diff > 0 ? C.red : C.green}">${diff > 0 ? "+" : ""}${diff.toFixed(1)}%</b>`
+          `标准 ${std.toFixed(2)} · 偏离 <b style="color:${diff > 0 ? C.red : C.green}">${diff > 0 ? "+" : ""}${diff.toFixed(1)}%</b>`
         );
       },
     },
@@ -225,23 +233,26 @@ export function unitKwhCompareOption(
       {
         type: "bar",
         barMaxWidth: 16,
-        data: sorted.map((r) =>
-          r.unitKwh === null
+        data: sorted.map((r) => {
+          const std = r.standardUnitKwh ?? target;
+          return r.unitKwh === null
             ? {
                 // 产量未接入：给 null（柱不画），标签单独显示「--」
                 value: null,
                 name: r.lineName,
+                standard: std,
                 label: { show: true, formatter: "--", color: C.slate },
               }
             : {
                 value: +r.unitKwh.toFixed(2),
                 name: r.lineName,
+                standard: std,
                 itemStyle: {
                   borderRadius: [0, 2, 2, 0],
-                  color: r.unitKwh > target ? C.red : C.green,
+                  color: std !== null && std !== undefined && r.unitKwh > std ? C.red : C.green,
                 },
-              },
-        ),
+              };
+        }),
         label: {
           show: true,
           position: "right",
@@ -251,18 +262,20 @@ export function unitKwhCompareOption(
           fontFamily: FONT,
           formatter: "{c}",
         },
-        markLine: {
-          silent: true,
-          symbol: "none",
-          lineStyle: { color: C.blue, type: [4, 4], width: 1.4 },
-          data: [{ xAxis: target }],
-          label: {
-            formatter: `目标 ${target}`,
-            color: C.blue,
-            fontSize: 11,
-            position: "end",
-          },
-        },
+        markLine: target === null
+          ? undefined
+          : {
+              silent: true,
+              symbol: "none",
+              lineStyle: { color: C.blue, type: [4, 4], width: 1.4 },
+              data: [{ xAxis: target }],
+              label: {
+                formatter: `车间目标 ${target}`,
+                color: C.blue,
+                fontSize: 11,
+                position: "end",
+              },
+            },
       },
     ],
   };

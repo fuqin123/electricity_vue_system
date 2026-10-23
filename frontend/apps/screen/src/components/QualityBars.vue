@@ -17,11 +17,11 @@ const rate = computed(() => (props.expect ? Math.round((props.received / props.e
 const missHours = computed(() =>
   props.line.hours
     .filter((s) => !s.future && (s.kwh === null || s.kwh === undefined))
-    .map((s) => pad2(s.hour))
+    .map((s) => pad2(s.clock))
 );
 
 const stoppedHours = computed(() =>
-  props.line.hours.filter((s) => !s.future && s.stopped).map((s) => pad2(s.hour))
+  props.line.hours.filter((s) => !s.future && s.stopped).map((s) => pad2(s.clock))
 );
 </script>
 
@@ -38,7 +38,7 @@ const stoppedHours = computed(() =>
       <b>{{ rate.toFixed(1) }}%</b>
     </div>
     <div class="quality__miss">
-      {{ missHours.length ? `缺失时段：${missHours.join('、')} 时` : '今日各整点数据完整' }}
+      {{ missHours.length ? `缺失时段：${missHours.join('、')} 时` : '本生产日各整点数据完整' }}
       <template v-if="stoppedHours.length"> · 计划停机：{{ stoppedHours.join('、') }} 时</template>
     </div>
   </div>

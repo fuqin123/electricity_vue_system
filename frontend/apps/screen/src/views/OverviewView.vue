@@ -59,16 +59,19 @@ const DIMS: TrendDim[] = ['年', '月', '日', '时'];
 const DIM_NOTE: Record<TrendDim, string> = {
   年: '每柱＝1 年 · 近 5 年 · 车间合计',
   月: '每柱＝1 个月 · 近 12 个月 · 车间合计（当月为进行中）',
-  日: '每柱＝1 天 · 近 30 天 · 车间合计（今日为进行中）',
-  时: '每柱＝1 小时 · 今日 24 小时 · 车间合计（虚线柱为计划）'
+  日: '每柱＝1 个生产日 · 近 30 日 · 车间合计（当前生产日为进行中）',
+  时: '每柱＝1 小时 · 本生产日 24 小时（06:00—次日06:00） · 车间合计'
 };
 
 /* ── 综合单位电耗仪表 ─────────────────────────────────── */
 const gauge = computed(() => ({
   actual: ws.value?.today.unitKwh ?? 0,
-  target: ws.value?.targetUnitKwh ?? 8.2,
+  target: ws.value?.targetUnitKwh ?? null,
   yesterday: ws.value?.yesterday.unitKwh ?? 0
 }));
+const gaugeTargetText = computed(() =>
+  gauge.value.target === null ? '标准未标定' : `目标 ${gauge.value.target.toFixed(2)}`
+);
 
 /* ── KPI 卡 ───────────────────────────────────────────── */
 const kpiCards = computed<KpiCard[]>(() => {
@@ -78,7 +81,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   const h = w.hours[curH];
   /** yearly5 按时间正序，末项是今年、倒数第二项是去年（同比只用这一种取法） */
   const prevYear = w.yearly5.length > 1 ? w.yearly5[w.yearly5.length - 2] : null;
-  const hPlan = Math.round(w.lines.reduce((a, l) => a + l.rated, 0) * PLAN_RATE * PROFILE[curH]);
+  const hPlan = Math.round(w.lines.reduce((a, l) => a + l.rated, 0) * PLAN_RATE * PROFILE[h?.clock ?? 0]);
   /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
   const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
   const hRef = hOut ?? 0;
@@ -96,7 +99,7 @@ const kpiCards = computed<KpiCard[]>(() => {
     {
       tag: '年',
       color: '#00b0f4',
-      label: '本年累计产量',
+      label: '本生产年累计产量',
       value: yq,
       delta: prodOn && prevYear ? rise(w.year.output, prevYear.output) : null,
       sub: `用电 ${yk.v}${yk.u}`
@@ -104,14 +107,14 @@ const kpiCards = computed<KpiCard[]>(() => {
     {
       tag: '月',
       color: '#7c8cff',
-      label: '本月累计产量',
+      label: '本生产月累计产量',
       value: mq,
       sub: `用电 ${mk.v}${mk.u}`
     },
     {
       tag: '日',
       color: '#a78bfa',
-      label: '今日累计产量',
+      label: '本生产日累计产量',
       value: big(w.today.output, '瓶'),
       delta: prodOn ? rise(w.today.output, w.yesterday.output) : null,
       sub: `完成率 ${rateText} · 用电 ${big(w.today.kwh, 'kWh').v}${big(w.today.kwh, 'kWh').u}`
@@ -120,7 +123,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       tag: '时',
       color: '#f06fcb',
       // 查历史整日时第 23 小时早已结算，不能写「当前小时」（B-522）
-      label: w.dayClosed ? `${pad2(curH)} 时段产量` : h?.partial ? '当前小时（进行中）' : '当前小时产量',
+      label: w.dayClosed ? `${pad2(h?.clock ?? 0)} 时段产量` : h?.partial ? '当前小时（进行中）' : '当前小时产量',
       value: { v: int(hOut), u: '瓶' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
@@ -134,8 +137,8 @@ const trendUnits = computed(() => OVERVIEW_TREND[dim.value]);
 /** 六线对比面板的说明必须跟着图表的自适应口径走，否则文字会指着一张画了别的东西的图 */
 const compareNote = computed(() =>
   prodOn
-    ? '条长＝今日产量 · 右侧为单位电耗'
-    : '条长＝今日用电量 · 右侧为占车间合计（产量未接入，算不出单位电耗）'
+    ? '条长＝本生产日产量 · 右侧为单位电耗'
+    : '条长＝本生产日用电量 · 右侧为占车间合计（产量未接入，算不出单位电耗）'
 );
 const trendOption = computed(() => (ws.value ? overviewTrendOption(ws.value, dim.value) : null));
 const compareOption = computed(() => (ws.value ? overviewLinesCompareOption(ws.value) : null));
@@ -154,7 +157,8 @@ const todayOption = computed(() =>
 const listNote = computed(() => {
   const w = ws.value;
   if (!w) return '--';
-  return w.dayClosed ? `${pad2(w.currentHour)} 时段 · 点击查看详情` : '本小时 · 点击查看详情';
+  const cur = w.hours[w.currentHour];
+  return w.dayClosed ? `${pad2(cur?.clock ?? 0)} 时段 · 点击查看详情` : '本小时 · 点击查看详情';
 });
 
 const todayNote = computed(() => {
@@ -208,10 +212,10 @@ const todayNote = computed(() => {
     >
       <!-- ══════ 左列 ══════ -->
       <div class="col">
-        <PanelBox title="今日综合单位电耗" height="var(--l1)">
+        <PanelBox title="本生产日综合单位电耗" height="var(--l1)">
           <template #note>
             <span class="panel__note">
-              车间合计 · {{ prodOn ? `目标 ${gauge.target.toFixed(2)}` : '产量未接入，暂不计算' }}
+              车间合计 · {{ prodOn ? gaugeTargetText : '产量未接入，暂不计算' }}
             </span>
           </template>
           <div class="panel__body panel__body--row gap-lg">
@@ -230,14 +234,14 @@ const todayNote = computed(() => {
             </div>
             <ul class="kv">
               <li>
-                <span>今日产量</span>
+                <span>本生产日产量</span>
                 <b class="t-num">
                   {{ wan(ws.today.output, 1) }}
                   <span class="c-muted" style="font-family: var(--font-cn); font-size: 11px">万瓶</span>
                 </b>
               </li>
               <li>
-                <span>今日用电</span>
+                <span>本生产日用电</span>
                 <b class="t-num c-cyan">
                   {{ big(ws.today.kwh, 'kWh').v }}
                   <span class="c-muted" style="font-family: var(--font-cn); font-size: 11px">{{
@@ -314,12 +318,12 @@ const todayNote = computed(() => {
 
       <!-- ══════ 右列 ══════ -->
       <div class="col">
-        <PanelBox title="今日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
+        <PanelBox title="本生产日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
           <template #note><span class="panel__note">{{ todayNote }}</span></template>
           <ChartBox :option="todayOption" grow />
         </PanelBox>
 
-        <PanelBox title="能源用量汇总" note="今日累计 / 昨日同期" height="var(--r2)" body-class="panel__body--list">
+        <PanelBox title="能源用量汇总" note="本生产日累计 / 上一生产日同期" height="var(--r2)" body-class="panel__body--list">
           <EnergySummary :ws="ws" />
         </PanelBox>
 

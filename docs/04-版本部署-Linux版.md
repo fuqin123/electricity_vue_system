@@ -474,7 +474,7 @@ curl -s http://127.0.0.1/healthz
 | `frontend` | `Dockerfile` 构建（Nginx） | 托管大屏 + 后台静态产物，反代 `/api/`、`/live/` |
 | `backend` | `Dockerfile.backend` 构建（gunicorn） | Django 接口；启动时自动 migrate + seed |
 | `collector` | **与 backend 同一个镜像** | 每 5 分钟 `collect --aggregate --if-due` |
-| `rollup` | **与 backend 同一个镜像** | 每天 00:30 `summarize --rollup`，结算日/月/年 |
+| `rollup` | **与 backend 同一个镜像** | 每天 06:30 `summarize --rollup`，结算生产日 / 月 / 年 |
 | `mysql` | `mysql:8.0` | 业务库；换现场已有库见 docker/README 第 6 节 |
 | `stream` | `alexxit/go2rtc` | 可选，`--profile stream` 才启动 |
 
@@ -509,7 +509,7 @@ curl -s http://127.0.0.1/healthz
 
 5. **周期结算必须单独排一个服务**
    v1.4.2 起 `collect` 默认**不**再刷日/月/年汇总（`--summarize` 要显式加），
-   改由每天 00:30 的 `summarize --rollup` 结算。漏掉它的现象是**静默的**：
+   改由每天 06:30 的 `summarize --rollup` 结算（生产日 06:00 结束）。漏掉它的现象是**静默的**：
    当天数字照常从小时表现算、不报错，而大屏「近 30 日 / 近 12 月」永远停在
    最后一次结算那天。依据见 `backend/scripts/daily-rollup-task.py` 顶部说明。
 
@@ -543,7 +543,7 @@ docker compose ps                                      # 五个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.5.5-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.6.0-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz
@@ -560,6 +560,25 @@ REGISTRY_MIRROR=docker.m.daocloud.io ./build-offline-bundle.sh
 生成，蒸汽平台 token 等仍是 `CHANGE_ME`，上线前必须现场填好。
 
 ---
+
+### 4.5 v1.6.0 升级（生产日口径）
+
+v1.6.0 把「日」从自然日改为 **06:00—次日 06:00**，并新增 `energy_standard_unit`。升级步骤：
+
+```bash
+cd deploy/docker
+docker compose pull                         # 或用离线包 import
+docker compose up -d mysql                  # 先让数据库可用
+docker compose run --rm backend python manage.py migrate
+# ⚠ 必须执行一次：旧的自然日汇总不能继续读；源读数/小时表/产量表不受影响
+docker compose run --rm backend python manage.py rebuild_summaries
+docker compose up -d
+docker compose logs --tail=6 rollup         # 期望末尾是 06:30 结算窗口
+```
+
+- 迁移 `0013_v160_line_codes` 会把六条产线原地改码为 W103/W101/W102/W301/W104/W105；如果库里同时存在旧码和新码，迁移会报冲突并停下，先人工核对再升级。
+- 迁移 `0014_v160_standard_unit` 只建新表；标准单耗初始为空（未标定），在后台「系统管理 → 标准单耗」录入。
+- `rebuild_summaries` 会清空并重建三张汇总表；请安排在维护窗口，执行前可先 `--dry-run` 看范围。
 
 ## 五、方案 C：一键部署脚本
 

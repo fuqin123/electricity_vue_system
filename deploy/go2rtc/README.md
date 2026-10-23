@@ -111,9 +111,9 @@ export const videoConfig = {
     webrtcPort: 8555
   },
   channels: {
-    A1: { channel: 'CH01', stream: 'my_camera',        // ← 必须与 go2rtc.yaml 的 key 一致
+    W103: { channel: 'CH01', stream: 'my_camera',        // ← 必须与 go2rtc.yaml 的 key 一致
           rtsp: 'rtsp://...', resolution: '1920×1080', fps: 25, codec: 'H.264' },
-    A2: { channel: 'CH02', stream: 'my_camera', rtsp: '', resolution: '1920×1080',
+    W101: { channel: 'CH02', stream: 'my_camera', rtsp: '', resolution: '1920×1080',
           fps: 25, codec: 'H.264', enabled: false }    // ← 摄像头未到位时置 false
   },
   // ...
@@ -263,7 +263,7 @@ sudo systemctl restart go2rtc
 
 ## 七、新增一路摄像头的完整步骤
 
-以 A2 产线为例：
+以二线（W101）为例：
 
 1. **网关侧** —— 编辑 `go2rtc.yaml`，在 `streams` 下新增：
 
@@ -280,12 +280,12 @@ sudo systemctl restart go2rtc
 2. **前端侧** —— 编辑 `frontend/packages/shared/src/config.ts`：
 
    ```ts
-   A2: { channel: 'CH02', stream: 'a2', rtsp: 'rtsp://admin:密码@10.113.1.119:554/Streaming/Channels/102',
+   W101: { channel: 'CH02', stream: 'a2', rtsp: 'rtsp://admin:密码@10.113.1.119:554/Streaming/Channels/102',
          resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: true },   // ← 由 false 改 true
    ```
 
-3. **验证** —— 重新构建前端并部署，打开大屏单线详情选 A2，右上角应显示 `HLS`（或 `MJPEG`）；
-   后台「视频监控」页点「检测网关」，A2 行的「配置校验」应变为「正常」。
+3. **验证** —— 重新构建前端并部署，打开大屏单线详情选二线（W101），右上角应显示 `HLS`（或 `MJPEG`）；
+   后台「视频监控」页点「检测网关」，W101 行的「配置校验」应变为「正常」。
 
 > 也可直接在后台「视频监控」页点「打开预览」先验证网关侧是否正常，
 > 那里用的是与大屏完全相同的播放链路。

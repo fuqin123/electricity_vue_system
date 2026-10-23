@@ -33,8 +33,12 @@ export type TrendDim = '年' | '月' | '日' | '时';
 
 /** 单条产线的小时数据点 */
 export interface HourPoint {
-  /** 0—23 */
+  /** 生产日序号 0—23（0 = 06:00，18 = 次日 00:00） */
   hour: number;
+  /** 实际时钟小时 0—23（用于显示 06:00 … 05:00） */
+  clock: number;
+  /** 0 / 1：1 表示这一格落在生产日的次日（00—05） */
+  dayOffset?: number;
   /** 产量（瓶）；未上报或未到时段为 null */
   output: number | null;
   /** 用电量（kWh）；未上报或未到时段为 null，刚过整点可能带 1 位小数 */
@@ -86,6 +90,8 @@ export interface LineData {
   /** 额定产能（瓶/小时） */
   rated: number;
   product: string;
+  /** 标准电单耗（kWh/千瓶）；未标定为 null，界面显示 -- */
+  standardUnitKwh: number | null;
   status: LineStatus;
   /** 停机原因备注，如「CIP 清洗停机」 */
   note: string;
@@ -188,8 +194,8 @@ export interface WorkshopData {
   monthly12: TrendPoint[];
   yearly5: TrendPoint[];
   utility: { water: UtilityMetric; steam: UtilityMetric };
-  /** 单位电耗考核目标 kWh/千瓶（产量接入后才能标定） */
-  targetUnitKwh: number;
+  /** 单位电耗考核目标 kWh/千瓶；未标定为 null，不要回退到硬编码值 */
+  targetUnitKwh: number | null;
   alerts: AlertItem[];
   /** 排序与「第 N 点已出数」的锚点：查历史整日时为 23 */
   currentHour: number;
@@ -509,6 +515,29 @@ export interface LoginLog {
   loginAt: string;
 }
 
+/** 标准单耗矩阵的一个格子（产线 × 能源类型） */
+export interface StandardUnitRow {
+  line: string;
+  lineName: string;
+  energy: string;
+  energyName: string;
+  /** 展示单位，如 kWh/千瓶 */
+  unit: string;
+  /** null = 未标定，与 0 不是一回事 */
+  value: number | null;
+  remark: string;
+  updatedAt?: string | null;
+  updatedBy?: string;
+  /** 水/汽没有分线实测；仍可配置，但界面要标注 */
+  perLineAvailable: boolean;
+}
+
+export interface StandardUnitMatrix {
+  lines: { code: string; name: string; sort: number }[];
+  energies: { code: string; name: string; unit: string; perUnit: string }[];
+  rows: StandardUnitRow[];
+}
+
 /** 系统参数 */
 export interface SysParam {
   id: number;
@@ -583,7 +612,15 @@ export interface AdminOverview {
   /** 近 12 个月 */
   monthly12: TrendPoint[];
   /** 各线单位电耗对标 */
-  lineUnitKwh: { lineCode: string; lineName: string; unitKwh: number | null; output: number | null }[];
+  lineUnitKwh: {
+    lineCode: string;
+    lineName: string;
+    unitKwh: number | null;
+    standardUnitKwh: number | null;
+    output: number | null;
+  }[];
+  /** 车间目标（已标定产线的算术平均）；未标定为 null */
+  targetUnitKwh: number | null;
   /** 最新告警 */
   latestAlarms: AlarmRecord[];
 }

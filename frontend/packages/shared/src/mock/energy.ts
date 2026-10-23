@@ -28,7 +28,6 @@ import {
   energyModel,
   linesConfig,
   lineColors,
-  thresholds,
   videoConfig,
   type LineConfig
 } from '../config';
@@ -61,12 +60,12 @@ const PROD_ENABLED = dataConfig.productionEnabled;
 
 /** 每条线的产能利用率与停机窗口（CIP 清洗 / 换型 / 计划检修） */
 const LINE_TRAITS: Record<string, { avail: number; stopHours: number[]; reason: string }> = {
-  A1: { avail: 0.9, stopHours: [], reason: '' },
-  A2: { avail: 0.93, stopHours: [], reason: '' },
-  A3: { avail: 0.86, stopHours: [12], reason: 'CIP 清洗' },
-  A4: { avail: 0.74, stopHours: [18, 19], reason: '计划检修' },
-  A5: { avail: 0.88, stopHours: [4], reason: 'CIP 清洗' },
-  A6: { avail: 0.8, stopHours: [6, 7, 8, 9], reason: '产品换型' }
+  W103: { avail: 0.9, stopHours: [], reason: '' },
+  W101: { avail: 0.93, stopHours: [], reason: '' },
+  W102: { avail: 0.86, stopHours: [12], reason: 'CIP 清洗' },
+  W301: { avail: 0.74, stopHours: [18, 19], reason: '计划检修' },
+  W104: { avail: 0.88, stopHours: [4], reason: 'CIP 清洗' },
+  W105: { avail: 0.8, stopHours: [6, 7, 8, 9], reason: '产品换型' }
 };
 
 /**
@@ -101,6 +100,8 @@ export function hourSample(line: LineConfig, date: Date, hour: number): HourPoin
 
   return {
     hour,
+    clock: hour,
+    dayOffset: 0,
     output,
     kwh,
     unitKwh: PROD_ENABLED && output !== null && output > 0 ? round2((kwh / output) * 1000) : null,
@@ -334,6 +335,7 @@ function buildLine(line: LineConfig, now: Date): LineData {
     name: line.name,
     rated: line.rated,
     product: line.product,
+    standardUnitKwh: null,
     note: trait?.reason ? `${trait.reason}停机` : '',
     status,
     hours,
@@ -377,7 +379,6 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
   const curH = now.getHours();
   const curFrac = now.getMinutes() / 60;
   const m = energyModel;
-  const th = thresholds;
 
   const lines = linesConfig.map((l) => buildLine(l, now));
 
@@ -397,7 +398,7 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
   const wsHours: HourPoint[] = [];
   for (let h = 0; h < 24; h++) {
     if (h > curH) {
-      wsHours.push({ hour: h, output: null, kwh: null, unitKwh: null, future: true, partial: false });
+      wsHours.push({ hour: h, clock: h, dayOffset: 0, output: null, kwh: null, unitKwh: null, future: true, partial: false });
       continue;
     }
     let o = 0;
@@ -411,6 +412,8 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
     });
     wsHours.push({
       hour: h,
+      clock: h,
+      dayOffset: 0,
       output: PROD_ENABLED ? o : null,
       kwh: e,
       unitKwh: PROD_ENABLED && o > 0 ? round2((e / o) * 1000) : null,
@@ -611,7 +614,7 @@ export function buildSnapshot(now: Date = new Date()): EnergySnapshot {
         expectedHours: curH + 1
       }
     },
-    targetUnitKwh: m.targetUnitKwh,
+    targetUnitKwh: null,
     alerts,
     currentHour: curH,
     // 演示数据永远是「今天进行中」，所以锚点与进行中的小时是同一个

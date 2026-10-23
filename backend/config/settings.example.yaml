@@ -103,14 +103,14 @@ workshops:
 #   否则大屏（读接口）与后台（读同一张表）会显示不一致。
 #   现场口径若有出入，改这里一处即可（或直接在后台「生产管理」改）。
 #
-# ⚠ `workshop` 指向 workshops 段的 code。现场确认 **A1—A6 全部属于碳水车间**。
+# ⚠ `workshop` 指向 workshops 段的 code。现场确认 **W103 / W101 / W102 / W301 / W104 / W105 全部属于碳水车间**。
 lines:
-  - { code: A1, name: 一线, sort: 1, rated: 30000, product: 冰红茶 500ml, workshop: WS-CARB }
-  - { code: A2, name: 二线, sort: 2, rated: 30000, product: 绿茶 500ml,   workshop: WS-CARB }
-  - { code: A3, name: 三线, sort: 3, rated: 24000, product: 茉莉蜜茶 500ml, workshop: WS-CARB }
-  - { code: A4, name: 四线, sort: 4, rated: 24000, product: 酸梅汤 500ml, workshop: WS-CARB }
-  - { code: A5, name: 五线, sort: 5, rated: 18000, product: 纯净水 550ml, workshop: WS-CARB }
-  - { code: A6, name: 六线, sort: 6, rated: 18000, product: 冰糖雪梨 500ml, workshop: WS-CARB }
+  - { code: W103, name: 一线, sort: 1, rated: 30000, product: 冰红茶 500ml, workshop: WS-CARB }
+  - { code: W101, name: 二线, sort: 2, rated: 30000, product: 绿茶 500ml,   workshop: WS-CARB }
+  - { code: W102, name: 三线, sort: 3, rated: 24000, product: 茉莉蜜茶 500ml, workshop: WS-CARB }
+  - { code: W301, name: 四线, sort: 4, rated: 24000, product: 酸梅汤 500ml, workshop: WS-CARB }
+  - { code: W104, name: 五线, sort: 5, rated: 18000, product: 纯净水 550ml, workshop: WS-CARB }
+  - { code: W105, name: 六线, sort: 6, rated: 18000, product: 冰糖雪梨 500ml, workshop: WS-CARB }
 
 # ── 辅助计量单元（车间下的非产线计量组）──────────────────────
 # 「辅机 / 瓶胚 / 调配」这些用电不属于任何单条产线，但也**不是车间总表** ——
@@ -183,26 +183,26 @@ gateways:
 #   · workshop     —— 冗余留档，实际归属由 `line` / `node` 决定
 #   · usage_type   —— 用能类型（生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电）
 #   · device_name  —— 设备名（吹瓶机 / 冰水机和水塔 / 溶糖CIP …）
-#   · line         —— 挂到产线（A1—A6）
+#   · line         —— 挂到产线（W103 / W101 / W102 / W301 / W104 / W105）
 #   · node         —— 挂到辅助计量单元（aux_nodes 段的 code）
 #
 # 现场接口表里的「线别」对辅机类设备写的是设备组合名，因此下面用 `node`
 # 而不是 `line` 挂靠；`device_name` 保留现场原文，界面第三级直接显示它。
 meters:
   # ══ 生产线用电（挂产线）══
-  - { code: E-A1-01, name: 一线生产线电表,      kind: elec, scope: line, role: line, line: A1, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-4, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A1-02, name: 一线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A1, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-4, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A2-01, name: 二线生产线电表,      kind: elec, scope: line, role: line, line: A2, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-3, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A2-02, name: 二线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A2, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-3, slave: 5,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A3-01, name: 三线生产线1电表,     kind: elec, scope: line, role: line, line: A3, usage_type: 生产线用电, device_name: 生产线1, gateway: GW-PDB-1, slave: 13, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A3-02, name: 三线生产线2电表,     kind: elec, scope: line, role: line, line: A3, usage_type: 生产线用电, device_name: 生产线2, gateway: GW-PDB-1, slave: 15, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A3-03, name: 三线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A3, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-1, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A4-01, name: 四线生产线电表,      kind: elec, scope: line, role: line, line: A4, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-TASHI, slave: 11, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A5-01, name: 五线生产线电表,      kind: elec, scope: line, role: line, line: A5, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-1, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A5-02, name: 五线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A5, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-1, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A5-03, name: 五线冰水机电表,      kind: elec, scope: line, role: aux,  line: A5, usage_type: 生产线用电, device_name: 冰水机,  gateway: GW-TASHI, slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A6-01, name: 六线生产线电表,      kind: elec, scope: line, role: line, line: A6, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-TASHI, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-A6-02, name: 六线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: A6, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-TASHI, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A1-01, name: 一线生产线电表,      kind: elec, scope: line, role: line, line: W103, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-4, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A1-02, name: 一线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: W103, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-4, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A2-01, name: 二线生产线电表,      kind: elec, scope: line, role: line, line: W101, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-3, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A2-02, name: 二线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: W101, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-3, slave: 5,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-01, name: 三线生产线1电表,     kind: elec, scope: line, role: line, line: W102, usage_type: 生产线用电, device_name: 生产线1, gateway: GW-PDB-1, slave: 13, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-02, name: 三线生产线2电表,     kind: elec, scope: line, role: line, line: W102, usage_type: 生产线用电, device_name: 生产线2, gateway: GW-PDB-1, slave: 15, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A3-03, name: 三线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: W102, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-1, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A4-01, name: 四线生产线电表,      kind: elec, scope: line, role: line, line: W301, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-TASHI, slave: 11, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-01, name: 五线生产线电表,      kind: elec, scope: line, role: line, line: W104, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-PDB-1, slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-02, name: 五线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: W104, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-PDB-1, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A5-03, name: 五线冰水机电表,      kind: elec, scope: line, role: aux,  line: W104, usage_type: 生产线用电, device_name: 冰水机,  gateway: GW-TASHI, slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A6-01, name: 六线生产线电表,      kind: elec, scope: line, role: line, line: W105, usage_type: 生产线用电, device_name: 生产线,  gateway: GW-TASHI, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-A6-02, name: 六线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: W105, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-TASHI, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
 
   # ══ 辅机用电（挂 aux 节点；现场「线别」列为设备组合名）══
   - { code: E-AUX-10, name: 冰水泵及塔1电表,                        kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }

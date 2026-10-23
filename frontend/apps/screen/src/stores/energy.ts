@@ -1,15 +1,13 @@
 import { computed, ref, shallowRef } from 'vue';
 import { defineStore } from 'pinia';
-import { dataConfig, energyApi, type EnergySnapshot, type LineData, type TrendDim } from '@eep/shared';
-
-/**
- * 本地日期字符串 YYYY-MM-DD。
- * ⚠ 不能用 `toISOString().slice(0,10)` —— 那是 UTC，东八区在早上 8 点前会得到「昨天」。
- */
-function isoToday(now: Date = new Date()): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-}
+import {
+  dataConfig,
+  energyApi,
+  productionDay,
+  type EnergySnapshot,
+  type LineData,
+  type TrendDim
+} from '@eep/shared';
 
 /**
  * 大屏数据仓库
@@ -21,20 +19,21 @@ export const useEnergyStore = defineStore('energy', () => {
   const loading = ref(false);
   const errorMsg = ref('');
   const dim = ref<TrendDim>('月');
-  const currentLineId = ref('A1');
+  const currentLineId = ref('W103');
   const refreshedAt = ref<Date | null>(null);
   /** 当前查看的日期（YYYY-MM-DD）；等于今天就按实时处理 */
-  const selectedDate = ref<string>(isoToday());
+  const selectedDate = ref<string>(productionDay());
   /**
-   * 「今天」—— 必须是**响应式**的，不能写成 `computed(() => isoToday())`。
+   * 「当前生产日」—— 必须是**响应式**的，不能写成 `computed(() => productionDay())`。
    *
    * B-527：原来 `selectedDate` 只在 store 创建时取一次当天日期，而 `isHistory`
    * 里那句 `isoToday()` 没有任何响应式依赖，Vue 把 computed 缓存后就再也不算。
    * 于是跨零点后 `selectedDate` 仍是昨天 → 接口把昨天当「已经过完的一天」整日返回
    * → 大屏的趋势图永远停在昨天，**只有手动刷新浏览器才会翻到今天**。
-   * 现在是：定时器每轮先 `syncToday()`，日期一变就把没被用户钉住的视图推到新的一天。
+   * v1.6.0 起翻页点是 **06:00**（生产日），不是 00:00：
+   * 定时器每轮先 `syncToday()`，生产日一变就把没被用户钉住的视图推到新的一天。
    */
-  const today = ref<string>(isoToday());
+  const today = ref<string>(productionDay());
   /** 用户是否显式选过日期。钉住历史日期时跨零点**不该**被强行拉回今天 */
   const userPicked = ref(false);
 
@@ -73,7 +72,7 @@ export const useEnergyStore = defineStore('energy', () => {
    * 不该被零点静默拽回今天 —— 那会被当成数据突然跳了一下。
    */
   function syncToday(): boolean {
-    const next = isoToday();
+    const next = productionDay();
     if (next === today.value) return false;
     today.value = next;
     if (!userPicked.value && selectedDate.value !== next) {

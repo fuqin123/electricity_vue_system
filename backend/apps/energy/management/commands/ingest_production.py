@@ -13,7 +13,7 @@
 
 用法：
     # 正式写入一个点
-    python manage.py ingest_production --line A1 --date 2026-09-22 --hour 10 --output 26800
+    python manage.py ingest_production --line W103 --date 2026-09-22 --hour 10 --output 26800
 
     # 演示占位：把近 2 天所有线别所有已过小时写成 null（marked as demo）
     python manage.py ingest_production --demo-null --days 2
@@ -73,7 +73,7 @@ class Command(BaseCommand):
     help = "写入小时产量（真实数据源接入后由采集脚本调用；也支持写入演示 null 占位）"
 
     def add_arguments(self, parser):
-        parser.add_argument("--line", help="产线代码，如 A1")
+        parser.add_argument("--line", help="产线代码，如 W103")
         parser.add_argument("--date", help="日期 YYYY-MM-DD")
         parser.add_argument("--hour", type=int, help="小时 0—23")
         parser.add_argument("--output", help="产量（瓶）；不传写到 null（未上报）")

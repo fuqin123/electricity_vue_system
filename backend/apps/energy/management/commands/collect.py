@@ -16,9 +16,11 @@
   比「每小时准点跑一次、错过就丢一小时」可靠得多。
 
 ⚠ 周期汇总**不在本命令的默认路径里**（v1.4.2 起）：日 / 月 / 年汇总改成每天结算一次
-  （`manage.py summarize --rollup`，建议配 00:30 的计划任务）。
+  （`manage.py summarize --rollup`，生产日 06:00 结束后于 06:30 结算）。
   当期（今天 / 本月 / 本年）的数字在界面上是**直接从小时表现算**的
   （见 `summary.is_open_period`），所以按小时重刷汇总表只是白耗一次扫描。
+  06:00—08:00 的轮次会额外补算刚结束的生产日一次（`refresh_just_closed_day`），
+  防止跨日边界读数晚到导致覆盖率告警挂一整天。
 
 生产环境建议每 60 秒跑一次（Windows 计划任务 / Linux cron / APScheduler 均可），
 比常驻进程更抗崩溃：
@@ -51,7 +53,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--summarize",
             action="store_true",
-            help="采完顺手刷日/月/年总计。默认不刷 —— 汇总已由每天 00:30 的 "
+            help="采完顺手刷日/月/年总计。默认不刷 —— 汇总已由每天 06:30 的 "
                  "`summarize --rollup` 结算，当期数字界面直接从小时表现算",
         )
         parser.add_argument(
@@ -99,6 +101,9 @@ class Command(BaseCommand):
         # 部分失败的那一轮恰恰是最该生成告警的一轮；放在后面就等于
         # 「只在一切正常时才工作的告警系统」，那是没有意义的。
         if not options["dry_run"]:
+            # 06:00 边界读数可能晚到：先在 06—08 点的轮次里补算刚结束的生产日，
+            # 再评估覆盖率告警，避免 06:30 的 23/24 挂到第二天。
+            S.refresh_just_closed_day()
             res = alerts.evaluate()
             if not options["json"]:
                 self.stdout.write(

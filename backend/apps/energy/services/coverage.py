@@ -163,8 +163,10 @@ def unit_of(meters, fallback: str = "kWh") -> str:
     return units.pop() if len(units) == 1 else fallback
 
 
-def coverage_of(meters, start: date_cls, end: date_cls, first_ok: dict[int, datetime] | None = None) -> dict:
-    """查询区间内的计量点覆盖度，区分「没出数」与「还没接入」。
+def coverage_of(
+    meters, start: datetime, end: datetime, first_ok: dict[int, datetime] | None = None
+) -> dict:
+    """查询生产日窗口内的计量点覆盖度，区分「没出数」与「还没接入」。
 
     total      登记且启用的表数
     connected  其中已接入（历史上有过可信值）的表数
@@ -172,6 +174,8 @@ def coverage_of(meters, start: date_cls, end: date_cls, first_ok: dict[int, date
     missing    已接入、但本区间没出数 —— 真的缺采，该报该告警
     unconnected 从未成功采到过读数 —— 不参与合计，另走「未接入」告警
     """
+    from .business_day import hour_q
+
     if first_ok is None:
         first_ok = first_data_map(meters)
     total = len(meters)
@@ -179,9 +183,9 @@ def coverage_of(meters, start: date_cls, end: date_cls, first_ok: dict[int, date
         return {"total": 0, "connected": 0, "covered": 0, "missing": [], "unconnected": []}
 
     have = set(
-        EnergyHourly.objects.filter(
-            meter__in=meters, stat_date__gte=start, stat_date__lte=end
-        ).values_list("meter_id", flat=True)
+        EnergyHourly.objects.filter(hour_q(start, end), meter__in=meters).values_list(
+            "meter_id", flat=True
+        )
     )
     missing = [m.code for m in meters if m.id in first_ok and m.id not in have]
     unconn = [m.code for m in meters if m.id not in first_ok]

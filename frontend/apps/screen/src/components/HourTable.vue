@@ -17,6 +17,7 @@ const props = defineProps<{
 
 interface Row {
   hour: number;
+  clock: number;
   isCurrent: boolean;
   outputText: string;
   kwhText: string;
@@ -87,6 +88,7 @@ const rows = computed<Row[]>(() => {
 
     return {
       hour: h,
+      clock: s.clock,
       isCurrent: h === ongoing,
       outputText: s.future ? '--' : int(s.output),
       kwhText,
@@ -123,7 +125,7 @@ defineExpose({ received, expect });
       <tbody>
         <tr v-for="r in rows" :key="r.hour" :class="r.cls">
           <td>
-            {{ pad2(r.hour) }}:00
+            {{ pad2(r.clock) }}:00
             <span v-if="r.isCurrent" style="color: var(--cyan); font-size: 9px">当前</span>
           </td>
           <td>{{ r.outputText }}</td>

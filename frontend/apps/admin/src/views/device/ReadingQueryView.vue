@@ -20,6 +20,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import {
   adminApi,
+  HOUR_QUALITY_LABEL,
   type Gateway,
   type MeterCurrentResult,
   type MeterPoint,
@@ -110,6 +111,7 @@ const columns: TableColumn<MeterReading>[] = [
   { prop: 'energyName', label: '能源', minWidth: 80 },
   { prop: 'reading', label: '累计读数', minWidth: 140, mono: true, slot: 'col-reading' },
   { prop: 'unit', label: '单位', minWidth: 70 },
+  { prop: 'hourUsage', label: '小时差值', minWidth: 150, mono: true, slot: 'col-hour' },
   { prop: 'ok', label: '状态', minWidth: 96, slot: 'col-ok' },
   { prop: 'raw', label: '原始报文 / 响应', minWidth: 220, showOverflow: false, slot: 'col-raw' }
 ];
@@ -117,6 +119,21 @@ const columns: TableColumn<MeterReading>[] = [
 function readingText(v: number | null): string {
   // null = 这次没读到。显示 -- 而不是 0：0 会被当成真实读数参与差分（B-502）
   return v === null || v === undefined ? '--' : v.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+}
+
+/** 该读数作为终点的上一小时差值；无匹配时如实说明是待结算还是非整点读数 */
+function hourUsageText(row: MeterReading): string {
+  if (row.hourUsage === null || row.hourUsage === undefined) return '--';
+  return row.hourUsage.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+}
+
+function hourStatusText(row: MeterReading): string {
+  if (row.hourStatus === 'pending') return '待结算';
+  if (row.hourStatus === 'not_boundary') return '非整点';
+  if (row.hourStatus && row.hourStatus !== 'ok') {
+    return HOUR_QUALITY_LABEL[row.hourStatus] ?? row.hourStatus;
+  }
+  return '';
 }
 
 /* ── 读取当前值（不落库）───────────────────────────────── */
@@ -181,7 +198,7 @@ function exportCsv() {
     ElMessage.warning('当前页没有可导出的数据');
     return;
   }
-  const head = ['采集时间', '网关', '仪表编码', '仪表名称', '归属', '能源', '累计读数', '单位', '状态', '原始报文', '错误'];
+  const head = ['采集时间', '网关', '仪表编码', '仪表名称', '归属', '能源', '累计读数', '单位', '小时差值', '小时差值说明', '状态', '原始报文', '错误'];
   const lines = [head.join(',')];
   lastPage.value.forEach((r) => {
     lines.push(
@@ -194,6 +211,8 @@ function exportCsv() {
         r.energyName,
         r.reading === null ? '' : String(r.reading),
         r.unit,
+        r.hourUsage === null ? '' : String(r.hourUsage),
+        hourStatusText(r),
         r.ok ? '成功' : '失败',
         `"${String(r.raw).replace(/"/g, '""')}"`,
         `"${String(r.error).replace(/"/g, '""')}"`
@@ -305,6 +324,14 @@ function exportCsv() {
     >
       <template #col-reading="{ row }">
         <span :class="{ 'is-missing': row.reading === null }">{{ readingText(row.reading) }}</span>
+      </template>
+      <template #col-hour="{ row }">
+        <el-tooltip :content="row.hourNote || '该读数结算出的上一小时差值'" placement="top" :show-after="300">
+          <span>
+            <span :class="{ 'is-missing': row.hourUsage === null }">{{ hourUsageText(row) }}</span>
+            <span v-if="hourStatusText(row)" class="hour-status">{{ hourStatusText(row) }}</span>
+          </span>
+        </el-tooltip>
       </template>
       <template #col-ok="{ row }">
         <el-tag :type="row.ok ? 'success' : 'danger'" size="small">{{ row.ok ? '成功' : '失败' }}</el-tag>
@@ -509,5 +536,10 @@ function exportCsv() {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   line-height: 32px;
+}
+.hour-status {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--el-text-color-placeholder);
 }
 </style>

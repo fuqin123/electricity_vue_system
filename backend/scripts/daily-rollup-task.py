@@ -1,21 +1,21 @@
-r"""每日周期结算入口 —— 计划任务（建议 00:30）静默跑 `summarize --rollup`。
+r"""每日周期结算入口 —— 计划任务（建议 06:30）静默跑 `summarize --rollup`。
 
 ## 为什么需要这一个任务（v1.4.2 起是**必须**的）
 
 日 / 月 / 年汇总表以前挂在每小时采集后面刷，现在改成**每天结算一次**：
 
     EEP-Collect    每 5 分钟   collect --aggregate --if-due    只出原始读数与小时差值
-    EEP-Rollup     每天 00:30  summarize --rollup              结算昨天 + 今天 + 近 2 月 + 今年
+    EEP-Rollup     每天 06:30  summarize --rollup              结算上一个生产日 + 当前生产日 + 近 2 月 + 近 2 年
 
 界面（大屏与后台）的**当期**数字一律从小时表现算（`summary.is_open_period`），
 所以当天不依赖汇总表；而**昨天及更早**的周期完全靠这个任务写出来。
 ⚠ 停掉它，大屏的「近 30 日 / 近 12 月」会停在最后一次结算的那天 ——
 今天不动、明天也不动，而且不报任何错。
 
-## 为什么 00:30
+## 为什么 06:30
 
-昨天 23 点的差值要等今天 00:04 采到跨日边界读数才算得出来（见 B-523），
-00:30 留了足够余量，又赶在白班 08:00 之前。
+生产日到次日 06:00 才结束，05—06 点的差值要等 06:xx 采到跨日边界读数
+才算得出来（见 B-523 / v1.6.0）。06:30 留了足够余量，又赶在白班交接前。
 
 ## 为什么单独一个脚本而不是复用 collect_task.py
 
@@ -27,7 +27,7 @@ r"""每日周期结算入口 —— 计划任务（建议 00:30）静默跑 `sum
 
 Windows 计划任务（不弹窗）：
 
-    schtasks /Create /TN EEP-Rollup /SC DAILY /ST 00:30 /F ^
+    schtasks /Create /TN EEP-Rollup /SC DAILY /ST 06:30 /F ^
       /TR "\"<venv>\\Scripts\\pythonw.exe\" \"<仓库>\\backend\\scripts\\daily-rollup-task.py\""
 
 手工验证（等价于计划任务那一轮）：

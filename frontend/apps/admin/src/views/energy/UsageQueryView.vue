@@ -19,7 +19,13 @@
  */
 import { computed, onMounted, ref } from 'vue';
 import { ElMessage } from 'element-plus';
-import { energyApi, type UsageRangeResult } from '@eep/shared';
+import {
+  energyApi,
+  lastClosedHour,
+  linesConfig,
+  productionDayStart,
+  type UsageRangeResult
+} from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
@@ -38,11 +44,12 @@ const ENERGY_COLOR: Record<EnergyKey, string> = { electric: '#1664ff', water: '#
 
 const granularity = ref<Granularity>('hour');
 const scope = ref<Scope>('all');
-const lineCode = ref('A1');
+const LINE_OPTIONS = linesConfig.map((l) => ({ value: l.id, label: `${l.name}（${l.id}）` }));
+const lineCode = ref(LINE_OPTIONS[0]?.value ?? 'W103');
 /** 勾选要看的能源曲线。默认三条都看（车间口径下水汽本来就有数） */
 const energies = ref<EnergyKey[]>(['electric', 'water', 'steam']);
 /**
- * 默认「今天 00:00 → 最后一个已结算整点」。
+ * 默认「当前生产日 06:00 → 最后一个已结算整点」。
  * ⚠ 终点不能取「现在」：当前小时还没结算（见 closedHour 的说明），
  *   取现在会多出一个恒为空的时段并被当成缺数。
  */
@@ -73,20 +80,16 @@ function fmtHour(d: Date): string {
  *   「共 16 个时段，其中 1 个时段缺数」，而那一个时段本来就不该出现（v1.4.4 修复）。
  */
 function closedHour(): Date {
-  const d = new Date();
-  d.setMinutes(0, 0, 0);
-  d.setHours(d.getHours() - 1);
-  return d;
+  return lastClosedHour();
 }
-/** 已结算小时所在那天的 00:00；跨零点（00:xx）时自动退到昨天，避免区间起点跑到终点后面 */
+/** 已结算小时所属生产日的 06:00；06:00—06:59 时自动退到前一天，避免起点跑到终点后面 */
 function anchorDayStart(): Date {
-  const c = closedHour();
-  return new Date(c.getFullYear(), c.getMonth(), c.getDate());
+  return productionDayStart(closedHour());
 }
 
 const QUICK: { label: string; from: () => Date; gran: Granularity }[] = [
   { label: '近 6 小时', from: () => new Date(closedHour().getTime() - 6 * 3600000), gran: 'hour' },
-  { label: '今日', from: () => anchorDayStart(), gran: 'hour' },
+  { label: '本生产日', from: () => anchorDayStart(), gran: 'hour' },
   { label: '近 3 日', from: () => new Date(closedHour().getTime() - 72 * 3600000), gran: 'hour' },
   { label: '近 30 日', from: () => new Date(closedHour().getTime() - 720 * 3600000), gran: 'day' },
   { label: '近 12 个月', from: () => new Date(closedHour().getTime() - 24 * 366 * 3600000), gran: 'month' }
@@ -307,7 +310,7 @@ function exportCsv() {
             <el-option label="单条产线" value="line" />
           </el-select>
           <el-select v-if="scope === 'line'" v-model="lineCode" size="small" style="width: 110px" @change="load">
-            <el-option v-for="c in ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']" :key="c" :label="c" :value="c" />
+            <el-option v-for="l in LINE_OPTIONS" :key="l.value" :label="l.label" :value="l.value" />
           </el-select>
 
           <span class="query__label">能源曲线</span>

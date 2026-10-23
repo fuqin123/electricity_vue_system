@@ -52,7 +52,7 @@ function onInput(e: Event) {
 <template>
   <div class="date-switch" :class="{ 'is-history': isHistory }">
     <button type="button" class="date-switch__step" title="前一天" @click="shift(-1)">‹</button>
-    <label class="date-switch__field">
+    <label class="date-switch__field" title="生产日：06:00—次日 06:00">
       <input type="date" :value="modelValue" :max="today" @change="onInput" />
     </label>
     <button
@@ -66,7 +66,7 @@ function onInput(e: Event) {
     </button>
     <span v-if="isHistory" class="date-switch__badge">
       <button type="button" @click="emit('update:modelValue', today)">
-        {{ busy ? '历史数据 · 正在取数' : '历史数据 · 回到今日' }}
+        {{ busy ? '历史数据 · 正在取数' : '历史数据 · 回到本生产日' }}
       </button>
     </span>
     <span v-else class="date-switch__badge date-switch__badge--live">

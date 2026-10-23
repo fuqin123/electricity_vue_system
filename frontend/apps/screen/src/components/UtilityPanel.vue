@@ -26,7 +26,7 @@ const sparkOption = computed(() => utilitySparkOption(props.ws.utility));
         class="dual-metric__item"
         :style="{ background: hexA(it.color, 0.09) }"
       >
-        <span>{{ it.name }}耗 · {{ props.ws.dayClosed ? '当日累计' : '今日累计' }}</span>
+        <span>{{ it.name }}耗 · {{ props.ws.dayClosed ? '当日累计' : '本生产日累计' }}</span>
         <b>{{ int(it.d.today) }}<small>t</small></b>
         <em :style="{ color: (rise(it.d.today, it.d.yesterday) ?? 0) > 0 ? '#ec48bd' : '#35ed7e' }">
           <template v-if="it.d.rateNow !== null">瞬时 {{ dec1(it.d.rateNow) }} t/h · </template>较昨日

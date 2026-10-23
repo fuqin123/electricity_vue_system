@@ -39,12 +39,14 @@ from ..models import (
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
+    StandardUnitConsumption,
 )
 from .aggregate import current_hour_usage
 # 用具体函数名导入而不是 `from . import alerts`：本模块下面有个局部变量就叫
 # alerts（大屏的告警条列表），会把模块名遮掉 —— 报 'list' object has no attribute
 from .alerts import evaluate as evaluate_alerts
 from .coverage import Q_UNCONNECTED, expected_ids, first_data_map
+from . import business_day as B
 from . import summary as S
 
 logger = logging.getLogger(__name__)
@@ -100,25 +102,26 @@ class HourCell:
 def hourly_cells(
     meters: list[EnergyMeter], day: date_cls, now: datetime | None = None, *, closed: bool = False
 ) -> dict[int, HourCell]:
-    """算出某天 0—23 点、这组计量点的小时用量。
+    """算出生产日 `day`（06:00—次日 06:00）的 24 格小时用量。
 
-    区分的三种情况：
+    返回字典的键是**生产日序号 0—23**（0 = 当天 06:00，23 = 次日 05:00），
+    不是自然时钟小时。区分的三种情况：
       · 已经过去的整点：读 EnergyHourly（聚合任务的产物）
       · 正在进行的小时：用「最新读数 − 上小时末读数」给参考值，标 partial + progress
       · 还没到的时段：value = null、future = true（前端画虚线，**绝不补 0**）
 
-    `closed=True` 表示**这一天已经整日结束**（大屏/后台在查历史日期）。
+    `closed=True` 表示**这个生产日已经整日结束**（大屏/后台在查历史日期）。
     此时 24 个小时全部走聚合表，既没有「进行中」也没有「计划」。
 
-    ⚠ 为什么这个参数必须显式传（B-522）：调用方为了表达「这一天过完了」，
-    把 as-of 造成为该日的 23:59:59 —— 于是 `day == now.date()` 恒真，
-    第 23 小时被误判成「进行中」，改走实时窗口。历史上实时窗口又没有上界，
-    一格就装下了从那天 23:04 一直到此刻的全部用量（一线 8.1 → 85）。
-    「这一天是否已经结束」是调用方的意图，不可能从时间戳里反推出来，只能说出来。
+    ⚠ 「这一天是否已经结束」必须由调用方显式传（B-522）：不能从时间戳反推，
+    否则历史日的最后一格会被误判成「进行中」并改走实时窗口。
     """
     now = now or datetime.now()
     meters = list(meters)
     cells: dict[int, HourCell] = {}
+    current_day = B.production_day(now)
+    is_current = day == current_day
+    ongoing = B.hour_index_at(day, now) if (is_current and not closed) else None
 
     # 「登记了但从未接线」的表没有否决权（口径与 ranges._hour_matrix 同源，
     # 见 coverage 模块）。不这么处理时，一块未接入的水表会让它所在组的
@@ -126,40 +129,41 @@ def hourly_cells(
     first_ok = first_data_map(meters) if meters else {}
     connected = [m for m in meters if m.id in first_ok]
 
-    future_flag = not closed and day == now.date()
     if not connected:
         # 有登记但一块都没接入过 → unconnected（区别于「查了但没有表」的 missing）
         return {
-            h: HourCell(
+            i: HourCell(
                 None,
                 Q_UNCONNECTED if meters else EnergyHourly.Q_MISSING,
-                future=(future_flag and h > now.hour),
+                future=(ongoing is not None and i > ongoing),
             )
-            for h in range(24)
+            for i in range(24)
         }
 
-    rows = EnergyHourly.objects.filter(meter__in=connected, stat_date=day)
-    grouped: dict[int, list[EnergyHourly]] = defaultdict(list)
+    rows = EnergyHourly.objects.filter(
+        meter__in=connected, stat_date__in=(day, day + timedelta(days=1))
+    )
+    grouped: dict[tuple[date_cls, int], list[EnergyHourly]] = defaultdict(list)
     for row in rows:
-        grouped[row.stat_hour].append(row)
+        if B.hour_index(day, row.stat_date, row.stat_hour) is not None:
+            grouped[(row.stat_date, row.stat_hour)].append(row)
 
-    is_today = day == now.date()
-    for hour in range(24):
+    for i in range(24):
+        bucket = B.hour_bucket(day, i)
         if closed:
-            cells[hour] = _finished_hour_cell(connected, grouped.get(hour, []), first_ok, (day, hour))
+            cells[i] = _finished_hour_cell(connected, grouped.get(bucket, []), first_ok, bucket)
             continue
-        if day > now.date():
-            cells[hour] = HourCell(None, "future", future=True)
+        if day > current_day:
+            cells[i] = HourCell(None, "future", future=True)
             continue
-        if is_today and hour > now.hour:
-            cells[hour] = HourCell(None, "future", future=True)
-            continue
-
-        if is_today and hour == now.hour:
-            cells[hour] = _current_hour_cell(connected, now)
-            continue
-
-        cells[hour] = _finished_hour_cell(connected, grouped.get(hour, []), first_ok, (day, hour))
+        if is_current and ongoing is not None:
+            if i > ongoing:
+                cells[i] = HourCell(None, "future", future=True)
+                continue
+            if i == ongoing:
+                cells[i] = _current_hour_cell(connected, now)
+                continue
+        cells[i] = _finished_hour_cell(connected, grouped.get(bucket, []), first_ok, bucket)
 
     return cells
 
@@ -252,7 +256,14 @@ class ProdInfo:
 
 
 def production_info(line: ProductionLine, day: date_cls) -> ProdInfo:
-    rows = list(ProductionHourly.objects.filter(line=line, stat_date=day))
+    """某线某个生产日的逐小时产量；by_hour 仍按**时钟小时**索引（06…23、00…05）。"""
+    rows = [
+        r
+        for r in ProductionHourly.objects.filter(
+            line=line, stat_date__in=(day, day + timedelta(days=1))
+        )
+        if B.hour_index(day, r.stat_date, r.stat_hour) is not None
+    ]
     if not rows:
         return ProdInfo({}, False, ProductionHourly.SOURCE_NONE, ProductionHourly.Q_NODATA)
 
@@ -274,16 +285,10 @@ def production_info(line: ProductionLine, day: date_cls) -> ProdInfo:
     return ProdInfo(by_hour, has_real, src, q)
 
 
-def production_sum(line: ProductionLine, start: date_cls, end: date_cls) -> Decimal:
-    """区间真实产量合计（演示占位不计入）。"""
-    total = (
-        ProductionHourly.objects.filter(
-            line=line, stat_date__gte=start, stat_date__lte=end, quality__in=ProductionHourly.TRUSTED
-        )
-        .exclude(source__in=DEMO_SOURCES)
-        .aggregate(t=Sum("output"))["t"]
-    )
-    return Decimal(total) if total is not None else Decimal(0)
+def production_sum(line: ProductionLine, start: datetime, end: datetime) -> Decimal:
+    """生产日窗口内的真实产量合计（演示占位不计入）。"""
+    total = S.production_total([line], start, end)
+    return total if total is not None else Decimal(0)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -291,8 +296,17 @@ def production_sum(line: ProductionLine, start: date_cls, end: date_cls) -> Deci
 # ══════════════════════════════════════════════════════════════
 
 
-def _hour_point(hour: int, cell: HourCell, prod: Decimal | None = None, real_prod: bool = False) -> dict:
+def _hour_point(
+    index: int,
+    clock: int,
+    cell: HourCell,
+    prod: Decimal | None = None,
+    real_prod: bool = False,
+) -> dict:
     """→ HourPoint。
+
+    `hour` 是**生产日序号** 0—23（0 = 06:00），`clock` 是实际时钟小时；
+    前端用 `hour` 索引数组、用 `clock` 显示 `06:00` 这类标签。
 
     `real_prod=False`（产量未接入）时 output 给 **null**、unitKwh 给 null：
     null 是「还没接数据 / 算不出来」，0 是「确实没产出」—— 两者不能混。
@@ -304,7 +318,9 @@ def _hour_point(hour: int, cell: HourCell, prod: Decimal | None = None, real_pro
     else:
         unit = None
     return {
-        "hour": hour,
+        "hour": index,
+        "clock": clock,
+        "dayOffset": 1 if clock < B.DAY_START_HOUR else 0,
         "output": output,
         "kwh": round_kwh(cell.value),
         "unitKwh": unit,
@@ -384,14 +400,15 @@ def _labels_for(dim: str, day: date_cls) -> str:
     return day.strftime("%Y年")
 
 
-def _range_kwh(meters_qs, start: date_cls, end: date_cls) -> Decimal | None:
-    """按日期区间直接汇总电量。
+def _range_kwh(meters_qs, start: datetime, end: datetime) -> Decimal | None:
+    """按生产日窗口直接汇总电量（06:00 起止，不是自然日期区间）。
 
-    未到的小时在 EnergyHourly 里**本来就没有行**，所以不需要再做时间截断，
-    口径比「按小时累加再截断」更准（跨月时不会漏掉前几天晚上的小时）。
+    未到的小时在 EnergyHourly 里**本来就没有行**，所以不需要再做时间截断。
     """
     agg = EnergyHourly.objects.filter(
-        meter__in=meters_qs, stat_date__gte=start, stat_date__lte=end, quality__in=EnergyHourly.TRUSTED
+        B.hour_q(start, end),
+        meter__in=meters_qs,
+        quality__in=EnergyHourly.TRUSTED,
     ).aggregate(t=Sum("consumption"))
     return agg["t"]
 
@@ -441,12 +458,7 @@ def _period_series(
             continue
 
         # ── 退化路径：现算（表里缺行时才会走到，日志已 warning）──
-        if dim == PeriodSummary.DIM_DAY:
-            start = end = d
-        else:
-            start, end = S.period_bounds(dim, key)
-            if end > now.date():
-                end = now.date()
+        start, end = B.period_window(dim, key)
         meters = (
             [m for m in line.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
             if line is not None
@@ -469,21 +481,26 @@ def _period_series(
 def build_line(line: ProductionLine, now: datetime | None = None, *, closed: bool = False) -> dict:
     """组装单条产线的前端结构。`closed=True` = 查的是已经结束的整天（见 `hourly_cells`）。"""
     now = now or datetime.now()
-    today = now.date()
+    today = B.production_day(now)
     yesterday = today - timedelta(days=1)
+    current_index = None if closed else B.hour_index_at(today, now)
+    upto = 23 if current_index is None else current_index
 
     cells = _line_kwh_cells(line, today, now, closed)
     y_cells = _line_kwh_cells(line, yesterday, now, closed=True)
     prod = production_info(line, today)
 
-    hours = [_hour_point(h, cells[h], prod.by_hour.get(h), prod.real) for h in range(24)]
-    # 今天进行中：给部分合计 + 覆盖度；昨天已结束：严格口径
-    today_kwh, cov, exp = _sum_cells(cells, upto=(23 if closed else now.hour), running=True)
+    hours = [
+        _hour_point(i, B.hour_bucket(today, i)[1], cells[i], prod.by_hour.get(B.hour_bucket(today, i)[1]), prod.real)
+        for i in range(24)
+    ]
+    # 当前生产日进行中：给部分合计 + 覆盖度；上一个已结束：严格口径
+    today_kwh, cov, exp = _sum_cells(cells, upto=upto, running=True)
     y_kwh, _, _ = _sum_cells(y_cells, upto=23)
 
     # ── 产量：只认真实数据源；演示占位与「无数据」都按未接入处理（null，不是 0）──
-    today_out = production_sum(line, today, today) if prod.real else None
-    y_out = production_sum(line, yesterday, yesterday) if prod.real else None
+    today_out = production_sum(line, *B.period_window(PeriodSummary.DIM_DAY, S.make_key("day", today))) if prod.real else None
+    y_out = production_sum(line, *B.period_window(PeriodSummary.DIM_DAY, S.make_key("day", yesterday))) if prod.real else None
 
     # ── 日 / 月 / 年：优先读汇总表 ──
     day_rows = _summary_rows(PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_LINE, line, [S.make_key("day", today)])
@@ -519,7 +536,7 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
             status = "running"
     else:
         latest_hour = max(
-            (h for h, c in cells.items() if h <= now.hour and c.value is not None),
+            (i for i, c in cells.items() if i <= upto and c.value is not None),
             default=None,
         )
         load = cells[latest_hour].value if latest_hour is not None else Decimal(0)
@@ -536,12 +553,20 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
     m12 = S.recent_months(12, now)
     y5 = S.recent_years(5, now)
     plan_now = _plan_for(line, today, now)
+    standard = StandardUnitConsumption.objects.filter(
+        line=line, energy_type__type_code=EnergyType.ELECTRIC
+    ).first()
+    standard_kwh = (
+        float(standard.value) if standard is not None and standard.value is not None else NULL
+    )
 
     return {
         "id": line.line_code,
         "name": line.line_name,
         "rated": line.rated or 0,
         "product": line.product or "",
+        # 标准电单耗（kWh/千瓶）；未标定为 null，界面显示 --，不要回退到硬编码 8.2
+        "standardUnitKwh": standard_kwh,
         "status": status,
         "note": "" if prod.real else "产量数据源未接入",
         "hours": hours,
@@ -597,32 +622,44 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
 
 
 def _heat(line: ProductionLine, today: date_cls, now: datetime, real: bool) -> list[list[int | None]]:
-    """近 7 日 × 24 小时产量热力图，单位「百瓶」。未接入时整片 null。"""
+    """近 7 个生产日 × 24 格产量热力图，单位「百瓶」。未接入时整片 null。"""
     if not real:
         return [[NULL for _ in range(24)] for _ in range(7)]
-    rows = ProductionHourly.objects.filter(
-        line=line, stat_date__gte=today - timedelta(days=6), stat_date__lte=today, quality__in=ProductionHourly.TRUSTED
-    ).exclude(source__in=DEMO_SOURCES)
+    days = [today - timedelta(days=i) for i in reversed(range(7))]
     grid: list[list[int | None]] = [[NULL for _ in range(24)] for _ in range(7)]
+    rows = ProductionHourly.objects.filter(
+        line=line,
+        stat_date__gte=today - timedelta(days=7),
+        stat_date__lte=today + timedelta(days=1),
+        quality__in=ProductionHourly.TRUSTED,
+    ).exclude(source__in=DEMO_SOURCES)
     for r in rows:
-        idx = 6 - (today - r.date).days
-        if 0 <= idx < 7 and r.output is not None:
-            grid[idx][r.stat_hour] = int(r.output / 100)
+        if r.output is None:
+            continue
+        d = B.day_of_hour(r.stat_date, r.stat_hour)
+        if d not in days:
+            continue
+        idx = 6 - (today - d).days
+        h = B.hour_index(d, r.stat_date, r.stat_hour)
+        if 0 <= idx < 7 and h is not None:
+            grid[idx][h] = int(r.output / 100)
     return grid
 
 
 def _plan_for(line: ProductionLine, day: date_cls, now: datetime) -> Decimal:
-    """截至当前小时的应产（达成率分母，必须与统计窗口一致）。"""
-    if day != now.date():
+    """截至当前生产日已开始小时的应产（达成率分母，必须与统计窗口一致）。"""
+    if day == B.production_day(now):
+        hours = B.started_hours(day, now)
+    elif day < B.production_day(now):
         hours = 24
     else:
-        hours = now.hour + 1
+        hours = 0
     return Decimal((line.rated or 0) * 0.88 * hours)
 
 
 def _period_total(line: ProductionLine, dim: str, now: datetime) -> Decimal | None:
     """从汇总表取某周期的电量；缺行则退化为现算。"""
-    key = S.make_key(dim, now.date())
+    key = S.make_key(dim, B.production_day(now))
     row = _summary_rows(dim, PeriodSummary.SCOPE_LINE, line, [key]).get(key)
     if row is not None:
         return row.kwh  # 可能为 None（该周期无可信数据），由调用方按「未知」处理
@@ -632,11 +669,12 @@ def _period_total(line: ProductionLine, dim: str, now: datetime) -> Decimal | No
 
 
 def _period_output(line: ProductionLine, dim: str, now: datetime) -> Decimal:
-    key = S.make_key(dim, now.date())
+    key = S.make_key(dim, B.production_day(now))
     row = _summary_rows(dim, PeriodSummary.SCOPE_LINE, line, [key]).get(key)
     if row is not None:
         return row.output if row.output is not None else Decimal(0)
-    return production_sum(line, *S.period_bounds(dim, key))
+    start, end = B.period_window(dim, key)
+    return production_sum(line, start, end)
 
 
 def _month_kwh(line: ProductionLine, now: datetime) -> float | None:
@@ -644,11 +682,10 @@ def _month_kwh(line: ProductionLine, now: datetime) -> float | None:
 
 
 def _month_kwh_raw(line: ProductionLine, now: datetime) -> Decimal | None:
+    key = S.make_key(PeriodSummary.DIM_MONTH, B.production_day(now))
     meters = [m for m in line.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
-    agg = EnergyHourly.objects.filter(
-        meter__in=meters, stat_date__year=now.year, stat_date__month=now.month, quality__in=EnergyHourly.TRUSTED
-    ).aggregate(total=Sum("consumption"))
-    return agg["total"]
+    start, end = B.period_window(PeriodSummary.DIM_MONTH, key)
+    return _range_kwh(meters, start, end)
 
 
 def _year_kwh(line: ProductionLine, now: datetime) -> float | None:
@@ -656,31 +693,32 @@ def _year_kwh(line: ProductionLine, now: datetime) -> float | None:
 
 
 def _year_kwh_raw(line: ProductionLine, now: datetime) -> Decimal | None:
+    key = S.make_key(PeriodSummary.DIM_YEAR, B.production_day(now))
     meters = [m for m in line.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
-    agg = EnergyHourly.objects.filter(
-        meter__in=meters, stat_date__year=now.year, quality__in=EnergyHourly.TRUSTED
-    ).aggregate(total=Sum("consumption"))
-    return agg["total"]
+    start, end = B.period_window(PeriodSummary.DIM_YEAR, key)
+    return _range_kwh(meters, start, end)
 
 
 def _utility_metric(kind: str, now: datetime, unit: str, closed: bool = False) -> dict:
-    today = now.date()
+    today = B.production_day(now)
     yesterday = today - timedelta(days=1)
+    current_index = None if closed else B.hour_index_at(today, now)
+    upto = 23 if current_index is None else current_index
 
     cells = _utility_cells(kind, today, now, closed)
     y_cells = _utility_cells(kind, yesterday, now, closed=True)
 
-    trend = [round_any(cells[h].value, 2) if cells[h].value is not None else NULL for h in range(24)]
+    trend = [round_any(cells[i].value, 2) if cells[i].value is not None else NULL for i in range(24)]
 
-    today_total, cov, exp = _sum_cells(cells, upto=(23 if closed else now.hour), running=True)
+    today_total, cov, exp = _sum_cells(cells, upto=upto, running=True)
     y_total, _, _ = _sum_cells(y_cells, upto=23)
 
     # 瞬时流量：设备响应里的瞬时字段（var2/var3/var4）含义尚未与现场核对，
     # 先用「当前小时用量 ÷ 已覆盖时长」作为平均流量（t/h）的估算值。
     # 查历史整日时没有「当前小时」，给 null —— 0 会被读成「此刻没有流量」。
     rate_now: float | None = None
-    if not closed:
-        current = cells.get(now.hour)
+    if current_index is not None:
+        current = cells.get(current_index)
         if current and current.value is not None and current.progress:
             rate_now = round(float(current.value) / max(current.progress, 1e-6), 2)
 
@@ -699,20 +737,23 @@ def _utility_metric(kind: str, now: datetime, unit: str, closed: bool = False) -
 
 def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict:
     now = now or datetime.now()
+    today = B.production_day(now)
+    current_index = None if closed else B.hour_index_at(today, now)
+    upto = 23 if current_index is None else current_index
     lines = list(ProductionLine.active_lines_qs())
     line_dicts = [build_line(ln, now, closed=closed) for ln in lines]
 
-    w_cells = _workshop_kwh_cells(now.date(), now, closed)
-    w_hours = [_hour_point(h, w_cells[h]) for h in range(24)]
-    w_today, w_cov, w_exp = _sum_cells(w_cells, upto=(23 if closed else now.hour), running=True)
-    w_yesterday, _, _ = _sum_cells(_workshop_kwh_cells(now.date() - timedelta(days=1), now, closed=True), upto=23)
+    w_cells = _workshop_kwh_cells(today, now, closed)
+    w_hours = [_hour_point(i, B.hour_bucket(today, i)[1], w_cells[i]) for i in range(24)]
+    w_today, w_cov, w_exp = _sum_cells(w_cells, upto=upto, running=True)
+    w_yesterday, _, _ = _sum_cells(_workshop_kwh_cells(today - timedelta(days=1), now, closed=True), upto=23)
 
     water = _utility_metric(EnergyType.WATER, now, "t", closed)
     steam = _utility_metric(EnergyType.STEAM, now, "t", closed)
 
     # 车间产量 = 各线真实产量之和（演示占位已在上游被排除）
     # 是否有**真实**产量数据源（演示占位不算）—— 决定要不要挂「产量未接入」提示
-    real_any = any(production_info(ln, now.date()).real for ln in lines)
+    real_any = any(production_info(ln, today).real for ln in lines)
     w_today_out = sum(int(ln["today"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
     w_y_out = sum(int(ln["yesterday"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
 
@@ -804,16 +845,31 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
             PeriodSummary.DIM_YEAR, PeriodSummary.SCOPE_WORKSHOP, None, y5, prod_line=None, now=now, real=real_any
         ),
         "utility": {"water": water, "steam": steam},
-        "targetUnitKwh": float(conf.get("energy_defaults.target_unit_kwh", 0) or 0),
+        # 车间目标 = 已标定产线的算术平均；一条都没标定就是 null（不是 0）。
+        # 不按产量加权：产量尚未接入时加权分母不存在，宁可给一个明确的“未标定”。
+        "targetUnitKwh": _workshop_standard(),
         "alerts": alerts,
-        # currentHour = 排序与「第 N 点已出数」的锚点（查历史整日时 = 23）
-        # ongoingHour = 真正「还没结束」的小时；查历史整日时为 null。
+        # currentHour = 生产日序号锚点（0 = 06:00，查历史整日时 = 23）
+        # ongoingHour = 真正「还没结束」的生产日序号；查历史整日时为 null。
         # 两者必须分开（B-522，与 B-518 同源）：拿锚点当进行中，
-        # 界面就会在 09-27 的 23 点写「进行中」，而那一格其实早就结算完了。
-        "currentHour": now.hour,
-        "ongoingHour": None if closed else now.hour,
+        # 界面就会在历史日的最后一格写「进行中」，而那一格其实早就结算完了。
+        "currentHour": 23 if current_index is None else current_index,
+        "ongoingHour": None if closed else current_index,
         "dayClosed": closed or None,
     }
+
+
+def _workshop_standard() -> float | None:
+    """车间目标电单耗：已标定产线的算术平均；未标定为 null。"""
+    values = [
+        float(v)
+        for v in StandardUnitConsumption.objects.filter(
+            line__node_type=ProductionLine.NODE_LINE,
+            energy_type__type_code=EnergyType.ELECTRIC,
+            value__isnull=False,
+        ).values_list("value", flat=True)
+    ]
+    return round(sum(values) / len(values), 2) if values else None
 
 
 def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
@@ -821,7 +877,7 @@ def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
 
     `real=False`（产量未接入）时 output 给 null —— 与线级口径一致。
     """
-    key = S.make_key(dim, now.date())
+    key = S.make_key(dim, B.production_day(now))
     row = _summary_rows(dim, PeriodSummary.SCOPE_WORKSHOP, None, [key]).get(key)
     if row is not None:
         # output 为 NULL 表示该周期没有可信产量；real=False（产量未接入）时统一留空
@@ -829,13 +885,13 @@ def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
             "output": int(row.output) if (real and row.output is not None) else (0 if real else NULL),
             "kwh": row.kwh,
         }
-    start, end = S.period_bounds(dim, key)
+    start, end = B.period_window(dim, key)
     agg = EnergyHourly.objects.filter(
-        meter__energy_type__type_code=EnergyType.ELECTRIC, stat_date__gte=start, stat_date__lte=end, quality__in=EnergyHourly.TRUSTED
+        B.hour_q(start, end),
+        meter__energy_type__type_code=EnergyType.ELECTRIC,
+        quality__in=EnergyHourly.TRUSTED,
     ).aggregate(total=Sum("consumption"))
-    out = sum(
-        (production_sum(ln, start, end) for ln in ProductionLine.active_lines_qs()), Decimal(0)
-    )
+    out = S.production_total(list(ProductionLine.active_lines_qs()), start, end) or Decimal(0)
     return {"output": int(out) if real else NULL, "kwh": agg["total"] or Decimal(0)}
 
 

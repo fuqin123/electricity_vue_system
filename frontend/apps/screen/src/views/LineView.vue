@@ -51,7 +51,7 @@ const store = useEnergyStore();
 /** 趋势维度与总览共用同一份状态，来回切屏不会丢 */
 const { dim, selectedDate, today, isHistory, stale } = storeToRefs(store);
 
-const lineId = computed(() => String(route.params.lineId ?? 'A1').toUpperCase());
+const lineId = computed(() => String(route.params.lineId ?? 'W103').toUpperCase());
 
 watch(
   lineId,
@@ -72,8 +72,8 @@ const DIMS: TrendDim[] = ['年', '月', '日', '时'];
 const DIM_NOTE: Record<TrendDim, string> = {
   年: '每柱＝1 年 · 近 5 年 · 本线',
   月: '每柱＝1 个月 · 近 12 个月 · 本线（当月为进行中）',
-  日: '每柱＝1 天 · 近 30 天 · 本线（今日为进行中）',
-  时: '每柱＝1 小时 · 今日 24 小时 · 本线'
+  日: '每柱＝1 个生产日 · 近 30 日 · 本线（当前生产日为进行中）',
+  时: '每柱＝1 小时 · 本生产日 24 小时（06:00—次日06:00） · 本线'
 };
 
 /** 单位电耗是否算得出来 —— 决定趋势第二条曲线是「单位电耗」还是「用电量」 */
@@ -135,7 +135,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   if (!l || !w) return [];
   const curH = w.currentHour;
   const h = l.hours[curH];
-  const hPlan = Math.round(l.rated * PLAN_RATE * PROFILE[curH]);
+  const hPlan = Math.round(l.rated * PLAN_RATE * PROFILE[h?.clock ?? 0]);
   /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
   const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
   const hRef = hOut ?? 0;
@@ -146,7 +146,8 @@ const kpiCards = computed<KpiCard[]>(() => {
   const mk = big(l.month.kwh, 'kWh');
   const dk = big(l.today.kwh, 'kWh');
   const hk = big(h?.kwh ?? 0, 'kWh');
-  const overTarget = l.today.unitKwh !== null && l.today.unitKwh > 8.2;
+  const target = l.standardUnitKwh;
+  const overTarget = target !== null && l.today.unitKwh !== null && l.today.unitKwh > target;
   /** 产量未接入时，达成率没有意义 —— 显示 `--`，不要显示 0% */
   const rateText = prodOn ? `${l.today.rate.toFixed(1)}%` : '--';
 
@@ -163,12 +164,12 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#7c8cff',
       label: '本月累计产量',
       value: mq,
-      sub: `用电 ${mk.v}${mk.u} · 今日单耗 ${l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(2)}${overTarget ? '（超目标）' : ''}`
+      sub: `用电 ${mk.v}${mk.u} · 本生产日单耗 ${l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(2)}${overTarget ? '（超标准）' : ''}`
     },
     {
       tag: '日',
       color: '#a78bfa',
-      label: '今日累计产量',
+      label: '本生产日累计产量',
       value: big(l.today.output, '瓶'),
       delta: prodOn ? rise(l.today.output, l.yesterday.output) : null,
       sub: `完成率 ${rateText} · 用电 ${dk.v}${dk.u}`
@@ -227,7 +228,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
     list.push({
       level: 'err',
       text: `单位电耗 ${(w2.unitKwh ?? 0).toFixed(2)}，超阈值 ${thresholds.unitKwhHigh.toFixed(2)}`,
-      time: `${pad2(w2.hour)}:00:00`
+      time: `${pad2(w2.clock)}:00:00`
     });
   }
 
@@ -246,12 +247,14 @@ const lineAlerts = computed<AlertItem[]>(() => {
   if (start >= 0) runs.push([start, 23]);
   runs.forEach((r) => {
     const span = r[1] - r[0] + 1;
+    const c0 = l.hours[r[0]]?.clock ?? 0;
+    const c1 = l.hours[r[1]]?.clock ?? 0;
     list.push({
       level: prodOn ? (span >= 3 ? 'warn' : 'info') : 'info',
       text:
-        (span > 1 ? `${pad2(r[0])}—${pad2(r[1])} 时计划停机 ${span} 小时` : `${pad2(r[0])} 时计划停机`) +
+        (span > 1 ? `${pad2(c0)}—${pad2(c1)} 时计划停机 ${span} 小时` : `${pad2(c0)} 时计划停机`) +
         (l.note ? `（${l.note}）` : ''),
-      time: `${pad2(r[1])}:00:00`
+      time: `${pad2(c1)}:00:00`
     });
   });
 
@@ -259,7 +262,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
     /* 电表缺失（有产量无电量） */
     l.hours.forEach((s) => {
       if (!s.future && (s.output ?? 0) > 0 && (s.kwh === null || s.kwh === 0)) {
-        list.push({ level: 'err', text: '产量已上报但电表无数据', time: `${pad2(s.hour)}:00:00` });
+        list.push({ level: 'err', text: '产量已上报但电表无数据', time: `${pad2(s.clock)}:00:00` });
       }
     });
 
@@ -278,7 +281,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
         text: `本小时预计产量 ${((cur.projected ?? 0) / 1000).toFixed(1)} 千瓶，低于额定 ${Math.round(
           thresholds.outputLowRate * 100
         )}%`,
-        time: `${pad2(curH)}:00:00`
+        time: `${pad2(cur.clock)}:00:00`
       });
     }
   }
@@ -441,7 +444,7 @@ function switchLine(id: string) {
 
       <!-- ══════ 右列 ══════ -->
       <div class="col">
-        <PanelBox title="今日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
+        <PanelBox title="本生产日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
           <template #note><span class="panel__note">{{ todayNote }}</span></template>
           <ChartBox :option="todayOption" grow />
         </PanelBox>

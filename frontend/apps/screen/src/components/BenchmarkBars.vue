@@ -7,7 +7,7 @@
  * 失去区分度，因此改用以目标为基准的达成度表达。
  */
 import { computed } from 'vue';
-import { energyModel, thresholds, type LineData, type WorkshopData } from '@eep/shared';
+import { thresholds, type LineData, type WorkshopData } from '@eep/shared';
 
 const props = defineProps<{
   ws: WorkshopData;
@@ -21,6 +21,8 @@ interface BenchRow {
   note: string;
 }
 
+const target = computed(() => props.line.standardUnitKwh ?? props.ws.targetUnitKwh);
+
 const rows = computed<BenchRow[]>(() => {
   const valid = props.ws.lines.filter((l) => l.today.unitKwh !== null);
   const avg = valid.length
@@ -32,17 +34,16 @@ const rows = computed<BenchRow[]>(() => {
   });
 
   return [
-    { key: `本线 ${props.line.id}`, value: props.line.today.unitKwh, cls: '', note: '实际' },
+    { key: `本线 ${props.line.name || props.line.id}`, value: props.line.today.unitKwh, cls: '', note: '实际' },
     { key: '车间平均', value: avg || null, cls: '', note: '六线均值' },
-    { key: `最优线 ${best ? (best as LineData).id : '--'}`, value: best ? (best as LineData).today.unitKwh : null, cls: 'is-ref', note: '标杆' },
-    { key: '目标值', value: energyModel.targetUnitKwh, cls: 'is-target', note: '考核目标' }
+    { key: `最优线 ${best ? ((best as LineData).name || (best as LineData).id) : '--'}`, value: best ? (best as LineData).today.unitKwh : null, cls: 'is-ref', note: '标杆' },
+    { key: '标准值', value: target.value, cls: 'is-target', note: '按线标准' }
   ];
 });
 
-const target = energyModel.targetUnitKwh;
-
 function width(v: number | null) {
-  return (v && v > 0 ? Math.min((target / v) * 100, 100) : 0).toFixed(1);
+  const t = target.value;
+  return t !== null && v && v > 0 ? Math.min((t / v) * 100, 100).toFixed(1) : '0.0';
 }
 
 function color(r: BenchRow) {

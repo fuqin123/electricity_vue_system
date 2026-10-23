@@ -44,6 +44,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db import transaction
 from django.db.models import Count, Max, Sum
 from django.http import HttpRequest, JsonResponse
 from django.utils.dateparse import parse_date
@@ -67,8 +68,10 @@ from .models import (
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
+    StandardUnitConsumption,
     SystemParam,
 )
+from .services import business_day as B
 from .services import ranges, slots
 from .services import summary as S
 from .services.snapshot import build_line, build_overview
@@ -112,43 +115,41 @@ def json_err(message: str, status: int = 400, **extra) -> JsonResponse:
 
 
 def _query_date(request: HttpRequest) -> date_cls:
+    """`?date=` 表示**生产日开始日期**；不传时取当前生产日（06:00 前仍是前一天）。"""
     raw = request.GET.get("date")
     if raw:
         parsed = parse_date(raw)
         if parsed:
             return parsed
-    return datetime.now().date()
+    return B.production_day(datetime.now())
 
 
 def _now_for(day: date_cls) -> datetime:
-    """按指定日期构造「现在」—— 决定接口把哪些小时算作「已过去」。
+    """按指定生产日构造「现在」—— 决定接口把哪些小时算作「已过去」。
 
-    · 今天     → 真实当前时刻（当天的 24 小时里只算到当前小时）
-    · 历史日期 → 当天 23:59:59（**整天都已经结束**，24 小时全部计入）
-    · 未来日期 → 当天 00:00:00（什么都没有，避免把未来数据算进来）
+    · 当前生产日 → 真实当前时刻（只算到当前小时）
+    · 历史生产日 → 次日 05:59:59（**整个生产日已结束**，24 小时全部计入）
+    · 未来生产日 → 当天 06:00:00（什么都没有，避免把未来数据算进来）
 
-    历史日期这里必须用「当天末」而不是「当天 + 当前时分」：
-    否则上午 10 点去看昨天的数据，昨天 11—23 点会被当成「还没到」而全部留空，
-    现场会以为昨天的数据丢了。
+    历史生产日这里必须用「日末」而不是「日首 + 当前时分」：
+    否则上午 10 点去看上一个生产日，06—23 点会被当成「还没到」而全部留空。
     """
-    today = datetime.now().date()
-    if day == today:
-        return datetime.now()
-    if day < today:
-        return datetime.combine(day, time(23, 59, 59))
-    return datetime.combine(day, time(0, 0, 0))
+    now = datetime.now()
+    current = B.production_day(now)
+    if day == current:
+        return now
+    if day < current:
+        return B.day_end(day) - timedelta(seconds=1)
+    return B.day_start(day)
 
 
 def _is_closed(day: date_cls) -> bool:
-    """这一天是否**已经整日结束** —— 只能问调用方要，不能从 `_now_for` 反推（B-522）。
+    """这个生产日是否**已经整日结束** —— 只能问调用方要，不能从 `_now_for` 反推（B-522）。
 
-    `_now_for(历史日)` 给的是那天 23:59:59，于是 `day == now.date()` 恒真，
-    快照层就把第 23 小时当成「还没结束」，改用实时窗口取数；
-    而实时窗口一度还没有时间上界，把那天 23:04 之后到此刻的全部读数减成一个数：
-    实测查 09-27 时一线 23 点 = 85 kWh（真值 8.1）、三线 = 3285 kWh（真值 343.1），
-    界面还给它打上「进行中」，日累计随之整体虚高。
+    `_now_for(历史生产日)` 给的是次日 05:59:59，若用 `day == now.date()` 判断，
+    会把这天误当成「今天」，把最后一格改成实时窗口取数，日累计虚高。
     """
-    return day < datetime.now().date()
+    return day < B.production_day(datetime.now())
 
 
 def _body(request: HttpRequest) -> dict:
@@ -623,10 +624,14 @@ def collect_log_json(r: EnergyCollectLog) -> dict:
 
 
 def _meter_today_usage() -> dict:
-    today = datetime.now().date()
+    now = datetime.now()
+    day = B.production_day(now)
     return {
         row["meter_id"]: row
-        for row in EnergyHourly.objects.filter(stat_date=today, quality__in=EnergyHourly.TRUSTED)
+        for row in EnergyHourly.objects.filter(
+            B.hour_q(B.day_start(day), B.day_end(day)),
+            quality__in=EnergyHourly.TRUSTED,
+        )
         .values("meter_id")
         .annotate(total=Sum("consumption"), hours=Count("id"))
     }
@@ -674,8 +679,11 @@ def hourly(request: HttpRequest) -> JsonResponse:
         scope_desc = f"{start} ~ {end}"
     else:
         start = end = _query_date(request)
-        qs = EnergyHourly.objects.filter(stat_date=start).select_related("meter", "meter__line")
-        scope_desc = str(start)
+        # date 表示生产日：06:00—次日 06:00，而不是自然日 00—23
+        qs = EnergyHourly.objects.filter(
+            B.hour_q(B.day_start(start), B.day_end(start))
+        ).select_related("meter", "meter__line")
+        scope_desc = f"{start} 生产日（06:00—次日 06:00）"
 
     if request.GET.get("line"):
         qs = qs.filter(meter__line__line_code=request.GET["line"])
@@ -795,7 +803,7 @@ def period_summary(request: HttpRequest) -> JsonResponse:
     拼回「一个周期一行、电水汽齐备」的形状，**对外结构一字未改**。
 
     参数：dim=day|month|year（默认 day）、scope=line|workshop（默认 workshop）、
-          line=A1、limit=N（默认 40，按周期倒序）
+          line=W103、limit=N（默认 40，按周期倒序）
     """
     dim = request.GET.get("dim", PeriodSummary.DIM_DAY)
     scope = request.GET.get("scope", PeriodSummary.SCOPE_WORKSHOP)
@@ -817,7 +825,7 @@ def period_summary(request: HttpRequest) -> JsonResponse:
     if scope == PeriodSummary.SCOPE_LINE:
         code = request.GET.get("line")
         if not code:
-            return json_err("scope=line 时必须给 line 参数，如 line=A1")
+            return json_err("scope=line 时必须给 line 参数，如 line=W103")
         line_obj = ProductionLine.objects.filter(line_code=str(code).upper()).first()
         if line_obj is None:
             return json_err(f"产线不存在：{code}")
@@ -905,7 +913,7 @@ def usage_range(request: HttpRequest) -> JsonResponse:
                          缺省为今天；最长 366 天
       granularity        hour | day | month（默认 day）
       scope              workshop | line | all（默认 all：车间 + 各线）
-      line               当 scope=line 时指定产线，如 A1
+      line               当 scope=line 时指定产线，如 W103
       kind / workshop / usage_type / device / node_code
                          ★ v1.5.2 后台三级筛选（车间 → 用能类型 → 设备）。
                          与「线别」不同：这套维度能表达辅机 / 瓶胚 / 调配这类
@@ -927,25 +935,36 @@ def usage_range(request: HttpRequest) -> JsonResponse:
       会被静默忽略并回退成「今天」，界面看着有数、其实是另一天的数。
       非法 date 一律 400，不静默回退（同项目铁律：参数错就要报错）。
     """
-    if request.GET.get("date"):
-        # date 优先于 from/to：单日查询是最常用入口，语义要唯一
+    date_raw = request.GET.get("date")
+    if date_raw:
+        # date 优先于 from/to：单日查询是最常用入口，语义要唯一。
+        # `date` 表示**生产日开始日期**，窗口 = 当天 06:00 → 次日 06:00。
         # ⚠ Django 的 parse_date 只对**格式**错误返回 None；月份/日越界
         #   （2026-13-99）会直接抛 ValueError → 未捕获就是 HTTP 500。
         #   两种错都属「参数错」，必须一律 400 并把原因说清楚。
         try:
-            day_sel = parse_date(request.GET["date"])
+            day_sel = parse_date(date_raw)
         except ValueError:
             day_sel = None
         if day_sel is None:
-            return json_err(f"date 格式必须是 YYYY-MM-DD，收到 {request.GET['date']}")
-        start_at = datetime.combine(day_sel, time.min)
-        end_at = datetime.combine(day_sel, time(hour=23, minute=59))
+            return json_err(f"date 格式必须是 YYYY-MM-DD，收到 {date_raw}")
+        start = end = day_sel
+        start_at = B.day_start(day_sel)
+        end_at = B.day_end(day_sel) - timedelta(seconds=1)
     else:
+        now_real = datetime.now()
         try:
-            start_at, end_at = ranges.parse_hours(request)
+            start_at, end_at = ranges.parse_hours(
+                request, default_start=B.day_start(B.production_day(now_real))
+            )
         except ValueError as exc:
             return json_err(str(exc))
-    start, end = start_at.date(), end_at.date()
+        start = B.production_day(start_at)
+        # 结束时刻正好落在 06:00 时，它属于下一个生产日，而区间并不包含它
+        end = B.production_day(end_at - timedelta(seconds=1))
+        if end < start:
+            end = start
+
     granularity = request.GET.get("granularity", "day")
     scope = request.GET.get("scope", "all")
     if granularity not in ("hour", "day", "month"):
@@ -955,11 +974,11 @@ def usage_range(request: HttpRequest) -> JsonResponse:
 
     line_code = request.GET.get("line")
     if scope == "line" and not line_code:
-        return json_err("scope=line 时必须给 line 参数，如 line=A1")
+        return json_err("scope=line 时必须给 line 参数，如 line=W103")
 
-    # 参考日：给前端标「服务器认为现在是哪天」。date 显式给了就用它，否则用今天。
-    day = start if request.GET.get("date") else datetime.now().date()
-    now = datetime.now() if end >= datetime.now().date() else datetime.combine(end, datetime.max.time())
+    # 参考日：给前端标「服务器认为当前是哪个生产日」。date 显式给了就用它。
+    now = datetime.now()
+    day = day_sel if date_raw else B.production_day(now)
 
     # ★ v1.5.2 三级筛选参数：**同时接受驼峰与下划线两种写法**。
     #   前端 `getRange()` 把 `usageType` 转成 `usage_type` 发出来，而现场/大屏
@@ -1000,18 +1019,21 @@ def dashboard(request: HttpRequest) -> JsonResponse:
     """★ 数据中心（后台首页）主数据 —— 按「电 / 水 / 汽」出累计序列 + 单箱变动费用。
 
     参数：
-      from / to      **精确到小时**：`YYYY-MM-DD HH`（也兼容纯日期，取当日 00:00）
-                     缺省为「今天 00:00 → 当前整点」
-      granularity    hour | day（默认 hour；day 时按天累加）
-      line           可选，如 A1。给定后水/汽序列一律 null ——
+      from / to      **精确到小时**：`YYYY-MM-DD HH`（也兼容纯日期）
+                     缺省为「当前生产日 06:00 → 当前整点」
+      granularity    hour | day（默认 hour；day 时按生产日累加）
+      line           可选，如 W103。给定后水/汽序列一律 null ——
                      车间只有总表，**不存在线别的水/汽**，界面据此禁用勾选，
                      而不是画一条全零线（零会被读成「这条线没用过水」）
 
     与 `/api/energy/range` 同源同口径；缺算料时相关字段为 null 并在
     `cost.blockers` 里写清原因，界面必须把原因显示出来。
     """
+    now = datetime.now()
     try:
-        start_at, end_at = ranges.parse_hours(request)
+        start_at, end_at = ranges.parse_hours(
+            request, default_start=B.day_start(B.production_day(now))
+        )
     except ValueError as exc:
         return json_err(str(exc))
 
@@ -1023,12 +1045,8 @@ def dashboard(request: HttpRequest) -> JsonResponse:
     if line_code and not ProductionLine.objects.filter(line_code=line_code.upper()).exists():
         return json_err(f"产线不存在：{line_code}", 404)
 
-    now = datetime.now()
-    # 查历史区间时把「现在」推到区间末，否则区间尾部会被当成「还没到」而留空（同 B-507）
-    ref_now = now if end_at.date() >= now.date() else end_at.replace(hour=23, minute=59, second=59)
-
     data = ranges.dashboard_range(
-        start_at, end_at, granularity=granularity, line_code=line_code.upper() if line_code else None, now=ref_now
+        start_at, end_at, granularity=granularity, line_code=line_code.upper() if line_code else None, now=now
     )
     data["cadence"] = slots.describe()
     return json_ok(data)
@@ -1094,6 +1112,119 @@ def admin_param_detail(request: HttpRequest, pk: int) -> JsonResponse:
     return json_ok({"id": obj.id, "key": obj.key, "value": obj.value, "updatedAt": obj.updated_at})
 
 
+def _standard_row(
+    line, etype, row: StandardUnitConsumption | None
+) -> dict:
+    return {
+        "line": line.line_code,
+        "lineName": line.line_name,
+        "energy": etype.type_code,
+        "energyName": etype.type_name,
+        "unit": f"{etype.unit}/千瓶",
+        "value": row.value if row is not None else None,
+        "remark": row.remark if row is not None else "",
+        "updatedAt": row.updated_at if row is not None else None,
+        "updatedBy": row.updated_by if row is not None else "",
+        # 水/汽目前只有车间总表，没有分线实测；仍允许配置，但界面要标注
+        "perLineAvailable": etype.type_code == EnergyType.ELECTRIC,
+    }
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT", "PATCH"])
+def admin_standard_units(request: HttpRequest) -> JsonResponse:
+    """标准单耗矩阵（产线 × 能源类型）。
+
+    GET  返回全部产线 × 三种能源的格子；未配置的 `value = null`（不是 0）。
+    PUT  批量保存，请求体 `{ "items": [{line, energy, value, remark}] }`；
+         传 `null` / 空串表示清空为「未标定」。只接受 `node_type=line` 的节点。
+    """
+    lines = list(
+        ProductionLine.objects.filter(node_type=ProductionLine.NODE_LINE).order_by(
+            "sort", "line_code"
+        )
+    )
+    energies = list(EnergyType.objects.order_by("sort", "id"))
+    existing = {
+        (r.line_id, r.energy_type_id): r
+        for r in StandardUnitConsumption.objects.select_related("line", "energy_type")
+    }
+
+    if request.method == "GET":
+        rows = [
+            _standard_row(ln, et, existing.get((ln.id, et.id)))
+            for ln in lines
+            for et in energies
+        ]
+        return json_ok(
+            {
+                "lines": [
+                    {"code": ln.line_code, "name": ln.line_name, "sort": ln.sort} for ln in lines
+                ],
+                "energies": [
+                    {
+                        "code": et.type_code,
+                        "name": et.type_name,
+                        "unit": et.unit,
+                        "perUnit": f"{et.unit}/千瓶",
+                    }
+                    for et in energies
+                ],
+                "rows": rows,
+            }
+        )
+
+    try:
+        body = _body(request)
+    except ValueError as exc:
+        return json_err(str(exc))
+    items = body.get("items")
+    if not isinstance(items, list) or not items:
+        return json_err("items 必须是非空数组")
+
+    line_map = {ln.line_code.upper(): ln for ln in lines}
+    energy_map = {et.type_code.upper(): et for et in energies}
+    updated_by = str(body.get("updatedBy") or "admin")[:32]
+
+    # 先整体校验再写库：否则中途某格数字不合法时，前面的格子已经提交，
+    # 界面收到 400 但库里只改了一半，现场无法判断该以哪次为准。
+    pending: list[tuple] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return json_err("items 的每一项必须是对象")
+        lc = str(item.get("line") or "").upper()
+        ec = str(item.get("energy") or "").upper()
+        line = line_map.get(lc)
+        etype = energy_map.get(ec)
+        if line is None:
+            return json_err(f"产线不存在或不是产线节点：{lc}")
+        if etype is None:
+            return json_err(f"未知能源类型：{ec}")
+        raw = item.get("value")
+        if raw in (None, "", "null"):
+            value = None
+        else:
+            try:
+                value = Decimal(str(raw))
+            except (InvalidOperation, ValueError):
+                return json_err(f"{lc} / {ec} 的标准单耗必须是数字或留空")
+            if value < 0:
+                return json_err(f"{lc} / {ec} 的标准单耗不能为负数")
+        pending.append((line, etype, value, str(item.get("remark") or "")[:200]))
+
+    saved: list[dict] = []
+    with transaction.atomic():
+        for line, etype, value, remark in pending:
+            obj, _ = StandardUnitConsumption.objects.update_or_create(
+                line=line,
+                energy_type=etype,
+                defaults={"value": value, "remark": remark, "updated_by": updated_by},
+            )
+            saved.append(_standard_row(line, etype, obj))
+
+    return json_ok({"saved": len(saved), "items": saved})
+
+
 @require_GET
 def admin_readings(request: HttpRequest) -> JsonResponse:
     """★ 仪表读数查询 —— 按时间 / 网关 / 仪表查 `energy_raw` 的**原始累计读数**。
@@ -1102,7 +1233,7 @@ def admin_readings(request: HttpRequest) -> JsonResponse:
       from / to    精确到小时（`YYYY-MM-DD HH`），缺省为今天
       gateway      网关 id 或编码
       meter        仪表 id 或编码
-      line         产线编码（如 A1）
+      line         产线编码（如 W103）
       energy       能源类型编码（ELECTRIC / WATER / STEAM）
       ok           1 只看成功 / 0 只看失败
       page/pageSize 分页（默认 50，上限 500）
@@ -1142,6 +1273,51 @@ def admin_readings(request: HttpRequest) -> JsonResponse:
     size = max(1, min(int(request.GET.get("pageSize", 50) or 50), 500))
     rows = qs[(page - 1) * size : page * size]
 
+    # 小时差值：一条边界读数 r 是上一个小时的**终点**（end_at），
+    # 直接复用 EnergyHourly 的结算结果，不在这里用相邻原始读数现减 ——
+    # 现减会把「补采 / 跨槽 / 峰值剔除」等口径重新实现一遍，迟早与小时表分叉。
+    # 同页只查一次，按 (meter_id, end_at) 精确认领。
+    page_times = {r.collect_time for r in rows if r.collect_time is not None}
+    hourly_map = {
+        (h.meter_id, h.end_at): h
+        for h in EnergyHourly.objects.filter(
+            meter_id__in={r.meter_id for r in rows}, end_at__in=page_times
+        )
+    } if page_times else {}
+
+    def _hour_payload(r: EnergyRaw) -> dict:
+        h = hourly_map.get((r.meter_id, r.collect_time))
+        if h is not None:
+            if h.quality == EnergyHourly.Q_OK:
+                status = "ok"
+            else:
+                status = h.quality
+            return {
+                "hourUsage": h.consumption,
+                "hourQuality": h.quality,
+                "hourStatus": status,
+                "hourStartAt": h.start_at.strftime("%Y-%m-%d %H:%M:%S") if h.start_at else "",
+                "hourEndAt": h.end_at.strftime("%Y-%m-%d %H:%M:%S") if h.end_at else "",
+                "hourNote": h.note,
+            }
+        # 没有匹配的 end_at：最新一条边界读数还没有“下一小时”可结算，
+        # 或这是一条不在整点采样窗口内的手工读数。两者含义不同，不能都叫 pending。
+        near = r.collect_time is not None and (
+            r.collect_time.minute <= 20 or r.collect_time.minute >= 40
+        )
+        return {
+            "hourUsage": None,
+            "hourQuality": "",
+            "hourStatus": "pending" if near else "not_boundary",
+            "hourStartAt": "",
+            "hourEndAt": "",
+            "hourNote": (
+                "该读数尚未成为任何已结算小时的终点"
+                if near
+                else "读数不在整点采样窗口内（±20 分钟），不参与小时差值"
+            ),
+        }
+
     items = [
         {
             "id": r.id,
@@ -1161,6 +1337,7 @@ def admin_readings(request: HttpRequest) -> JsonResponse:
             "ok": r.ok,
             "raw": r.raw,
             "error": r.error,
+            **_hour_payload(r),
         }
         for r in rows
     ]
@@ -1182,21 +1359,35 @@ def production(request: HttpRequest) -> JsonResponse:
       只要看 `available` 就知道该显示数值还是显示 `--`。
     """
     day = _query_date(request)
-    rows = ProductionHourly.objects.filter(stat_date=day).select_related("line").order_by("line__line_code", "stat_hour")
-    real = rows.exclude(source__in=(ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE))
+    start, end = B.day_start(day), B.day_end(day)
+    rows = [
+        r
+        for r in ProductionHourly.objects.filter(B.hour_q(start, end))
+        .select_related("line")
+        .order_by("line__line_code", "stat_date", "stat_hour")
+        if B.hour_index(day, r.stat_date, r.stat_hour) is not None
+    ]
+    real = [
+        r
+        for r in rows
+        if r.source not in (ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE)
+    ]
 
     return json_ok(
         {
             "date": day.isoformat(),
-            "available": real.exists(),
-            "status": "pending" if not real.exists() else "ok",
+            "dayStartHour": B.DAY_START_HOUR,
+            "available": bool(real),
+            "status": "pending" if not real else "ok",
             "reason": "产量侧取数方式尚未改造（灌装机计数器 / 装箱机 PLC / MES 班报工）",
             "total": int(sum((r.output or 0) for r in real)),
-            "count": rows.count(),
+            "count": len(rows),
             "items": [
                 {
                     "line": r.line.line_code,
-                    "hour": r.stat_hour,
+                    "hour": B.hour_index(day, r.stat_date, r.stat_hour),
+                    "clock": r.stat_hour,
+                    "dayOffset": 1 if r.stat_hour < B.DAY_START_HOUR else 0,
                     "output": float(r.output) if r.output is not None else None,
                     "quality": r.quality,
                     "source": r.source,
@@ -1222,11 +1413,17 @@ def production(request: HttpRequest) -> JsonResponse:
 def admin_overview(request: HttpRequest) -> JsonResponse:
     """后台首页看板。**与 /api/energy/overview 同源**（都读 period_summary + hourly_usage）。"""
     now = datetime.now()
+    day = B.production_day(now)
     ws = build_overview(now)["workshop"]
     since = now - timedelta(hours=24)
 
     usage = _meter_today_usage()
-    expect = EnergyMeter.objects.filter(enabled=True, energy_type__type_code=EnergyType.ELECTRIC).count() * (now.hour + 1)
+    expect = (
+        EnergyMeter.objects.filter(
+            enabled=True, energy_type__type_code=EnergyType.ELECTRIC
+        ).count()
+        * B.started_hours(day, now)
+    )
     received = sum(a.get("hours", 0) for a in usage.values())
     online_ids = _online_gateway_ids(now)
 
@@ -1255,24 +1452,28 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
             },
             "hourly": [
                 {
-                    "label": f"{h:02d}:00",
+                    "label": f"{w['clock']:02d}:00",
+                    "clock": w["clock"],
+                    "dayOffset": w["dayOffset"],
                     # 产量未接入时 output 为 null（不是 0），让后台看板与线显示 --
                     "output": w["output"],
                     "kwh": w["kwh"] or 0,
                     "unitKwh": w["unitKwh"],
                 }
-                for h, w in enumerate(ws["hours"])
+                for w in ws["hours"]
             ],
             "daily30": [
                 {"label": p["label"], "output": p["output"], "kwh": p["kwh"] or 0, "unitKwh": p["unitKwh"]}
                 for p in ws["daily30"]
             ],
             "monthly12": monthly12,
+            "targetUnitKwh": ws["targetUnitKwh"],
             "lineUnitKwh": [
                 {
                     "lineCode": ln["id"],
                     "lineName": ln["name"],
                     "unitKwh": ln["today"]["unitKwh"],
+                    "standardUnitKwh": ln["standardUnitKwh"],
                     "output": ln["today"]["output"],
                 }
                 for ln in ws["lines"]
@@ -1286,12 +1487,11 @@ def admin_overview(request: HttpRequest) -> JsonResponse:
                 )[:5]
             ],
             "dataSource": {
-                "productionAvailable": any(
-                    ProductionHourly.objects.filter(stat_date=now.date())
-                    .exclude(source__in=(ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE))
-                    .exists()
-                    for _ in [0]
-                ),
+                "productionAvailable": ProductionHourly.objects.filter(
+                    B.hour_q(B.day_start(day), B.day_end(day))
+                )
+                .exclude(source__in=(ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE))
+                .exists(),
                 "collectRounds24h": EnergyCollectLog.objects.filter(started_at__gte=since).count(),
             },
         }
@@ -1387,17 +1587,24 @@ def admin_lines(request: HttpRequest) -> JsonResponse:
 
 @require_GET
 def admin_quality(request: HttpRequest) -> JsonResponse:
-    """数据质量（按产线）：应报 / 实收 / 缺报。"""
-    today = datetime.now().date()
-    expect = datetime.now().hour + 1
+    """数据质量（按产线）：当前生产日的应报 / 实收 / 缺报。"""
+    now = datetime.now()
+    day = B.production_day(now)
+    expect = B.started_hours(day, now)
+    expect_buckets = [B.hour_bucket(day, i) for i in range(expect)]
     rows = []
     for ln in ProductionLine.active_lines_qs().order_by("sort", "line_code"):
         meters = [m for m in ln.meters.all() if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled]
         ok_rows = EnergyHourly.objects.filter(
-            meter__in=meters, stat_date=today, quality__in=EnergyHourly.TRUSTED
+            B.hour_q(B.day_start(day), B.day_end(day)),
+            meter__in=meters,
+            quality__in=EnergyHourly.TRUSTED,
         )
-        received = ok_rows.values("stat_hour").distinct().count()
-        missing = sorted(set(range(expect)) - set(ok_rows.values_list("stat_hour", flat=True)))
+        received = ok_rows.values("stat_date", "stat_hour").distinct().count()
+        got = set(ok_rows.values_list("stat_date", "stat_hour"))
+        missing = sorted(
+            h for d, h in expect_buckets if (d, h) not in got
+        )
         last = ok_rows.aggregate(last=Max("computed_at"))["last"]
         rows.append(
             {

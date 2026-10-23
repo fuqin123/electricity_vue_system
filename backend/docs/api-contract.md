@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.5.5 ｜ 最后更新：2026-10-22
+> 版本：v1.6.0 ｜ 最后更新：2026-10-23
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -33,6 +33,8 @@
 | `GET/POST/PUT/DELETE /api/admin/gateways*` `meters*` | ✅ v1.2.1 已实现 | 网关 / 计量点后台增删改；`POST …/{id}/test` 连接测试与试采（返回**真实读数**） |
 | `GET /api/admin/overview` `lines` `quality` `collect-logs` | ✅ v1.2.1 已实现 | 后台看板 / 产线主数据 / 数据质量 / 采集日志 |
 | `GET /api/admin/alarms` `POST /api/admin/alarms/{id}/ack` | ✅ v1.5.4 已实现 | 告警列表与确认，读 `energy_alarm` 表（由告警引擎生成） |
+| `GET /api/admin/readings` | ✅ v1.6.0 增补 | 原始累计读数；每行带「上一小时差值」`hourUsage` 与状态 |
+| `GET/PUT /api/admin/standard-units` | ✅ v1.6.0 已实现 | 标准单耗矩阵（产线 × 电/水/汽），空值为未标定 |
 | `/api/admin/*` 其余（系统管理、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`）；**告警已移出该清单，不再有演示数据** |
 
 > ⚠ v1.2.1 修复：admin 组接口曾误挂在 `/api/energy/admin/*` 下导致前端 404（B-404），
@@ -118,7 +120,7 @@
 ```jsonc
 {
   "meterId": 4, "meter": "E-A4-01", "name": "四线 生产线电表",
-  "category": "电", "lineCode": "A4",
+  "category": "电", "lineCode": "W301",
   "gatewayCode": "GW-TASHI", "gatewayName": "一期配电房塔石",
   "protocol": "Modbus RTU over TCP",
   "address": "10.112.66.133:8890 / 从站 11 / 寄存器 1000×2",
@@ -223,21 +225,21 @@
 
 | 写法 | 含义 |
 | :--- | :--- |
-| `2026-09-24` | 当日 `00:00` |
+| `2026-09-24` | 对 `date=` 查询是**生产日开始日**；对 `from/to` 是绝对时间 `00:00` |
 | `2026-09-24 08` / `2026-09-24T08` | 该整点 |
 | `2026-09-24 08:37` | 规范到 `08:00`（本项目最小时间桶 = 1 小时） |
 
 ⚠ 格式无法解析时接口返回 400 并写明期望格式，**不静默回退到「今天」** ——
 静默回退会让用户以为筛选生效了，实际看的是另一段时间。
-小时端点只在 `granularity=hour` 时生效；`day` / `month` 的桶是整天/整月，端点规范到周期边界。
+小时端点只在 `granularity=hour` 时生效；`day` / `month` 的桶按**生产日**归集，端点规范到生产日/生产月边界。
 
 ### 2) `GET /api/energy/dashboard` ★ 数据中心主数据
 
-参数：`from` / `to`（小时精度，缺省今天 00:00 → 当前整点）、`granularity`（`hour` | `day`）、`line`（可选）。
+参数：`from` / `to`（小时精度，缺省当前生产日 06:00 → 当前整点）、`granularity`（`hour` | `day`）、`line`（可选，如 W103）。
 
 ```json
 {
-  "from": "2026-09-24 00:00", "to": "2026-09-24 15:00",
+  "from": "2026-09-24 06:00", "to": "2026-09-24 15:00",
   "granularity": "hour", "labels": ["09-24 00:00", "..."], "bucketCount": 16,
   "energies": {
     "electric": { "unit": "kWh", "values": [305.9, null], "cumulative": [305.9, 305.9],
@@ -250,6 +252,7 @@
             "standardPerCase": null,
             "blockers": ["成本参数未标定：电价、工业水价", "产量数据源未接入，折不出箱数"] },
   "productionAvailable": false,
+  "dayStartHour": 6,
   "totals": { "kwh": 4194.1, "waterT": null, "steamT": 2.22, "output": null,
               "costYuan": null, "perCaseCost": null }
 }
@@ -263,7 +266,7 @@
   `cost.blockers` 摊开显示**。单价或箱规任一项未标定 → 费用为 `null`，**绝不按 0 计入**
   （少算一项会得到偏小但看起来正常的费用，与 B-302 / B-505 同类）。
 - `standardPerCase` 为 `null` = 未标定，**不画基准虚线**；画成 0 等于宣称「标准是 0 元/箱」。
-- 选 `line=A1` 时 `energies.water/steam` 的 `perLineAvailable=false` 且序列全 `null`：
+- 选 `line=W103` 时 `energies.water/steam` 的 `perLineAvailable=false` 且序列全 `null`：
   水与汽只有车间总表。界面据此**禁用勾选**，不要画一条全零线（零会被读成「这条线没用过水」）。
 
 ### 3) `GET/PUT /api/admin/params` 系统参数（成本算料的唯一真值来源）
@@ -280,6 +283,28 @@
 新增键走 `python manage.py seed_params`。默认登记五项：
 `price.electric` / `price.water` / `price.steam` / `package.bottles_per_case` / `cost.standard_per_case`。
 
+### 3.5) `GET/PUT /api/admin/standard-units` 标准单耗（v1.6.0）
+
+按「产线 × 能源类型」维护考核标准，单位统一为「能源单位 / 千瓶」。
+
+`GET` 返回：
+
+```jsonc
+{
+  "lines": [{ "code": "W103", "name": "一线", "sort": 1 }],
+  "energies": [{ "code": "ELECTRIC", "name": "电", "unit": "kWh", "perUnit": "kWh/千瓶" }],
+  "rows": [{
+    "line": "W103", "lineName": "一线", "energy": "ELECTRIC", "energyName": "电",
+    "unit": "kWh/千瓶", "value": 8.5, "remark": "考核值",
+    "updatedAt": "...", "updatedBy": "admin",
+    "perLineAvailable": true          // 水/汽无分线实测，为 false
+  }]
+}
+```
+
+`PUT` body：`{ "items": [{ "line": "W103", "energy": "ELECTRIC", "value": 8.5, "remark": "" }] }`，
+`value: null` / 空串表示**未标定**（与 0 不同）。整批先校验再写库，任一项非法返回 400 且不落半批。
+
 ### 4) `GET /api/admin/readings` 仪表原始读数查询
 
 参数：`from` / `to`（小时精度）、`gateway`（id 或编码）、`meter`（id 或编码）、
@@ -289,15 +314,24 @@
 ```json
 { "list": [ { "id": 1, "collectTime": "2026-09-24 14:04:04", "meter": "E-A4-01",
               "meterName": "四线 生产线电表", "gateway": "一期配电房塔石", "gatewayId": 1,
-              "line": "A4", "lineName": "四线", "energy": "ELECTRIC", "energyName": "电",
+              "line": "W301", "lineName": "四线", "energy": "ELECTRIC", "energyName": "电",
               "reading": 635929.0, "unit": "kWh", "ok": true,
-              "raw": "slave=11 addr=1000 regs=0061 08fa", "error": "" } ],
+              "raw": "slave=11 addr=1000 regs=0061 08fa", "error": "",
+              "hourUsage": 30.0, "hourQuality": "ok", "hourStatus": "ok",
+              "hourStartAt": "2026-09-24 14:04:04", "hourEndAt": "2026-09-24 15:04:04",
+              "hourNote": "" } ],
   "total": 98, "page": 1, "pageSize": 50, "from": "...", "to": "..." }
 ```
 
 与 `/api/energy/hourly` 的分工：那边是**差分后的用量**，这边是**读数本身 + 原始报文**，
 排查倍率 / 字序 / 断讯从这页开始。`reading` 为 `null` = 这次没读到（不是 0；
 0 会被差值当成真实读数，B-502 的源头就在这张表）。
+
+`hourUsage`（v1.6.0）是**以该读数为终点**结算出的上一小时差值：用
+`EnergyHourly.end_at == collectTime` 精确认领，不在接口里用相邻原始读数现减。
+无匹配行时 `hourUsage = null`，`hourStatus` 区分 `pending`（最新读数尚未结算）与
+`not_boundary`（不在整点 ±20 分钟窗口）；匹配到质量异常时照给 `hourQuality`，
+`consumption = null` 的行显示 `--`，任何情况都不补 0。
 
 ---
 
@@ -311,8 +345,8 @@
 
 | 字段 | 含义 | 查今天 | 查历史日（`?date=2026-09-27`） |
 | :--- | :--- | :--- | :--- |
-| `currentHour` | **排序锚点**：小时表从这一格往上排、备注写「已完成 N 点」 | 当前小时 | 固定 23 |
-| `ongoingHour` | **真正还没结束的小时**；「进行中」状态只能由它推出 | 当前小时 | `null` |
+| `currentHour` | **生产日序号锚点**（0 = 06:00）：小时表从这一格往上排 | 当前生产日序号 | 固定 23 |
+| `ongoingHour` | **真正还没结束的生产日序号**；「进行中」状态只能由它推出 | 当前生产日序号 | `null` |
 | `dayClosed` | 查看的是已经过完的一天 | 字段不出现 | `true` |
 
 ⚠ 历史日的第 23 小时**绝不能**再走「进行中」的实时窗口（B-522）：
@@ -355,23 +389,23 @@
 
 ## 〇·补五、v1.4.2 周期取数规则：当期现算、往期读汇总表 ★ 数字核对必读
 
-日 / 月 / 年汇总从「每小时重刷」改为**每天 00:30 结算一次**（`summarize --rollup`，
-计划任务 `EEP-Rollup`）。配套一条取数规则，写在一个地方、两个界面共用：
+日 / 月 / 年汇总从「每小时重刷」改为**每天 06:30 结算一次**（`summarize --rollup`，
+计划任务 `EEP-Rollup`；v1.6.0 起按生产日 06:00 结束）。配套一条取数规则，写在一个地方、两个界面共用：
 
-> **`summary.is_open_period(dim, key, now)` —— 包含「今天」的那个周期不算结束，
+> **`summary.is_open_period(dim, key, now)` —— 包含「当前生产日」的那个周期不算结束，
 > 一律直接从 `energy_hourly` 现算；已结束的周期才读 `energy_daily` / `monthly` / `yearly`。**
 
 | 界面上的位置 | 数据来源 | 更新时机 |
 | :--- | :--- | :--- |
-| 今日累计、当前小时 | 小时表 + 实时读数 | 每个整点 |
-| 近 30 日的**今天那一根**、本月 / 本年累计 | 小时表现算（不查汇总表） | 每个整点 |
-| 近 30 日的**昨天那一根** | 汇总表行**完整**时读表；行缺失或 `covered_count < expected_count` 时**也退回现算** | 每个整点（B-528） |
-| 近 30 日的历史各根、近 12 月中已结束的各根 | 汇总表 | 每天 00:30 |
+| 当前生产日累计、当前小时 | 小时表 + 实时读数 | 每个整点 |
+| 近 30 日的**当前生产日那一根**、本月 / 本年累计 | 小时表现算（不查汇总表） | 每个整点 |
+| 近 30 日的**上一个生产日那一根** | 汇总表行**完整**时读表；行缺失或 `covered_count < expected_count` 时**也退回现算** | 每个整点（B-528） |
+| 近 30 日的历史各根、近 12 月中已结束的各根 | 汇总表 | 每天 06:30 |
 | 后台「用量查询」按天 / 按月 | 同一函数 `period_rows()` → 与大屏一格不差 | 同上 |
 
 三条推论，排查时用得上：
 
-1. **汇总表当天的行不可信，也不该被读**（它记的是 00:30 那一刻的状态）。
+1. **汇总表当前生产日的行不可信，也不该被读**（它记的是 06:30 那一刻的状态）。
    有人手工把今天的日行改成 999，大屏与后台的当期数字**都不会变** —— 这是设计如此，
    不是缓存问题（单测 `OpenPeriodRollupTests` 锁的就是这一条）。
 2. **`EEP-Rollup` 停掉不会报错**，只会让「近 30 日 / 近 12 月」停在最后一次结算那天，
@@ -405,8 +439,8 @@
           "usageType": "生产线用电",
           "devices": [
             { "code": "E-A1-01", "name": "一线生产线电表", "deviceName": "生产线",
-              "nodeCode": "A1", "nodeName": "一线", "nodeType": "line",
-              "lineCode": "A1", "kind": "elec", "unit": "kWh", "enabled": true }
+              "nodeCode": "W103", "nodeName": "一线", "nodeType": "line",
+              "lineCode": "W103", "kind": "elec", "unit": "kWh", "enabled": true }
           ]
         }
       ]
@@ -427,7 +461,7 @@
 | `workshop` | 车间编码，如 `WS-CARB`（含该车间下的产线与辅助单元） |
 | `usage_type` | 用能类型，如 `生产线用电` |
 | `device` | 设备名，如 `冰水机和水塔` |
-| `node` | 组织节点编码（产线 `A1` / 辅助单元 `AUX-CARB-AIR`） |
+| `node` | 组织节点编码（产线 `W103` / 辅助单元 `AUX-CARB-AIR`） |
 
 行为：
 - 任一项给定 → 进入**焦点通道**，只返回一条序列（`key='focus'`），不再叠「车间合计 + 各线」；
@@ -629,6 +663,19 @@ Authorization: Bearer <token>
 
 ## 二、大屏接口
 
+### 2.0 时间口径（v1.6.0 必读）
+
+- **生产日 D = [D 06:00, D+1 06:00)**，标签用开始日期。全年的「日 / 月 / 年」都按生产日归集。
+- `GET /api/energy/overview?date=YYYY-MM-DD`、`/api/energy/line/{code}?date=` 里的 `date`
+  表示**生产日开始日**，不是自然日；不传时取当前生产日（06:00 前仍是前一天）。
+- `/api/energy/range?date=YYYY-MM-DD` 等价于该生产日 06:00 → 次日 05:59；
+  `from` / `to` 则是**绝对时钟时间**（小时精度）。`granularity=day` / `month` 的桶按生产日 /
+  生产月归集，`granularity=hour` 仍是绝对时钟小时。
+- 24 格分时的 `hour` 是**生产日序号 0—23**（0 = 06:00，18 = 次日 00:00）；实际时钟小时在
+  `clock`，是否落在次日看 `dayOffset`（0/1）。前端必须用 `clock` 显示时间、用 `hour` 索引数组。
+- 结算任务 `EEP-Rollup` 在 **06:30** 结算上一个生产日；覆盖率告警门槛 06:25。
+- 产量接口的 `date` 同样表示生产日；`hour` 是生产日序号，另带 `clock` / `dayOffset`。
+
 ### 2.1 `GET /api/energy/overview`
 
 一次返回大屏总览所需的**全部**数据（含 6 条产线、趋势、告警）。
@@ -643,17 +690,20 @@ Authorization: Bearer <token>
 
     "lines": [
       {
-        "id": "A1",
-        "name": "A1 生产线",
+        "id": "W103",
+        "name": "一线",
         "rated": 30000,                    // 额定产能 瓶/小时
         "product": "冰红茶 500ml",
+        "standardUnitKwh": 8.20,     // 未标定为 null，不要回退到硬编码
         "status": "running",               // running | slow | stopped
         "note": "",                        // 如「CIP 清洗停机」
         "dayOfYear": 265,
 
-        "hours": [                         // ⚠ 长度固定 24，下标 = 小时
+        "hours": [                         // ⚠ 长度固定 24，下标 = 生产日序号
           {
-            "hour": 0,
+            "hour": 0,                 // 0 = 06:00（生产日序号）
+            "clock": 6,                // 实际时钟小时
+            "dayOffset": 0,            // 1 = 次日 00—05
             "output": 26141,               // 瓶；未到时段为 null
             "kwh": 197,                    // 刚过整点可能带 1 位小数
             "unitKwh": 7.54,               // 产量为 0 时为 null
@@ -678,7 +728,7 @@ Authorization: Bearer <token>
         "year":  { "output": 137930000, "kwh": 1078000,
                    "full": 190600000, "fullKwh": 1490000 }
       }
-      // …A2—A6 同构
+      // …W101 / W102 / W301 / W104 / W105 同构
     ],
 
     "today":     { "output": 835736, "kwh": 6863, "unitKwh": 8.21,
@@ -689,7 +739,7 @@ Authorization: Bearer <token>
     "month": { "output": 47871200, "kwh": 385000 },
     "year":  { "output": 601830000, "kwh": 4809000 },
 
-    "hours":     [{ "hour": 0, "output": 76732, "kwh": 652,
+    "hours":     [{ "hour": 0, "clock": 6, "dayOffset": 0, "output": 76732, "kwh": 652,
                     "unitKwh": 8.50, "future": false, "partial": false }],
     "daily30":   [{ "label": "8/23", "output": 2183000, "kwh": 16900, "unitKwh": 7.74 }],
     "monthly12": [{ "label": "10月",  "output": 73180000, "kwh": 588000, "unitKwh": 8.03 }],
@@ -702,9 +752,9 @@ Authorization: Bearer <token>
                  "unit": "t", "trend": [null, null, 20.1] }
     },
 
-    "targetUnitKwh": 8.20,
+    "targetUnitKwh": 8.20,             // 已标定产线的算术平均；未标定为 null
     "alerts": [
-      { "level": "warn", "text": "A4 线本小时预计产量 16.6 千瓶，低于额定 75%", "time": "09:00:00" }
+      { "level": "warn", "text": "四线本小时预计产量 16.6 千瓶，低于额定 75%", "time": "09:00:00" }
     ]
   }
 }
@@ -714,7 +764,7 @@ Authorization: Bearer <token>
 
 | 字段 | 说明 |
 | :--- | :--- |
-| `currentHour` | 当前小时 0—23。车间级与产线级的 `hours[currentHour]` 即「进行中」的那个小时 |
+| `currentHour` | 生产日序号 0—23（0 = 06:00）。车间级与产线级的 `hours[currentHour]` 即「进行中」的那一格 |
 | `hours[i].partial` | `true` 时该小时未走完，`output`/`kwh` 为**已过时间的累计值**，`projected` 为整点预期值 |
 | `hours[i].future` | `true` 时表示还没到，三个数值字段一律 `null` |
 | `today.plan` | **截至当前小时**的应产（日达成率分母），不是全天计划 |
@@ -735,7 +785,7 @@ Authorization: Bearer <token>
 
 单条产线的聚合数据，用于单线详情页刷新（大屏当前从 overview 取，拆成独立接口可减流量）。
 
-**路径参数：** `lineId` — 产线编号，如 `A1`
+**路径参数：** `lineId` — 产线编号，如 `W103`
 
 **响应：**
 
@@ -752,7 +802,7 @@ Authorization: Bearer <token>
 | `from` / `to` | `YYYY-MM-DD` | 日期区间，缺省为今天；最长 366 天 |
 | `granularity` | `hour` / `day` / `month` | 默认 `day` |
 | `scope` | `workshop` / `line` / `all` | 默认 `all`（车间合计 + 各线一次返回） |
-| `line` | 如 `A1` | `scope=line` 时必填 |
+| `line` | 如 `W103` | `scope=line` 时必填 |
 
 ```json
 {
@@ -761,7 +811,7 @@ Authorization: Bearer <token>
   "labels": ["09-17", "09-18", "..."],
   "series": [
     { "key": "workshop", "name": "车间合计", "unit": "kWh", "values": [null, 434.9, null] },
-    { "key": "A1", "name": "一线", "unit": "kWh", "values": [null, null, null] }
+    { "key": "W103", "name": "一线", "unit": "kWh", "values": [null, null, null] }
   ],
   "quality": ["missing", "ok", "missing"],
   "utility": { "water": [null], "steam": [0.69] },
@@ -798,7 +848,7 @@ Authorization: Bearer <token>
 
 ```jsonc
 [
-  { "lineId": "A1", "hour": 9, "output": 26141, "kwh": 197,
+  { "lineId": "W103", "hour": 9, "output": 26141, "kwh": 197,
     "unitKwh": 7.54, "stopped": false, "reported": true }
 ]
 ```
@@ -858,7 +908,8 @@ Authorization: Bearer <token>
   "hourly":      [{ "label": "09:00", "output": 76732, "kwh": 652, "unitKwh": 8.50 }],
   "daily30":     [{ "label": "8/23", "output": 2183000, "kwh": 16900, "unitKwh": 7.74 }],
   "monthly12":   [{ "label": "10月", "output": 73180000, "kwh": 588000, "unitKwh": 8.03 }],
-  "lineUnitKwh": [{ "lineCode": "A1", "lineName": "A1 生产线", "unitKwh": 7.78, "output": 199200 }],
+  "lineUnitKwh": [{ "lineCode": "W103", "lineName": "一线", "unitKwh": 7.78, "standardUnitKwh": 8.20, "output": 199200 }],
+  "targetUnitKwh": 8.20,
   "latestAlarms": [ /* AlarmRecord[]，见 4.4 */ ]
 }
 ```
@@ -911,9 +962,9 @@ Authorization: Bearer <token>
 
 ```jsonc
 {
-  "id": 1, "code": "EM-A1-1001", "name": "A1 生产线 配电柜电表",
+  "id": 1, "code": "EM-A1-1001", "name": "一线 配电柜电表",
   "category": "电",                          // 电 | 水 | 汽 | 气
-  "lineCode": "A1",
+  "lineCode": "W103",
   "protocol": "Modbus TCP",                  // Modbus TCP | Modbus RTU | OPC UA | MQTT | DL/T645
   "address": "10.20.31.11:502",
   "unit": "kWh", "factor": 1,
@@ -926,7 +977,7 @@ Authorization: Bearer <token>
 
 ```jsonc
 {
-  "lineCode": "A1", "lineName": "A1 生产线",
+  "lineCode": "W103", "lineName": "一线",
   "expectPoints": 24, "receivedPoints": 24, "missingPoints": 0,
   "rate": 100.0, "missingHours": "—",
   "lastAt": "2026-09-22 09:58:00"
@@ -972,7 +1023,7 @@ Authorization: Bearer <token>
 | `gateway_offline` | 该网关最近一轮点位**全部失败**（0/N）。⚠ 与网关列表页的「在线」徽标是两件事 | critical |
 | `collect_stale` | 最新成功读数超过 `collect.stale_alert_hours` 未更新，或尚无任何数据 | critical |
 | `hour_quality` | 近 24 小时出现 `reset`（换表/清零）或 `spike`（尖峰）。**不含 missing** —— 缺数由覆盖率与采集失败覆盖，重复报会把告警页刷成流水账 | major |
-| `coverage_low` | 昨日日汇总 `covered_count < expected_count`，即日合计少算了若干小时。**只判日终结算后重算过的行**（`computed_at` ≥ 次日 00:30）：00:30 结算前的当天快照不是结论（含 00:00–00:30 重启触发的补跑）；仍挂着的历史告警所属日期也会一并复核，避免换日被误判为恢复（B-553） | minor |
+| `coverage_low` | **上一生产日**（06:00—次日06:00）日汇总 `covered_count < expected_count`，即日合计少算了若干小时。**只判 06:30 结算后重算过的行**（`computed_at` ≥ 次日 06:25）：06:30 前的当天快照不是结论（含 06:00–06:30 重启触发的补跑）；仍挂着的历史告警所属日期也会一并复核，避免换日被误判为恢复（B-553 / v1.6.0） | minor |
 
 ⚠ **操作审计日志尚未实现**：契约原先要求「确认必须写审计日志」，而操作日志表还没建，
 所以 `ack` 目前只写 `acked_by` / `acked_at` 两列。接口实现处有同样的注释，

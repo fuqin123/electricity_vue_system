@@ -20,7 +20,13 @@
  */
 import { computed, onMounted, ref, watch, type Ref } from 'vue';
 import { ElMessage } from 'element-plus';
-import { energyApi, type MeterCategoryWorkshop, type UsageRangeResult } from '@eep/shared';
+import {
+  energyApi,
+  lastClosedHour,
+  productionDayStart,
+  type MeterCategoryWorkshop,
+  type UsageRangeResult
+} from '@eep/shared';
 import { energyUsageOption, type EnergyUsageSeries } from './charts';
 
 export type UsageEnergy = 'electric' | 'water' | 'steam';
@@ -60,19 +66,15 @@ function fmt(d: Date): string {
  * 「仪表读数查询」查的是 energy_raw 原始读数，实时都有，终点仍应取「现在」。
  */
 export function closedHour(): Date {
-  const d = new Date();
-  d.setMinutes(0, 0, 0);
-  d.setHours(d.getHours() - 1);
-  return d;
+  return lastClosedHour();
 }
 
-/** 已结算小时所在那天的 00:00；跨零点时自动退到昨天，避免区间起点跑到终点后面 */
+/** 已结算小时所属生产日的 06:00；06:00—06:59 自动退到前一天，避免起点跑到终点后面 */
 function anchorDayStart(): Date {
-  const c = closedHour();
-  return new Date(c.getFullYear(), c.getMonth(), c.getDate());
+  return productionDayStart(closedHour());
 }
 
-/** 快捷区间的起点：0 表示「当天 00:00」（以已结算小时所在那天为准） */
+/** 快捷区间的起点：0 表示「当前生产日 06:00」（以已结算小时所属生产日为准） */
 export function usageQuickStart(hours: number): string {
   if (hours <= 0) return fmt(anchorDayStart());
   return fmt(new Date(closedHour().getTime() - hours * 3600000));

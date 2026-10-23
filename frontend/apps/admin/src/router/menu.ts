@@ -86,6 +86,7 @@ export const menuTree: MenuNode[] = [
       { path: '/system/role', title: '角色管理', icon: 'UserFilled' },
       { path: '/system/menu', title: '菜单管理', icon: 'Menu' },
       { path: '/system/param', title: '系统参数', icon: 'Tools' },
+      { path: '/system/standard-unit', title: '标准单耗', icon: 'DataLine' },
       { path: '/system/dict', title: '数据字典', icon: 'Collection' }
     ]
   }

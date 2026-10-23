@@ -1,14 +1,14 @@
 """生成 / 刷新周期总计（日、月、年），落到 `energy_daily` / `energy_monthly` / `energy_yearly`。
 
-★ 常态用法 = **每天结算一次**（v1.4.2 起，配 00:30 的计划任务）：
+★ 常态用法 = **每天结算一次**（v1.6.0 起，配 06:30 的计划任务）：
 
     python manage.py summarize --rollup
 
-  `--rollup` 走 `summary.refresh_rollups()` 这一个入口：昨天 + 今天 + 近 2 月 + 今年。
-  必须包含昨天，因为昨天 23 点的差值要等今天 00:04 采到跨日边界读数才算得出来
-  （只刷今天 = 每一天永远少最后一个小时，B-523）。
-  今天这一行照写，但它只是「结算到此刻」的快照：界面上的当期数字
-  一律从小时表现算（见 `summary.is_open_period`），不依赖这一行。
+  `--rollup` 走 `summary.refresh_rollups()` 这一个入口：上一个生产日 +
+  当前生产日 + 近 2 月 + 近 2 年。生产日到次日 06:00 才结束，05—06 点的差值
+  要等 06:xx 采到跨日边界读数才算得出来（只刷当前生产日 = 每一天永远少最后
+  一个小时，B-523）。当前生产日这一行照写，但它只是「结算到此刻」的快照：
+  界面上的当期数字一律从小时表现算（见 `summary.is_open_period`），不依赖它。
 
   采集侧（`collect --aggregate` / `collect_loop`）**不再每小时刷汇总**。
 
@@ -34,13 +34,13 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--dim", default="all", choices=["day", "month", "year", "all"])
-        parser.add_argument("--days", type=int, default=2, help="刷最近多少天的日总计")
+        parser.add_argument("--days", type=int, default=2, help="刷最近多少个生产日的日总计")
         parser.add_argument("--months", type=int, default=13, help="覆盖最近多少个月")
         parser.add_argument("--years", type=int, default=6, help="覆盖最近多少年")
         parser.add_argument(
             "--rollup",
             action="store_true",
-            help="跑运维滚动窗口（昨天 + 今天 + 近 2 月 + 今年）—— 每天 00:30 的计划任务用这个",
+            help="跑运维滚动窗口（上一个生产日 + 当前生产日 + 近 2 月 + 近 2 年）—— 每天 06:30 的计划任务用这个",
         )
         parser.add_argument("--show", action="store_true", help="打印生成结果")
 
@@ -51,11 +51,13 @@ class Command(BaseCommand):
             # 每天一次的结算入口。窗口为什么含昨天，见 refresh_rollups 的说明（B-523）
             written = S.refresh_rollups(now)
             self.stdout.write(
-                self.style.SUCCESS(f"滚动窗口结算完成（昨天 + 今天 + 近 2 月 + 今年）：{len(written)} 条")
+                self.style.SUCCESS(
+                    f"滚动窗口结算完成（上一个生产日 + 当前生产日 + 近 2 月 + 近 2 年）：{len(written)} 条"
+                )
             )
-            # 结算完立刻评估：覆盖率规则读的就是刚写下的这批昨日日汇总行。
-            # 等下一轮采集才报会白挂几个小时，而 00:30 正是值班交接前
-            # 最该看到「昨天哪些数不完整」的时刻。
+            # 结算完立刻评估：覆盖率规则读的就是刚写下的上一个生产日日汇总行。
+            # 等下一轮采集才报会白挂，而 06:30 正是值班交接前
+            # 最该看到「上一生产日哪些数不完整」的时刻。
             res = alerts.evaluate(now=now)
             self.stdout.write(
                 f"告警：新增 {res['created']}、恢复 {res['resolved']}、未处理 {res['active']}"

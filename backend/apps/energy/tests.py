@@ -34,9 +34,11 @@ from apps.energy.models import (
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
+    StandardUnitConsumption,
     SystemParam,
 )
 from apps.energy.services import alerts
+from apps.energy.services import business_day as B
 from apps.energy.services import ranges, registry, slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
@@ -922,9 +924,9 @@ class ClosedDaySnapshotTests(TestCase):
     日累计跟着一起虚高 —— 大屏与后台于是既「对不上」又「23 点特别离谱」。
     """
 
-    DAY = datetime(2026, 9, 27).date()
-    AS_OF = datetime(2026, 9, 27, 23, 59, 59)  # 大屏查历史日时接口构造的「现在」
-    REAL_NOW = datetime(2026, 9, 28, 9, 17)  # 真实的此刻（已是次日）
+    DAY = datetime(2026, 9, 27).date()  # 生产日：09-27 06:00 → 09-28 06:00
+    AS_OF = B.day_end(DAY) - timedelta(seconds=1)  # 查历史生产日时接口构造的「现在」
+    REAL_NOW = datetime(2026, 9, 28, 9, 17)  # 真实的此刻（已是下一个生产日）
     STEP = Decimal("10")
 
     @classmethod
@@ -965,8 +967,8 @@ class ClosedDaySnapshotTests(TestCase):
             )
 
     def aggregate_day_27(self, meter: EnergyMeter) -> None:
-        for h in range(24):
-            aggregate_hour(self.DAY, h, meters=[meter])
+        for d, h in B.day_hours(self.DAY):
+            aggregate_hour(d, h, meters=[meter])
 
     def test_实时窗口不跨过小时边界(self):
         """进行中的参考值只能在本小时内取数，不许一路读到明天。"""
@@ -994,7 +996,7 @@ class ClosedDaySnapshotTests(TestCase):
 
     def test_历史日23点走聚合表(self):
         m = self.meter()
-        self.seed_hourly_readings(m, datetime(2026, 9, 26, 23, 4), 26)
+        self.seed_hourly_readings(m, datetime(2026, 9, 27, 6, 4), 25)
         self.aggregate_day_27(m)
 
         data = build_line(m.line, self.AS_OF, closed=True)
@@ -1017,13 +1019,16 @@ class ClosedDaySnapshotTests(TestCase):
     def test_实时快照的进行中小时就是当前小时(self):
         m = self.meter()
         snap = build_overview(self.REAL_NOW)
-        self.assertEqual(snap["workshop"]["ongoingHour"], self.REAL_NOW.hour)
+        self.assertEqual(
+            snap["workshop"]["ongoingHour"],
+            B.hour_index_at(B.production_day(self.REAL_NOW), self.REAL_NOW),
+        )
         self.assertIsNone(snap["workshop"].get("dayClosed"))
 
     def test_大屏与后台逐格相等(self):
         """同源同口径的硬保证：大屏每小时数字 == /api/energy/range 的线别序列。"""
         m = self.meter()
-        self.seed_hourly_readings(m, datetime(2026, 9, 26, 23, 4), 26)
+        self.seed_hourly_readings(m, datetime(2026, 9, 27, 6, 4), 25)
         self.aggregate_day_27(m)
 
         big = [h["kwh"] for h in build_line(m.line, self.AS_OF, closed=True)["hours"]]
@@ -1033,8 +1038,8 @@ class ClosedDaySnapshotTests(TestCase):
             granularity="hour",
             scope="all",
             now=self.REAL_NOW,
-            start_at=datetime(2026, 9, 27, 0),
-            end_at=datetime(2026, 9, 27, 23),
+            start_at=B.day_start(self.DAY),
+            end_at=B.day_end(self.DAY) - timedelta(seconds=1),
         )
         admin = next(s["values"] for s in rng["series"] if s["key"] == "A1")
         self.assertEqual(len(admin), 24)
@@ -1043,16 +1048,15 @@ class ClosedDaySnapshotTests(TestCase):
 
 
 class YesterdayRollupTests(TestCase):
-    """v1.4.1（B-523）：日总计必须包含第 23 小时。
+    """v1.4.1（B-523）：日总计必须包含生产日的最后一个小时。
 
-    昨天 23 点的差值要等**今天 00:04** 采到跨日边界读数才算得出来，
-    那一刻 `now.date()` 已经是今天了 —— 只刷今天的汇总，
-    每一天就永远少最后一个小时（现场实测覆盖数恒为 23，日合计 377.4 对不上小时表的 385.5），
+    生产日到次日 06:00 才结束，05—06 点的差值要等**次日 06:04** 采到跨日边界
+    读数才算得出来 —— 只刷当前生产日的汇总，每一天就永远少最后一个小时，
     而月 / 年是按日行累加的，三个尺度一起偏小。
     """
 
-    YESTERDAY = datetime(2026, 9, 27).date()
-    NOW = datetime(2026, 9, 28, 0, 34)
+    YESTERDAY = datetime(2026, 9, 27).date()  # 生产日：09-27 06:00 → 09-28 06:00
+    NOW = datetime(2026, 9, 28, 6, 34)
 
     @classmethod
     def setUpTestData(cls):
@@ -1061,7 +1065,7 @@ class YesterdayRollupTests(TestCase):
             code="GW-T", name="测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=1
         )
 
-    def test_刷新滚动窗口会把昨天的第23小时算进日总计(self):
+    def test_刷新滚动窗口会把上一生产日的最后一小时算进日总计(self):
         meter = EnergyMeter.objects.create(
             code="E-A1-01",
             name="一线电表",
@@ -1071,19 +1075,19 @@ class YesterdayRollupTests(TestCase):
             gateway=self.gw,
             unit="kWh",
         )
-        # 09-27 00:04 … 09-28 00:04 共 25 条，每小时恰好 10 kWh
+        # 09-27 06:04 … 09-28 06:04 共 25 条，每小时恰好 10 kWh
         for i in range(25):
             EnergyRaw.objects.create(
                 meter=meter,
                 line=meter.line,
                 energy_type=meter.energy_type,
-                collect_time=datetime(2026, 9, 27, 0, 4) + timedelta(hours=i),
+                collect_time=datetime(2026, 9, 27, 6, 4) + timedelta(hours=i),
                 reading=Decimal("1000") + Decimal("10") * i,
                 ok=True,
                 raw="test",
             )
-        for h in range(24):
-            aggregate_hour(self.YESTERDAY, h, meters=[meter])
+        for d, h in B.day_hours(self.YESTERDAY):
+            aggregate_hour(d, h, meters=[meter])
 
         S.refresh_rollups(self.NOW)
 
@@ -1096,17 +1100,19 @@ class YesterdayRollupTests(TestCase):
 class OpenPeriodRollupTests(TestCase):
     """v1.4.2：周期汇总改成每天结算一次之后的取数规则。
 
-    一句话：**已结束的周期读汇总表，进行中的周期（今天 / 本月 / 本年）从小时表现算**。
-    两头都要锁 —— 少第一条，00:30 的结算就白做；少第二条，大屏与后台的
-    「今日 / 本月」会整天不动（汇总表在当天早上就定格了），值班人员以为系统卡死。
+    一句话：**已结束的周期读汇总表，进行中的周期（当前生产日 / 本月 / 本年）
+    从小时表现算**。两头都要锁 —— 少第一条，06:30 的结算就白做；少第二条，
+    大屏与后台的「今日 / 本月」会整天不动（汇总表在当天早上就定格了），
+    值班人员以为系统卡死。
     """
 
     PER = Decimal("10")
 
     @classmethod
     def setUpTestData(cls):
-        cls.now = datetime.now().replace(minute=0, second=0, microsecond=0)
-        cls.today = cls.now.date()
+        # 固定到当前生产日的 14:00，避免测试恰好在 06:00 整点跑时没有已完成小时
+        cls.now = B.day_start(B.production_day(datetime.now())) + timedelta(hours=8)
+        cls.today = B.production_day(cls.now)
         cls.yesterday = cls.today - timedelta(days=1)
         cls.line = ProductionLine.objects.create(line_code="A1", line_name="一线")
         cls.gw = EnergyGateway.objects.create(
@@ -1122,14 +1128,16 @@ class OpenPeriodRollupTests(TestCase):
             unit="kWh",
         )
 
-    def hourly(self, day: object, hours: range) -> None:
-        for h in hours:
+    def hourly(self, day: object, indices: range) -> None:
+        """按**生产日序号**造小时行（0 = 06:00）。"""
+        for i in indices:
+            stat_date, stat_hour = B.hour_bucket(day, i)
             EnergyHourly.objects.create(
                 meter=self.meter,
                 line=self.line,
                 energy_type=etype(),
-                stat_date=day,
-                stat_hour=h,
+                stat_date=stat_date,
+                stat_hour=stat_hour,
                 consumption=self.PER,
                 unit="kWh",
                 quality=EnergyHourly.Q_OK,
@@ -1148,8 +1156,8 @@ class OpenPeriodRollupTests(TestCase):
         )
 
     def test_当期不读汇总表_汇总行再旧也不影响(self):
-        """今天的日行故意写成 999（模拟 00:30 结算后一整天没再刷）→ 当期必须给小时表的值。"""
-        done = range(self.now.hour)  # 已完成的小时
+        """当前生产日的日行故意写成 999（模拟 06:30 结算后一整天没再刷）→ 必须给小时表的值。"""
+        done = range(B.hour_index_at(self.today, self.now))  # 已完成的小时序号
         self.hourly(self.today, done)
         self.daily_row(self.today, "999")
 
@@ -1161,7 +1169,7 @@ class OpenPeriodRollupTests(TestCase):
         self.assertLess(row.covered_hours, row.expected_hours)
 
     def test_已结束的周期读汇总表(self):
-        """昨天的行是给定的结算值 —— 现算会得到不同结果，用它证明「读的是表」。"""
+        """上一个生产日的行是给定的结算值 —— 现算会得到不同结果，用它证明「读的是表」。"""
         self.hourly(self.yesterday, range(24))  # 240
         self.daily_row(self.yesterday, "777")
 
@@ -1169,24 +1177,21 @@ class OpenPeriodRollupTests(TestCase):
         row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], self.now)[key]
         self.assertEqual(row.kwh, Decimal("777"))
 
-    def test_昨天的行没结算完整时退回现算(self):
-        """00:00—00:30 的窗口：昨天的日行还是前天写的残缺值 → 必须现算，不能空一晚。
-
-        `EEP-Rollup` 没注册或跑失败时也是靠这条兜住：数字仍然正确，只是多扫一次小时表。
-        """
-        before_midnight = datetime.now().replace(hour=0, minute=12, second=0, microsecond=0)
-        y = before_midnight.date() - timedelta(days=1)
+    def test_上一生产日的行没结算完整时退回现算(self):
+        """06:00—06:30 的窗口：上一生产日的日行还是前一天写的残缺值 → 必须现算。"""
+        before_settle = B.day_start(self.today) + timedelta(minutes=12)
+        y = self.today - timedelta(days=1)
         self.hourly(y, range(24))  # 240
-        self.daily_row(y, "100", covered=10)  # 前天 00:30 那次结算的残缺值
+        self.daily_row(y, "100", covered=10)  # 前一天 06:30 那次结算的残缺值
 
         key = S.make_key(S.DIM_DAY, y)
-        row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], before_midnight)[key]
+        row = S.period_rows(S.DIM_DAY, S.SCOPE_LINE, self.line, [key], before_settle)[key]
         self.assertEqual(row.kwh, self.PER * 24)
         self.assertNotEqual(row.kwh, Decimal("100"))
 
     def test_更早的周期即使残缺也不回退(self):
-        """回退只对今天 / 昨天开放 —— 更早的行按结算值交付，避免长序列反复扫小时表。"""
-        long_ago = self.now.date() - timedelta(days=3)
+        """回退只对当前 / 上一个生产日开放 —— 更早的行按结算值交付，避免长序列反复扫小时表。"""
+        long_ago = self.today - timedelta(days=3)
         self.hourly(long_ago, range(24))  # 240
         self.daily_row(long_ago, "777", covered=10)
 
@@ -1195,8 +1200,8 @@ class OpenPeriodRollupTests(TestCase):
         self.assertEqual(row.kwh, Decimal("777"))
 
     def test_大屏与后台在当期同样相等(self):
-        """当期现算之后，大屏的「今天那一根」必须仍等于后台日粒度序列的同一格。"""
-        self.hourly(self.today, range(self.now.hour))
+        """当期现算之后，大屏的「当前生产日那一根」必须仍等于后台日粒度序列的同一格。"""
+        self.hourly(self.today, range(B.hour_index_at(self.today, self.now)))
         self.daily_row(self.today, "999")  # 谁读汇总表谁就错
 
         big = build_line(self.line, self.now)["daily30"][-1]
@@ -1208,7 +1213,7 @@ class OpenPeriodRollupTests(TestCase):
         self.assertEqual(big["kwh"], admin)
 
     def test_采集命令默认不再刷汇总(self):
-        """每天 00:30 的 `summarize --rollup` 才是结算入口；采集命令只出小时数。"""
+        """每天 06:30 的 `summarize --rollup` 才是结算入口；采集命令只出小时数。"""
         opts = collect.Command().create_parser("x", "y").parse_args([])
         self.assertFalse(opts.summarize)
         self.assertFalse(hasattr(opts, "no_summary"))
@@ -2660,9 +2665,9 @@ class AlarmEngineTests(TestCase):
 class CoverageAlarmTests(TestCase):
     """覆盖率告警只能基于「日终结算后重算过」的日汇总行（B-553）。
 
-    日结算是每天 00:30 写的，而那只是「到此刻」的快照；凌晨 00:01 的采集
-    评估如果直接读它，就会把所有计量数据误报成「昨日仅结算 0/24」。
-    另一面：真实缺数的告警不能因为换了一天就自动变成「已恢复」。
+    日结算是每天 06:30 写的，而那只是「到此刻」的快照；次日 06:25 之前的
+    采集评估如果直接读它，就会把所有计量数据误报成「上一生产日仅结算 0/24」。
+    另一面：真实缺数的告警不能因为换了一个生产日就自动变成「已恢复」。
     """
 
     @classmethod
@@ -2700,50 +2705,280 @@ class CoverageAlarmTests(TestCase):
         )
 
     def test_结算前读到当天快照不产生覆盖率告警(self):
-        """09-22 00:30 写的当天快照（0/24）在次日凌晨还不是结论。"""
-        self._daily(datetime(2026, 9, 22).date(), 0, datetime(2026, 9, 22, 0, 30))
-        self._evaluate(datetime(2026, 9, 23, 0, 1, 44))
+        """09-22 06:30 写的当天快照（0/24）在下一个生产日还不是结论。"""
+        self._daily(datetime(2026, 9, 22).date(), 0, datetime(2026, 9, 22, 6, 30))
+        self._evaluate(datetime(2026, 9, 23, 6, 1))
         self.assertFalse(
             EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_COVERAGE).exists(),
-            "日终后还没重算过的日行只是当天快照，不能据此报「昨日少算了 24 小时」",
+            "日终结算前写下的日行只是当天快照，不能据此报「上一生产日少算了 24 小时」",
         )
 
     def test_零点后结算时刻前重算的快照也不报(self):
-        """rollup 容器在 00:10 重启会立刻补跑一次，但昨天的边界读数可能还没到。
+        """rollup 容器在 06:10 重启会立刻补跑一次，但边界读数可能还没到。
 
-        此时日行已经是「今天写的」，只按日期会误以为它是对完整一天的结论；
-        门槛必须落在 00:30 的固定结算时刻。
+        此时日行已经是「新生产日写的」，只按日期会误以为它是对完整一天的结论；
+        门槛必须落在 06:25（06:30 结算前留抖动余量）。
         """
-        self._daily(datetime(2026, 9, 22).date(), 23, datetime(2026, 9, 23, 0, 10))
-        self._evaluate(datetime(2026, 9, 23, 0, 11))
+        self._daily(datetime(2026, 9, 22).date(), 23, datetime(2026, 9, 23, 6, 10))
+        self._evaluate(datetime(2026, 9, 23, 6, 11))
         self.assertFalse(
             EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_COVERAGE).exists(),
-            "00:30 前重启触发的结算仍可能缺最后一小时，不能当成日终结论",
+            "06:25 前重启触发的结算仍可能缺最后一小时，不能当成日终结论",
         )
 
     def test_日终后重算仍缺数才产生覆盖率告警(self):
-        self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 0, 30))
-        self._evaluate(datetime(2026, 9, 23, 0, 31))
+        self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 6, 30))
+        self._evaluate(datetime(2026, 9, 23, 6, 31))
         alarm = self._alarm()
         self.assertEqual(alarm.value, "18/24")
         self.assertEqual(alarm.threshold, "24/24")
         self.assertIn("少 6 个小时", alarm.content)
+        self.assertIn("生产日 2026-09-22", alarm.content)
 
     def test_真实缺数告警不会被换日误恢复(self):
-        """数据没补回来，告警不能因为规则改看新的一天就自愈。"""
-        self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 0, 30))
-        self._evaluate(datetime(2026, 9, 23, 0, 31))
-        self._evaluate(datetime(2026, 9, 24, 0, 1))
+        """数据没补回来，告警不能因为规则改看新的生产日就自愈。"""
+        self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 6, 30))
+        self._evaluate(datetime(2026, 9, 23, 6, 31))
+        self._evaluate(datetime(2026, 9, 24, 6, 1))
         self.assertEqual(self._alarm().status, EnergyAlarm.STATUS_ACTIVE)
 
     def test_缺数补齐后才会自动恢复(self):
-        row = self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 0, 30))
-        self._evaluate(datetime(2026, 9, 23, 0, 31))
+        row = self._daily(datetime(2026, 9, 22).date(), 18, datetime(2026, 9, 23, 6, 30))
+        self._evaluate(datetime(2026, 9, 23, 6, 31))
         EnergyDaily.objects.filter(pk=row.pk).update(
             covered_count=24, quality=EnergyDaily.Q_OK, computed_at=datetime(2026, 9, 23, 12, 0)
         )
-        self._evaluate(datetime(2026, 9, 24, 0, 1))
+        self._evaluate(datetime(2026, 9, 24, 6, 1))
         self.assertEqual(self._alarm().status, EnergyAlarm.STATUS_RESOLVED)
+
+
+class ProductionDayTests(TestCase):
+    """v1.6.0：日 / 月 / 年按生产日 06:00—次日 06:00。"""
+
+    DAY = datetime(2026, 10, 22).date()
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(
+            line_code="W103", line_name="一线", node_type=ProductionLine.NODE_LINE
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-PD", name="生产日测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-PD-01", name="生产日测试表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+
+    def test_生产日以六点为界(self):
+        self.assertEqual(B.production_day(datetime(2026, 10, 23, 5, 59)), self.DAY)
+        self.assertEqual(B.production_day(datetime(2026, 10, 23, 6, 0)), datetime(2026, 10, 23).date())
+        self.assertEqual(B.production_day(self.DAY), self.DAY, "纯日期原样表示生产日开始日")
+
+    def test_生产日二十四格顺序(self):
+        buckets = B.day_hours(self.DAY)
+        self.assertEqual(len(buckets), 24)
+        self.assertEqual(buckets[0], (self.DAY, 6))
+        self.assertEqual(buckets[17], (self.DAY, 23))
+        self.assertEqual(buckets[18], (datetime(2026, 10, 23).date(), 0))
+        self.assertEqual(buckets[-1], (datetime(2026, 10, 23).date(), 5))
+        self.assertEqual(B.hour_index(self.DAY, *buckets[18]), 18)
+        self.assertEqual(B.hour_index(self.DAY, self.DAY, 5), None, "05 点属于上一生产日")
+
+    def test_月和年的窗口也从六点开始(self):
+        start, end = B.period_window("month", "2026-10")
+        self.assertEqual(start, datetime(2026, 10, 1, 6))
+        self.assertEqual(end, datetime(2026, 11, 1, 6))
+        start, end = B.period_window("year", "2026")
+        self.assertEqual(start, datetime(2026, 1, 1, 6))
+        self.assertEqual(end, datetime(2027, 1, 1, 6))
+
+    def test_日汇总只取本生产日的二十四小时(self):
+        for d, h in B.day_hours(self.DAY):
+            EnergyHourly.objects.create(
+                meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+                stat_date=d, stat_hour=h, consumption=Decimal("1"), unit="kWh", quality=EnergyHourly.Q_OK,
+            )
+        # 干扰项：开始日 00—05 属于上一个生产日；次日 06—23 属于下一个生产日
+        for d, h in [(self.DAY, h) for h in range(6)] + [
+            (datetime(2026, 10, 23).date(), h) for h in range(6, 24)
+        ]:
+            EnergyHourly.objects.create(
+                meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+                stat_date=d, stat_hour=h, consumption=Decimal("100"), unit="kWh", quality=EnergyHourly.Q_OK,
+            )
+
+        S.summarize_days(self.DAY)
+        row = EnergyDaily.objects.get(line=self.line, energy_type=etype(), stat_date=self.DAY)
+        self.assertEqual(row.consumption, Decimal("24.000"))
+        self.assertEqual(row.covered_count, 24)
+        self.assertEqual(row.quality, PeriodSummary.Q_OK)
+
+    def test_大屏小时序号与时钟小时分开(self):
+        for d, h in B.day_hours(self.DAY):
+            EnergyHourly.objects.create(
+                meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+                stat_date=d, stat_hour=h, consumption=Decimal("1"), unit="kWh", quality=EnergyHourly.Q_OK,
+            )
+        data = build_line(self.line, datetime(2026, 10, 22, 10, 30))
+        self.assertEqual(data["hours"][0]["clock"], 6)
+        self.assertEqual(data["hours"][4]["clock"], 10)
+        self.assertEqual(data["hours"][18]["clock"], 0)
+        self.assertEqual(data["hours"][18]["dayOffset"], 1)
+        snap = build_overview(datetime(2026, 10, 22, 10, 30))
+        self.assertEqual(snap["workshop"]["ongoingHour"], 4, "10:30 是生产日第 5 格（序号 4）")
+        self.assertFalse(data["today"]["kwh"] is None)
+
+    def test_已结束生产日的格子全部按聚合表(self):
+        snap = build_overview(datetime(2026, 10, 23, 7, 0), closed=True)
+        self.assertEqual(snap["workshop"]["currentHour"], 23)
+        self.assertIsNone(snap["workshop"]["ongoingHour"])
+
+
+class StandardUnitTests(TestCase):
+    """v1.6.0：标准单耗按产线 × 能源维护，并驱动线/车间的标准值。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(
+            line_code="W103", line_name="一线", node_type=ProductionLine.NODE_LINE
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-SU", name="标准测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-SU-01", name="标准测试表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+
+    def setUp(self):
+        self.client = Client()
+
+    def test_矩阵读取时未标定为null(self):
+        body = json.loads(self.client.get("/api/admin/standard-units").content)
+        self.assertEqual(len(body["lines"]), 1)
+        self.assertEqual(len(body["energies"]), 3)
+        row = next(r for r in body["rows"] if r["energy"] == EnergyType.ELECTRIC)
+        self.assertIsNone(row["value"])
+        self.assertTrue(row["perLineAvailable"])
+
+    def test_批量保存与清空(self):
+        payload = {
+            "items": [
+                {"line": "W103", "energy": "ELECTRIC", "value": "8.5", "remark": "考核值"},
+                {"line": "W103", "energy": "WATER", "value": None},
+            ]
+        }
+        res = self.client.put(
+            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+        )
+        self.assertEqual(res.status_code, 200, res.content)
+        row = StandardUnitConsumption.objects.get(line=self.line, energy_type=etype())
+        self.assertEqual(row.value, Decimal("8.5000"))
+        self.assertEqual(row.remark, "考核值")
+
+        # 空串 = 清空为未标定，与 0 不同
+        payload["items"] = [{"line": "W103", "energy": "ELECTRIC", "value": ""}]
+        res = self.client.put(
+            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+        )
+        self.assertEqual(res.status_code, 200)
+        row.refresh_from_db()
+        self.assertIsNone(row.value)
+
+    def test_负数整批拒绝且不落半批(self):
+        payload = {
+            "items": [
+                {"line": "W103", "energy": "ELECTRIC", "value": "9"},
+                {"line": "W103", "energy": "WATER", "value": "-1"},
+            ]
+        }
+        res = self.client.put(
+            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertFalse(StandardUnitConsumption.objects.exists(), "校验失败不能留下半批数据")
+
+    def test_标准值进入线详情与车间目标(self):
+        StandardUnitConsumption.objects.create(
+            line=self.line, energy_type=etype(), value=Decimal("8.5")
+        )
+        data = build_line(self.line, datetime(2026, 10, 22, 10, 30))
+        self.assertEqual(data["standardUnitKwh"], 8.5)
+        snap = build_overview(datetime(2026, 10, 22, 10, 30))
+        self.assertEqual(snap["workshop"]["targetUnitKwh"], 8.5)
+
+
+class ReadingHourUsageTests(TestCase):
+    """v1.6.0：仪表历史读数增加「该读数结算的上一小时差值」。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(
+            line_code="W103", line_name="一线", node_type=ProductionLine.NODE_LINE
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-RD", name="读数测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-RD-01", name="读数测试表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+
+    def test_读数作为终点时带出上一小时差值(self):
+        day = datetime(2026, 10, 22).date()
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 10, 22, 14, 4), reading=Decimal("100"), ok=True,
+        )
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 10, 22, 15, 4), reading=Decimal("130"), ok=True,
+        )
+        aggregate_hour(day, 14, meters=[self.meter])
+        body = json.loads(
+            self.client.get(
+                "/api/admin/readings",
+                {"from": "2026-10-22 14:00", "to": "2026-10-22 16:00", "meter": self.meter.code},
+            ).content
+        )
+        start_row = next(r for r in body["list"] if r["collectTime"] == "2026-10-22 14:04:00")
+        end_row = next(r for r in body["list"] if r["collectTime"] == "2026-10-22 15:04:00")
+        self.assertIsNone(start_row["hourUsage"])
+        self.assertEqual(start_row["hourStatus"], "pending")
+        self.assertEqual(end_row["hourUsage"], 30.0)
+        self.assertEqual(end_row["hourQuality"], EnergyHourly.Q_OK)
+        self.assertEqual(end_row["hourStatus"], "ok")
+
+
+class RebuildSummariesTests(TestCase):
+    """v1.6.0：口径切换后可按生产日重建汇总，源小时数据不受影响。"""
+
+    def test_重建后日汇总等于生产日小时之和(self):
+        day = datetime(2026, 10, 22).date()
+        line = ProductionLine.objects.create(
+            line_code="W103", line_name="一线", node_type=ProductionLine.NODE_LINE
+        )
+        gw = EnergyGateway.objects.create(
+            code="GW-RB", name="重建测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        meter = EnergyMeter.objects.create(
+            code="E-RB-01", name="重建测试表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=line, gateway=gw, unit="kWh",
+        )
+        for d, h in B.day_hours(day):
+            EnergyHourly.objects.create(
+                meter=meter, line=line, energy_type=etype(),
+                stat_date=d, stat_hour=h, consumption=Decimal("2"), unit="kWh",
+                quality=EnergyHourly.Q_OK,
+            )
+        call_command(
+            "rebuild_summaries", from_date="2026-10-22", to_date="2026-10-22", stdout=StringIO()
+        )
+        row = EnergyDaily.objects.get(line=line, energy_type=etype(), stat_date=day)
+        self.assertEqual(row.consumption, Decimal("48.000"))
+        self.assertEqual(row.covered_count, 24)
+        self.assertEqual(EnergyHourly.objects.count(), 24, "源小时表不能被清理")
 
 
 class ProductionIngestTests(TestCase):

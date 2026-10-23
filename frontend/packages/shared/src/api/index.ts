@@ -58,6 +58,8 @@ import type {
   PageQuery,
   PageResult,
   ReportTemplate,
+  StandardUnitMatrix,
+  StandardUnitRow,
   SysMenu,
   SysParam,
   SysRole,
@@ -389,6 +391,24 @@ export const adminApi = {
     if (!useApi('admin.params')) return delay({ ...(payload as SysParam), id }, 220);
     return request<SysParam>(`/api/admin/params/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
   },
+
+  /** 标准单耗矩阵（产线 × 电/水/汽） */
+  async getStandardUnits(): Promise<StandardUnitMatrix> {
+    if (!useApi('admin.standardUnits')) {
+      return delay({ lines: [], energies: [], rows: [] } as StandardUnitMatrix, 120);
+    }
+    return request<StandardUnitMatrix>('/api/admin/standard-units');
+  },
+  /** 批量保存标准单耗；value=null 表示清空为「未标定」 */
+  async saveStandardUnits(
+    items: Pick<StandardUnitRow, 'line' | 'energy' | 'value' | 'remark'>[]
+  ): Promise<{ saved: number; items: StandardUnitRow[] }> {
+    if (!useApi('admin.standardUnits')) return delay({ saved: 0, items: [] }, 220);
+    return request<{ saved: number; items: StandardUnitRow[] }>('/api/admin/standard-units', {
+      method: 'PUT',
+      body: JSON.stringify({ items })
+    });
+  },
   async getDicts(query: PageQuery = { page: 1, pageSize: 50 }): Promise<PageResult<DictItem>> {
     if (!useApi('admin.dicts')) return delay(page(mockDicts(), query));
     return request<PageResult<DictItem>>('/api/admin/dicts', { params: query as Record<string, string> });
@@ -595,7 +615,7 @@ export interface MeterCategoryDevice {
   name: string;
   /** 设备名（分类用），如「生产线」 */
   deviceName: string;
-  /** 所属组织节点编码（产线 A1 / 辅助单元 AUX-CARB-AIR / 车间 WS-CARB） */
+  /** 所属组织节点编码（产线 W103 / 辅助单元 AUX-CARB-AIR / 车间 WS-CARB） */
   nodeCode: string;
   nodeName: string;
   /** line = 产线，aux = 辅助计量单元，workshop = 车间（总表） */
@@ -748,6 +768,15 @@ export interface MeterReading {
   ok: boolean;
   raw: string;
   error: string;
+  /** 该读数作为终点结算出的上一小时差值；无对应小时行时为 null */
+  hourUsage: number | null;
+  /** 对应小时行的质量（ok/partial/spike/reset/missing）；未匹配为空串 */
+  hourQuality: string;
+  /** ok / pending / not_boundary / missing / reset / spike / partial */
+  hourStatus: string;
+  hourStartAt: string;
+  hourEndAt: string;
+  hourNote: string;
 }
 
 export interface ReadingQuery {

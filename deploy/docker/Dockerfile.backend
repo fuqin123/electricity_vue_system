@@ -2,7 +2,7 @@
 # 能源产效管理系统 · 后端镜像（Django + gunicorn）
 #
 # 构建上下文 = **仓库根目录**（与前端镜像共用一份 .dockerignore）：
-#   docker build -f deploy/docker/Dockerfile.backend -t eep-backend:1.5.5 .
+#   docker build -f deploy/docker/Dockerfile.backend -t eep-backend:1.6.0 .
 #   或：cd deploy/docker && docker compose build backend
 #
 # 采集容器（collector）复用本镜像，只换 command，不另建镜像 ——

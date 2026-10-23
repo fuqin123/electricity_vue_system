@@ -99,7 +99,7 @@ export const plantConfig = {
   name: '康师傅饮料 · 长沙工厂',
   shortName: '能源产效管理系统',
   code: 'PLANT 01',
-  linesName: 'A1—A6 灌装线'
+  linesName: '六条灌装线（W103 / W101 / W102 / W301 / W104 / W105）'
 };
 
 /** 数据源配置 */
@@ -166,12 +166,12 @@ export const dataConfig = {
 
 /** 六条产线定义 */
 export const linesConfig: LineConfig[] = [
-  { id: 'A1', name: 'A1 生产线', rated: 30000, product: '冰红茶 500ml', shift: true },
-  { id: 'A2', name: 'A2 生产线', rated: 30000, product: '绿茶 500ml', shift: true },
-  { id: 'A3', name: 'A3 生产线', rated: 24000, product: '茉莉蜜茶 500ml', shift: true },
-  { id: 'A4', name: 'A4 生产线', rated: 24000, product: '酸梅汤 500ml', shift: true },
-  { id: 'A5', name: 'A5 生产线', rated: 18000, product: '纯净水 550ml', shift: true },
-  { id: 'A6', name: 'A6 生产线', rated: 18000, product: '冰糖雪梨 500ml', shift: false }
+  { id: 'W103', name: '一线', rated: 30000, product: '冰红茶 500ml', shift: true },
+  { id: 'W101', name: '二线', rated: 30000, product: '绿茶 500ml', shift: true },
+  { id: 'W102', name: '三线', rated: 24000, product: '茉莉蜜茶 500ml', shift: true },
+  { id: 'W301', name: '四线', rated: 24000, product: '酸梅汤 500ml', shift: true },
+  { id: 'W104', name: '五线', rated: 18000, product: '纯净水 550ml', shift: true },
+  { id: 'W105', name: '六线', rated: 18000, product: '冰糖雪梨 500ml', shift: false }
 ];
 
 /**
@@ -204,8 +204,6 @@ export const energyModel = {
   waterPerKwhL: 0.55,
   /** ⚠ 过渡口径：按电量估算汽耗 kg/kWh，同样未经标定 */
   steamPerKwhKg: 0.045,
-  /** 单位电耗考核目标 kWh/千瓶（产量接入后才能标定，当前仅留档） */
-  targetUnitKwh: 8.2
 };
 
 /** 告警阈值 */
@@ -262,22 +260,22 @@ export const videoConfig: VideoConfig = {
    * 其余产线先复用同一路，待摄像头到位后按行填写各自流名即可。
    */
   channels: {
-    A1: { channel: 'CH01', stream: 'my_camera', rtsp: 'rtsp://admin:***@10.113.1.118:554/Streaming/Channels/102', resolution: '1920×1080', fps: 25, codec: 'H.264' },
-    A2: { channel: 'CH02', stream: 'my_camera', rtsp: '', resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: false },
-    A3: { channel: 'CH03', stream: 'my_camera', rtsp: '', resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: false },
-    A4: { channel: 'CH04', stream: 'my_camera', rtsp: '', resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: false },
-    A5: { channel: 'CH05', stream: 'my_camera', rtsp: '', resolution: '1280×720', fps: 25, codec: 'H.264', enabled: false },
-    A6: { channel: 'CH06', stream: 'my_camera', rtsp: '', resolution: '1280×720', fps: 25, codec: 'H.264', enabled: false }
+    W103: { channel: 'CH01', stream: 'my_camera', rtsp: 'rtsp://admin:***@10.113.1.118:554/Streaming/Channels/102', resolution: '1920×1080', fps: 25, codec: 'H.264' },
+    W101: { channel: 'CH02', stream: 'my_camera', rtsp: '', resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: false },
+    W102: { channel: 'CH03', stream: 'my_camera', rtsp: '', resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: false },
+    W301: { channel: 'CH04', stream: 'my_camera', rtsp: '', resolution: '1920×1080', fps: 25, codec: 'H.264', enabled: false },
+    W104: { channel: 'CH05', stream: 'my_camera', rtsp: '', resolution: '1280×720', fps: 25, codec: 'H.264', enabled: false },
+    W105: { channel: 'CH06', stream: 'my_camera', rtsp: '', resolution: '1280×720', fps: 25, codec: 'H.264', enabled: false }
   },
 
   /** provider = 'custom' 时（MediaMTX / ZLMediaKit 等）手工填写 */
   customEndpoints: {
-    A1: { flv: '', hls: '', webrtc: '' },
-    A2: { flv: '', hls: '', webrtc: '' },
-    A3: { flv: '', hls: '', webrtc: '' },
-    A4: { flv: '', hls: '', webrtc: '' },
-    A5: { flv: '', hls: '', webrtc: '' },
-    A6: { flv: '', hls: '', webrtc: '' }
+    W103: { flv: '', hls: '', webrtc: '' },
+    W101: { flv: '', hls: '', webrtc: '' },
+    W102: { flv: '', hls: '', webrtc: '' },
+    W301: { flv: '', hls: '', webrtc: '' },
+    W104: { flv: '', hls: '', webrtc: '' },
+    W105: { flv: '', hls: '', webrtc: '' }
   }
 };
 
@@ -349,12 +347,12 @@ export const palette = {
 
 /** 产线专用色带：青 → 蓝紫 → 品红，同一和弦下可区分 6 条线 */
 export const lineColors: Record<string, string> = {
-  A1: '#00b0f4',
-  A2: '#4ea8ff',
-  A3: '#5865f2',
-  A4: '#8b7bf7',
-  A5: '#b96bee',
-  A6: '#ec48bd'
+  W103: '#00b0f4',
+  W101: '#4ea8ff',
+  W102: '#5865f2',
+  W301: '#8b7bf7',
+  W104: '#b96bee',
+  W105: '#ec48bd'
 };
 
 /** 后台管理端品牌色（源力设计系统） */

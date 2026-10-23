@@ -3,7 +3,7 @@ import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-rou
 /**
  * 大屏路由（hash 模式）
  *   #/overview    → 大屏一：车间总览
- *   #/line/A1     → 大屏二：单线详情
+ *   #/line/W103     → 大屏二：单线详情
  * 采用 hash 模式，静态目录任意层级部署均无需服务端 rewrite 配置。
  */
 const routes: RouteRecordRaw[] = [

@@ -54,6 +54,61 @@ export function rise(cur: number | null | undefined, prev: number | null | undef
 /** 补零到 2 位 */
 export const pad2 = (n: number | string): string => String(n).padStart(2, '0');
 
+/* ══════════════════════════════════════════════════════════════
+   生产日（06:00—次日 06:00）—— 与后端 services/business_day.py 同口径
+   ══════════════════════════════════════════════════════════════ */
+
+/** 生产日开始小时。全年固定（含节假日），与后端 DAY_START_HOUR 一致。 */
+export const DAY_START_HOUR = 6;
+
+/** 当前时刻所属生产日的开始日期（YYYY-MM-DD）；06:00 前仍属于前一天。 */
+export function productionDay(now: Date = new Date()): string {
+  const d = new Date(now);
+  if (d.getHours() < DAY_START_HOUR) d.setDate(d.getDate() - 1);
+  return isoDate(d);
+}
+
+/** 生产日开始日期对应的 Date（00:00，用于日期选择器）。 */
+export function productionDayDate(now: Date = new Date()): Date {
+  const d = new Date(now);
+  if (d.getHours() < DAY_START_HOUR) d.setDate(d.getDate() - 1);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+/** 生产日的起点时刻（06:00）。 */
+export function productionDayStart(now: Date = new Date()): Date {
+  const d = productionDayDate(now);
+  d.setHours(DAY_START_HOUR, 0, 0, 0);
+  return d;
+}
+
+/** 在 YYYY-MM-DD 上加减天数（按本地日期，不经过 UTC）。 */
+export function shiftDate(iso: string, days: number): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + days);
+  return isoDate(dt);
+}
+
+/** 当前生产日已经走到第几格（0 = 06:00，23 = 次日 05:00）。 */
+export function productionHourIndex(now: Date = new Date()): number {
+  const elapsed = now.getTime() - productionDayStart(now).getTime();
+  return Math.min(23, Math.max(0, Math.floor(elapsed / 3600000)));
+}
+
+/** 最后一个已结算小时（按绝对时钟），即“当前小时 - 1”。 */
+export function lastClosedHour(now: Date = new Date()): Date {
+  const d = new Date(now);
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() - 1);
+  return d;
+}
+
+/** 生产日小时序号 → 显示文本；`dayOffset=1` 表示次日 00—05。 */
+export function productionHourLabel(clock: number, dayOffset = 0): string {
+  return `${dayOffset ? '次日' : ''}${pad2(clock)}:00`;
+}
+
 /**
  * 小时数据质量 → 界面文案。
  *

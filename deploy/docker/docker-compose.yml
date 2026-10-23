@@ -2,7 +2,7 @@
 # 能源产效管理系统 · Docker Compose 编排（全栈）
 #
 # 五个默认服务：frontend(Nginx) / backend(Django) / collector(采集)
-#               / rollup(每天 00:30 周期结算) / mysql
+#               / rollup(每天 06:30 生产日结算) / mysql
 #
 # 首次启动：
 #   cd deploy/docker
@@ -53,7 +53,7 @@ x-settings-mount: &eep-settings-mount
 # 后端与采集器共用同一镜像、同一套连接参数，只差跑什么命令。
 # 不放 container_name / volumes / depends_on，避免上面那个覆盖陷阱。
 x-backend-base: &eep-backend-base
-  image: eep-backend:${EEP_VERSION:-1.5.5}
+  image: eep-backend:${EEP_VERSION:-1.6.0}
   build:
     context: ../..
     dockerfile: deploy/docker/Dockerfile.backend
@@ -71,7 +71,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: eep-frontend:${EEP_VERSION:-1.5.5}
+    image: eep-frontend:${EEP_VERSION:-1.6.0}
     container_name: eep-frontend
     restart: unless-stopped
     ports:
@@ -151,9 +151,9 @@ services:
       backend:
         condition: service_healthy
 
-  # ── 周期结算：每天 00:30 跑 summarize --rollup ──────────────
+  # ── 周期结算：每天 06:30 跑 summarize --rollup（生产日 06:00 结束后）──
   # v1.4.2 起日/月/年汇总**不再**跟着采集刷（collect 的 --summarize 默认关），
-  # 改由此任务结算「昨天 + 今天 + 近 2 月 + 今年」。
+  # 改由此任务结算「上一个生产日 + 当前生产日 + 近 2 月 + 近 2 年」。
   # ⚠ 漏掉它的后果是静默的：大屏「近 30 日 / 近 12 月」会永远停在最后一次结算
   #   那天，当期数字却一切正常、也不报任何错 —— 是最容易漏部署的一个服务。
   #   依据见 backend/scripts/daily-rollup-task.py 顶部说明与 collect.py 的注释。
@@ -177,12 +177,12 @@ services:
         # ⚠ compose 会对整段文本做变量插值，所以交给容器内 shell 的变量与
         #   算术展开一律要写成「两个美元符号」转义形式，否则到容器里就成了空串；
         #   只有确实想让 compose 从 .env 代入的才用单花括号形式。
-        # 启动先补一次：容器可能正好错过 00:30（发版、断电、重启）
+        # 启动先补一次：容器可能正好错过 06:30（发版、断电、重启）
         python manage.py summarize --rollup || sleep 300
         while true; do
           now=$$(date +%s)
-          next=$$(date -d "today 00:30" +%s)
-          [ "$$next" -le "$$now" ] && next=$$(date -d "tomorrow 00:30" +%s)
+          next=$$(date -d "today 06:30" +%s)
+          [ "$$next" -le "$$now" ] && next=$$(date -d "tomorrow 06:30" +%s)
           echo "[rollup] 距下次结算还有 $$(( (next - now) / 60 )) 分钟"
           sleep $$((next - now))
           python manage.py summarize --rollup || sleep 300

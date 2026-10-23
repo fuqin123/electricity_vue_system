@@ -175,6 +175,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '系统参数', desc: '能耗阈值、采集策略、大屏参数与运维策略' }
       },
       {
+        path: 'system/standard-unit',
+        name: 'system-standard-unit',
+        component: () => import('@/views/system/StandardUnitView.vue'),
+        meta: { title: '标准单耗', desc: '按产线 × 能源类型维护考核标准（kWh/m³/t 每千瓶）' }
+      },
+      {
         path: 'system/dict',
         name: 'system-dict',
         component: () => import('@/views/system/DictView.vue'),

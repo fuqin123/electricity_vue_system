@@ -10,7 +10,7 @@
  * v1.5.2：筛选从「线别」改为 **车间 → 用能类型 → 设备** 三级联动 ——
  *   辅机 / 瓶胚 / 调配电表在接口表里没有「线别」，用旧维度根本选不出来。
  */
-import { big, energyModel, int, thresholds, type PageQuery, type PageResult } from '@eep/shared';
+import { big, int, thresholds, type PageQuery, type PageResult } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
@@ -222,7 +222,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         :value="thresholds.unitKwhHigh.toFixed(2)"
         unit="kWh/千瓶"
         color="#d7312a"
-        :foot="`目标 ${energyModel.targetUnitKwh} · 产量接入后才能算实际值`"
+        :foot="'按线标准见「标准单耗」页；产量接入后才能算实际值'"
       />
     </div>
 
