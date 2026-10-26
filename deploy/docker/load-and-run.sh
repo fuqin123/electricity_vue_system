@@ -2,8 +2,8 @@
 # ══════════════════════════════════════════════════════════════
 # 目标机一键部署（离线，无需源码、无需外网）
 #
-#   tar xzf eep-docker-bundle-v1.6.0-*.tar.gz
-#   cd eep-docker-bundle-v1.6.0-*/runtime
+#   tar xzf eep-docker-bundle-v1.7.0-*.tar.gz
+#   cd eep-docker-bundle-v1.7.0-*/runtime
 #   ./load-and-run.sh
 #
 # 脚本做的事：导入镜像 → 生成 .env（随机强口令）→ 检查现场配置 →

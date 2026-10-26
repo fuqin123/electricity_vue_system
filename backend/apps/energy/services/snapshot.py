@@ -39,7 +39,6 @@ from ..models import (
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
-    StandardUnitConsumption,
 )
 from .aggregate import current_hour_usage
 # 用具体函数名导入而不是 `from . import alerts`：本模块下面有个局部变量就叫
@@ -47,6 +46,7 @@ from .aggregate import current_hour_usage
 from .alerts import evaluate as evaluate_alerts
 from .coverage import Q_UNCONNECTED, expected_ids, first_data_map
 from . import business_day as B
+from . import standards as STD
 from . import summary as S
 
 logger = logging.getLogger(__name__)
@@ -553,12 +553,8 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
     m12 = S.recent_months(12, now)
     y5 = S.recent_years(5, now)
     plan_now = _plan_for(line, today, now)
-    standard = StandardUnitConsumption.objects.filter(
-        line=line, energy_type__type_code=EnergyType.ELECTRIC
-    ).first()
-    standard_kwh = (
-        float(standard.value) if standard is not None and standard.value is not None else NULL
-    )
+    standard_value = STD.standard_for_line(line)
+    standard_kwh = float(standard_value) if standard_value is not None else NULL
 
     return {
         "id": line.line_code,
@@ -847,7 +843,7 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
         "utility": {"water": water, "steam": steam},
         # 车间目标 = 已标定产线的算术平均；一条都没标定就是 null（不是 0）。
         # 不按产量加权：产量尚未接入时加权分母不存在，宁可给一个明确的“未标定”。
-        "targetUnitKwh": _workshop_standard(),
+        "targetUnitKwh": STD.workshop_standard(),
         "alerts": alerts,
         # currentHour = 生产日序号锚点（0 = 06:00，查历史整日时 = 23）
         # ongoingHour = 真正「还没结束」的生产日序号；查历史整日时为 null。
@@ -857,19 +853,6 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
         "ongoingHour": None if closed else current_index,
         "dayClosed": closed or None,
     }
-
-
-def _workshop_standard() -> float | None:
-    """车间目标电单耗：已标定产线的算术平均；未标定为 null。"""
-    values = [
-        float(v)
-        for v in StandardUnitConsumption.objects.filter(
-            line__node_type=ProductionLine.NODE_LINE,
-            energy_type__type_code=EnergyType.ELECTRIC,
-            value__isnull=False,
-        ).values_list("value", flat=True)
-    ]
-    return round(sum(values) / len(values), 2) if values else None
 
 
 def _workshop_period(dim: str, now: datetime, real: bool) -> dict:

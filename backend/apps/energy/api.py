@@ -72,6 +72,7 @@ from .models import (
     SystemParam,
 )
 from .services import business_day as B
+from .services import standards as STD
 from .services import ranges, slots
 from .services import summary as S
 from .services.snapshot import build_line, build_overview
@@ -1063,6 +1064,10 @@ def admin_params(request: HttpRequest) -> JsonResponse:
     group = request.GET.get("group")
     if group:
         qs = qs.filter(group=group)
+    else:
+        # 能源单价已迁到「能源配置管理」页；系统参数页不再重复展示，
+        # 否则同一值有两个入口，现场会以改错的那一处为准。
+        qs = qs.exclude(group="能源价格")
     rows = [
         {
             "id": p.id,
@@ -1112,55 +1117,104 @@ def admin_param_detail(request: HttpRequest, pk: int) -> JsonResponse:
     return json_ok({"id": obj.id, "key": obj.key, "value": obj.value, "updatedAt": obj.updated_at})
 
 
-def _standard_row(
-    line, etype, row: StandardUnitConsumption | None
-) -> dict:
+def _line_option(line: ProductionLine) -> dict:
+    parent = line.parent if line.parent_id else None
+    workshop = parent if parent is not None and parent.node_type == ProductionLine.NODE_WORKSHOP else None
     return {
-        "line": line.line_code,
-        "lineName": line.line_name,
-        "energy": etype.type_code,
-        "energyName": etype.type_name,
-        "unit": f"{etype.unit}/千瓶",
-        "value": row.value if row is not None else None,
-        "remark": row.remark if row is not None else "",
-        "updatedAt": row.updated_at if row is not None else None,
-        "updatedBy": row.updated_by if row is not None else "",
-        # 水/汽目前只有车间总表，没有分线实测；仍允许配置，但界面要标注
-        "perLineAvailable": etype.type_code == EnergyType.ELECTRIC,
+        "code": line.line_code,
+        "name": line.line_name,
+        "workshop": workshop.line_name if workshop is not None else "",
+        "workshopCode": workshop.line_code if workshop is not None else "",
+        "product": line.product or "",
+        "capacity": STD.capacity_from_product(line.product),
     }
+
+
+def _group_standard_rows(rows, energies: list[EnergyType]) -> list[dict]:
+    """把按能源拆开的行拼成「产线 + 瓶型」一行，供配置表直接显示。"""
+    groups: dict[tuple[int, str], dict] = {}
+    for r in rows:
+        key = (r.line_id, r.bottle_capacity or "")
+        group = groups.get(key)
+        if group is None:
+            parent = r.line.parent if r.line.parent_id else None
+            workshop = (
+                parent
+                if parent is not None and parent.node_type == ProductionLine.NODE_WORKSHOP
+                else None
+            )
+            group = {
+                "key": f"{r.line.line_code}|{r.bottle_capacity or ''}",
+                "line": r.line.line_code,
+                "lineName": r.line.line_name,
+                "workshop": workshop.line_name if workshop is not None else "",
+                "workshopCode": workshop.line_code if workshop is not None else "",
+                "bottleCapacity": r.bottle_capacity or "",
+                "values": {},
+                "remark": "",
+                "updatedAt": None,
+                "updatedBy": "",
+            }
+            groups[key] = group
+        group["values"][r.energy_type.type_code] = r.value
+        if r.remark and not group["remark"]:
+            group["remark"] = r.remark
+        if r.updated_at is not None and (
+            group["updatedAt"] is None or r.updated_at > group["updatedAt"]
+        ):
+            group["updatedAt"] = r.updated_at
+            group["updatedBy"] = r.updated_by
+
+    for group in groups.values():
+        for et in energies:
+            group["values"].setdefault(et.type_code, None)
+    return list(groups.values())
 
 
 @csrf_exempt
-@require_http_methods(["GET", "PUT", "PATCH"])
+@require_http_methods(["GET", "PUT", "PATCH", "DELETE"])
 def admin_standard_units(request: HttpRequest) -> JsonResponse:
-    """标准单耗矩阵（产线 × 能源类型）。
+    """标准单耗配置（产线 + 瓶型容量，电/水/汽三列）。
 
-    GET  返回全部产线 × 三种能源的格子；未配置的 `value = null`（不是 0）。
-    PUT  批量保存，请求体 `{ "items": [{line, energy, value, remark}] }`；
-         传 `null` / 空串表示清空为「未标定」。只接受 `node_type=line` 的节点。
+    GET    支持 `workshop`（车间编码）/ `line`（产线编码）/ `capacity`（模糊）筛选。
+    PUT    单行新增或修改：`{line, bottleCapacity, values:{ELECTRIC,WATER,STEAM}, remark}`；
+           空串 / null 表示未标定，0 允许保存但界面显示 `-`。
+    DELETE `line` + `capacity`（query 或 JSON body）删除整组三行。
     """
     lines = list(
-        ProductionLine.objects.filter(node_type=ProductionLine.NODE_LINE).order_by(
-            "sort", "line_code"
-        )
+        ProductionLine.objects.filter(node_type=ProductionLine.NODE_LINE)
+        .select_related("parent")
+        .order_by("sort", "line_code")
     )
     energies = list(EnergyType.objects.order_by("sort", "id"))
-    existing = {
-        (r.line_id, r.energy_type_id): r
-        for r in StandardUnitConsumption.objects.select_related("line", "energy_type")
-    }
+    energy_map = {et.type_code.upper(): et for et in energies}
 
     if request.method == "GET":
-        rows = [
-            _standard_row(ln, et, existing.get((ln.id, et.id)))
-            for ln in lines
-            for et in energies
-        ]
+        qs = (
+            StandardUnitConsumption.objects.filter(line__node_type=ProductionLine.NODE_LINE)
+            .select_related("line", "line__parent", "energy_type")
+            .order_by("line__sort", "line__line_code", "bottle_capacity", "energy_type__sort")
+        )
+        workshop = request.GET.get("workshop")
+        if workshop:
+            qs = qs.filter(line__parent__line_code=workshop.upper())
+        line_code = request.GET.get("line")
+        if line_code:
+            qs = qs.filter(line__line_code=line_code.upper())
+        capacity = str(request.GET.get("capacity") or "").strip()
+        if capacity:
+            qs = qs.filter(bottle_capacity__icontains=capacity)
+
+        rows = _group_standard_rows(list(qs), energies)
+        order = {ln.line_code: (ln.sort, ln.line_code) for ln in lines}
+        rows.sort(key=lambda r: (order.get(r["line"], (9999, r["line"])), r["bottleCapacity"]))
         return json_ok(
             {
-                "lines": [
-                    {"code": ln.line_code, "name": ln.line_name, "sort": ln.sort} for ln in lines
+                "workshops": [
+                    {"code": ws.line_code, "name": ws.line_name}
+                    for ws in ProductionLine.workshops_qs().order_by("sort", "line_code")
                 ],
+                "lines": [_line_option(ln) for ln in lines],
                 "energies": [
                     {
                         "code": et.type_code,
@@ -1174,6 +1228,112 @@ def admin_standard_units(request: HttpRequest) -> JsonResponse:
             }
         )
 
+    if request.method == "DELETE":
+        # DELETE 的 line/capacity 既可从 query 传，也可从 JSON body 传；
+        # 表单编码的 body 不应让删除失败，解析不了就按空对象处理。
+        body = {}
+        if request.body:
+            try:
+                body = _body(request)
+            except ValueError:
+                body = {}
+        raw_line = str(body.get("line") or request.GET.get("line") or "").upper()
+        capacity = str(
+            body.get("bottleCapacity") if body.get("bottleCapacity") is not None
+            else request.GET.get("capacity") or ""
+        )
+        line = next((ln for ln in lines if ln.line_code.upper() == raw_line), None)
+        if line is None:
+            return json_err(f"产线不存在或不是产线节点：{raw_line}")
+        deleted, _ = StandardUnitConsumption.objects.filter(
+            line=line, bottle_capacity=capacity
+        ).delete()
+        return json_ok({"deleted": deleted, "line": line.line_code, "bottleCapacity": capacity})
+
+    try:
+        body = _body(request)
+    except ValueError as exc:
+        return json_err(str(exc))
+
+    raw_line = str(body.get("line") or "").upper()
+    line = next((ln for ln in lines if ln.line_code.upper() == raw_line), None)
+    if line is None:
+        return json_err(f"产线不存在或不是产线节点：{raw_line}")
+    capacity = str(body.get("bottleCapacity") or "").strip()[:32]
+    raw_values = body.get("values")
+    if not isinstance(raw_values, dict):
+        return json_err("values 必须是对象（含 ELECTRIC / WATER / STEAM）")
+    remark = str(body.get("remark") or "")[:200]
+    updated_by = str(body.get("updatedBy") or "admin")[:32]
+
+    pending: list[tuple[EnergyType, Decimal | None]] = []
+    for code, et in energy_map.items():
+        raw = raw_values.get(code)
+        if raw in (None, "", "null"):
+            value = None
+        else:
+            try:
+                value = Decimal(str(raw))
+            except (InvalidOperation, ValueError):
+                return json_err(f"{line.line_code} / {et.type_name} 的标准单耗必须是数字或留空")
+            if value < 0:
+                return json_err(f"{line.line_code} / {et.type_name} 的标准单耗不能为负数")
+        pending.append((et, value))
+
+    with transaction.atomic():
+        for et, value in pending:
+            StandardUnitConsumption.objects.update_or_create(
+                line=line,
+                bottle_capacity=capacity,
+                energy_type=et,
+                defaults={"value": value, "remark": remark, "updated_by": updated_by},
+            )
+        rows = _group_standard_rows(
+            list(
+                StandardUnitConsumption.objects.filter(
+                    line=line, bottle_capacity=capacity
+                ).select_related("line", "line__parent", "energy_type")
+            ),
+            energies,
+        )
+    return json_ok({"saved": len(pending), "row": rows[0] if rows else None})
+
+
+# ── 能源单价（独立于系统参数页）────────────────────────────────
+
+_PRICE_SPECS = {
+    "price.electric": ("电价", "元/kWh"),
+    "price.water": ("工业水价", "元/t"),
+    "price.steam": ("蒸汽单价", "元/t"),
+}
+
+
+def _price_items() -> list[dict]:
+    existing = {p.key: p for p in SystemParam.objects.filter(key__in=_PRICE_SPECS)}
+    items: list[dict] = []
+    for key, (name, unit) in _PRICE_SPECS.items():
+        p = existing.get(key)
+        items.append(
+            {
+                "key": key,
+                "name": p.name if p is not None else name,
+                "value": p.value if p is not None else None,
+                "unit": p.unit if p is not None else unit,
+                "group": "能源价格",
+                "updatedAt": p.updated_at if p is not None else None,
+                "updatedBy": p.updated_by if p is not None else "",
+            }
+        )
+    return items
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT", "PATCH"])
+def admin_energy_prices(request: HttpRequest) -> JsonResponse:
+    """能源单价（电价 / 水价 / 汽价）—— 后台「能源配置管理 → 能源单价」。"""
+    if request.method == "GET":
+        return json_ok({"items": _price_items()})
+
     try:
         body = _body(request)
     except ValueError as exc:
@@ -1181,25 +1341,14 @@ def admin_standard_units(request: HttpRequest) -> JsonResponse:
     items = body.get("items")
     if not isinstance(items, list) or not items:
         return json_err("items 必须是非空数组")
-
-    line_map = {ln.line_code.upper(): ln for ln in lines}
-    energy_map = {et.type_code.upper(): et for et in energies}
     updated_by = str(body.get("updatedBy") or "admin")[:32]
-
-    # 先整体校验再写库：否则中途某格数字不合法时，前面的格子已经提交，
-    # 界面收到 400 但库里只改了一半，现场无法判断该以哪次为准。
-    pending: list[tuple] = []
+    pending: list[tuple[str, Decimal | None]] = []
     for item in items:
         if not isinstance(item, dict):
             return json_err("items 的每一项必须是对象")
-        lc = str(item.get("line") or "").upper()
-        ec = str(item.get("energy") or "").upper()
-        line = line_map.get(lc)
-        etype = energy_map.get(ec)
-        if line is None:
-            return json_err(f"产线不存在或不是产线节点：{lc}")
-        if etype is None:
-            return json_err(f"未知能源类型：{ec}")
+        key = str(item.get("key") or "")
+        if key not in _PRICE_SPECS:
+            return json_err(f"不是能源单价参数：{key}")
         raw = item.get("value")
         if raw in (None, "", "null"):
             value = None
@@ -1207,22 +1356,25 @@ def admin_standard_units(request: HttpRequest) -> JsonResponse:
             try:
                 value = Decimal(str(raw))
             except (InvalidOperation, ValueError):
-                return json_err(f"{lc} / {ec} 的标准单耗必须是数字或留空")
+                return json_err(f"{_PRICE_SPECS[key][0]}必须是数字或留空")
             if value < 0:
-                return json_err(f"{lc} / {ec} 的标准单耗不能为负数")
-        pending.append((line, etype, value, str(item.get("remark") or "")[:200]))
+                return json_err(f"{_PRICE_SPECS[key][0]}不能为负数")
+        pending.append((key, value))
 
-    saved: list[dict] = []
     with transaction.atomic():
-        for line, etype, value, remark in pending:
-            obj, _ = StandardUnitConsumption.objects.update_or_create(
-                line=line,
-                energy_type=etype,
-                defaults={"value": value, "remark": remark, "updated_by": updated_by},
+        for key, value in pending:
+            name, unit = _PRICE_SPECS[key]
+            SystemParam.objects.update_or_create(
+                key=key,
+                defaults={
+                    "name": name,
+                    "unit": unit,
+                    "group": "能源价格",
+                    "value": value,
+                    "updated_by": updated_by,
+                },
             )
-            saved.append(_standard_row(line, etype, obj))
-
-    return json_ok({"saved": len(saved), "items": saved})
+    return json_ok({"saved": len(pending), "items": _price_items()})
 
 
 @require_GET

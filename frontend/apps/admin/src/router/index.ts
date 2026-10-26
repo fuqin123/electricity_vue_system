@@ -75,6 +75,27 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '能源报表', desc: '日报 / 周报 / 月报 / 年报模板与生成记录' }
       },
 
+      /* ── 能源配置管理（独立于系统配置）── */
+      {
+        path: 'energy-config',
+        name: 'energy-config',
+        redirect: '/energy-config/standard-unit',
+        meta: { title: '能源配置管理', desc: '能源单价与标准单耗等前提设置' },
+        children: [
+          {
+            path: 'standard-unit',
+            name: 'energy-config-standard-unit',
+            component: () => import('@/views/energy/StandardUnitView.vue'),
+            meta: { title: '标准单耗配置', desc: '按车间 / 产线 / 瓶型容量维护电、水、汽标准单耗' }
+          },
+          {
+            path: 'price',
+            name: 'energy-config-price',
+            component: () => import('@/views/energy/EnergyPriceView.vue'),
+            meta: { title: '能源单价', desc: '电价 / 水价 / 汽价，供成本折算使用' }
+          }
+        ]
+      },
       /* ── 告警管理 ── */
       {
         path: 'alarm/realtime',
@@ -173,12 +194,6 @@ const routes: RouteRecordRaw[] = [
         name: 'system-param',
         component: () => import('@/views/system/ParamView.vue'),
         meta: { title: '系统参数', desc: '能耗阈值、采集策略、大屏参数与运维策略' }
-      },
-      {
-        path: 'system/standard-unit',
-        name: 'system-standard-unit',
-        component: () => import('@/views/system/StandardUnitView.vue'),
-        meta: { title: '标准单耗', desc: '按产线 × 能源类型维护考核标准（kWh/m³/t 每千瓶）' }
       },
       {
         path: 'system/dict',

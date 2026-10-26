@@ -206,7 +206,7 @@ export function unitKwhCompareOption(
           return (
             `<b style="color:${C.text}">${d.name}</b><br>` +
             `单位电耗：<b>${d.value.toFixed(2)}</b> kWh/千瓶<br>` +
-            `标准单耗未标定（后台「标准单耗」页维护）`
+            `标准单耗未标定（后台「能源配置管理 → 标准单耗配置」维护）`
           );
         }
         const diff = ((d.value - std) / std) * 100;

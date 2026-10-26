@@ -57,8 +57,9 @@ import type {
   OperationLog,
   PageQuery,
   PageResult,
+  EnergyPriceRow,
   ReportTemplate,
-  StandardUnitMatrix,
+  StandardUnitOptions,
   StandardUnitRow,
   SysMenu,
   SysParam,
@@ -392,19 +393,46 @@ export const adminApi = {
     return request<SysParam>(`/api/admin/params/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
   },
 
-  /** 标准单耗矩阵（产线 × 电/水/汽） */
-  async getStandardUnits(): Promise<StandardUnitMatrix> {
+  /** 标准单耗配置：按产线 + 瓶型容量查询 */
+  async getStandardUnits(
+    query: { workshop?: string; line?: string; capacity?: string } = {}
+  ): Promise<StandardUnitOptions> {
     if (!useApi('admin.standardUnits')) {
-      return delay({ lines: [], energies: [], rows: [] } as StandardUnitMatrix, 120);
+      return delay({ workshops: [], lines: [], energies: [], rows: [] } as StandardUnitOptions, 120);
     }
-    return request<StandardUnitMatrix>('/api/admin/standard-units');
+    return request<StandardUnitOptions>('/api/admin/standard-units', {
+      params: query as Record<string, string>
+    });
   },
-  /** 批量保存标准单耗；value=null 表示清空为「未标定」 */
-  async saveStandardUnits(
-    items: Pick<StandardUnitRow, 'line' | 'energy' | 'value' | 'remark'>[]
-  ): Promise<{ saved: number; items: StandardUnitRow[] }> {
-    if (!useApi('admin.standardUnits')) return delay({ saved: 0, items: [] }, 220);
-    return request<{ saved: number; items: StandardUnitRow[] }>('/api/admin/standard-units', {
+  /** 新增/修改一组标准单耗（电/水/汽三列）；空串 = 未标定，0 保存但界面显示 - */
+  async saveStandardUnit(payload: {
+    line: string;
+    bottleCapacity: string;
+    values: Record<string, string | number | null>;
+    remark?: string;
+  }): Promise<{ saved: number; row: StandardUnitRow | null }> {
+    if (!useApi('admin.standardUnits')) return delay({ saved: 0, row: null }, 220);
+    return request<{ saved: number; row: StandardUnitRow | null }>('/api/admin/standard-units', {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    });
+  },
+  /** 删除一组标准单耗（line + 瓶型容量） */
+  async deleteStandardUnit(line: string, bottleCapacity: string): Promise<{ deleted: number }> {
+    if (!useApi('admin.standardUnits')) return delay({ deleted: 0 }, 180);
+    const qs = new URLSearchParams({ line, capacity: bottleCapacity }).toString();
+    return request<{ deleted: number }>(`/api/admin/standard-units?${qs}`, { method: 'DELETE' });
+  },
+  /** 能源单价（能源配置管理 → 能源单价） */
+  async getEnergyPrices(): Promise<{ items: EnergyPriceRow[] }> {
+    if (!useApi('admin.energyPrices')) return delay({ items: [] }, 120);
+    return request<{ items: EnergyPriceRow[] }>('/api/admin/energy-prices');
+  },
+  async saveEnergyPrices(
+    items: { key: string; value: string | number | null }[]
+  ): Promise<{ saved: number; items: EnergyPriceRow[] }> {
+    if (!useApi('admin.energyPrices')) return delay({ saved: 0, items: [] }, 220);
+    return request<{ saved: number; items: EnergyPriceRow[] }>('/api/admin/energy-prices', {
       method: 'PUT',
       body: JSON.stringify({ items })
     });

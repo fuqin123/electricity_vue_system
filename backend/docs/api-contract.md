@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.6.0 ｜ 最后更新：2026-10-23
+> 版本：v1.7.0 ｜ 最后更新：2026-10-26
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -34,7 +34,8 @@
 | `GET /api/admin/overview` `lines` `quality` `collect-logs` | ✅ v1.2.1 已实现 | 后台看板 / 产线主数据 / 数据质量 / 采集日志 |
 | `GET /api/admin/alarms` `POST /api/admin/alarms/{id}/ack` | ✅ v1.5.4 已实现 | 告警列表与确认，读 `energy_alarm` 表（由告警引擎生成） |
 | `GET /api/admin/readings` | ✅ v1.6.0 增补 | 原始累计读数；每行带「上一小时差值」`hourUsage` 与状态 |
-| `GET/PUT /api/admin/standard-units` | ✅ v1.6.0 已实现 | 标准单耗矩阵（产线 × 电/水/汽），空值为未标定 |
+| `GET/PUT/DELETE /api/admin/standard-units` | ✅ v1.7.0 已实现 | 标准单耗（产线 + 瓶型容量，电/水/汽三列），支持筛选/新增/修改/删除 |
+| `GET/PUT /api/admin/energy-prices` | ✅ v1.7.0 已实现 | 能源单价（电价/水价/汽价），底层同 `system_param` |
 | `/api/admin/*` 其余（系统管理、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`）；**告警已移出该清单，不再有演示数据** |
 
 > ⚠ v1.2.1 修复：admin 组接口曾误挂在 `/api/energy/admin/*` 下导致前端 404（B-404），
@@ -282,28 +283,56 @@
 `value: null` 表示**主动清空 = 未标定**（与填 0 含义不同）。参数键不可改（键是代码取值凭据），
 新增键走 `python manage.py seed_params`。默认登记五项：
 `price.electric` / `price.water` / `price.steam` / `package.bottles_per_case` / `cost.standard_per_case`。
+其中 `price.*` 归入「能源价格」组，由「能源配置管理 → 能源单价」页维护；**系统参数列表默认不返回该组**，
+避免同一价格有两个修改入口。
 
-### 3.5) `GET/PUT /api/admin/standard-units` 标准单耗（v1.6.0）
+### 3.5) `GET/PUT/DELETE /api/admin/standard-units` 标准单耗（v1.7.0）
 
-按「产线 × 能源类型」维护考核标准，单位统一为「能源单位 / 千瓶」。
+按「产线 + 瓶型容量」维护，一行包含电/水/汽三列；单位统一为「能源单位 / 千瓶」。
 
-`GET` 返回：
+`GET` 支持 `workshop`（车间编码）/ `line`（产线编码）/ `capacity`（瓶型容量模糊）筛选：
 
 ```jsonc
 {
-  "lines": [{ "code": "W103", "name": "一线", "sort": 1 }],
+  "workshops": [{ "code": "WS-CARB", "name": "碳水车间" }],
+  "lines": [{ "code": "W103", "name": "一线", "workshop": "碳水车间",
+              "workshopCode": "WS-CARB", "product": "冰红茶 500ml", "capacity": "500ml" }],
   "energies": [{ "code": "ELECTRIC", "name": "电", "unit": "kWh", "perUnit": "kWh/千瓶" }],
   "rows": [{
-    "line": "W103", "lineName": "一线", "energy": "ELECTRIC", "energyName": "电",
-    "unit": "kWh/千瓶", "value": 8.5, "remark": "考核值",
-    "updatedAt": "...", "updatedBy": "admin",
-    "perLineAvailable": true          // 水/汽无分线实测，为 false
+    "key": "W103|500ml",
+    "line": "W103", "lineName": "一线", "workshop": "碳水车间", "workshopCode": "WS-CARB",
+    "bottleCapacity": "500ml",
+    "values": { "ELECTRIC": 8.5, "WATER": 2.1, "STEAM": 0.15 },
+    "remark": "考核值", "updatedAt": "...", "updatedBy": "admin"
   }]
 }
 ```
 
-`PUT` body：`{ "items": [{ "line": "W103", "energy": "ELECTRIC", "value": 8.5, "remark": "" }] }`，
-`value: null` / 空串表示**未标定**（与 0 不同）。整批先校验再写库，任一项非法返回 400 且不落半批。
+`PUT` 单行新增/修改：
+
+```json
+{ "line": "W103", "bottleCapacity": "500ml",
+  "values": { "ELECTRIC": 8.5, "WATER": null, "STEAM": 0.15 }, "remark": "" }
+```
+
+`DELETE /api/admin/standard-units?line=W103&capacity=500ml` 删除该产线+瓶型的整组三行。
+`value` 为空 / null 表示未标定；0 可保存但界面显示 `-`，且不参与目标线计算。
+
+### 3.6) `GET/PUT /api/admin/energy-prices` 能源单价（v1.7.0）
+
+`GET` 返回三项：
+
+```json
+{ "items": [
+  { "key": "price.electric", "name": "电价", "value": 0.65, "unit": "元/kWh", "group": "能源价格" },
+  { "key": "price.water", "name": "工业水价", "value": 4.5, "unit": "元/t", "group": "能源价格" },
+  { "key": "price.steam", "name": "蒸汽单价", "value": 260, "unit": "元/t", "group": "能源价格" }
+] }
+```
+
+`PUT` body：`{ "items": [{ "key": "price.electric", "value": 0.72 }, ...] }`；
+只接受这三个键，空 / null = 未标定，负数返回 400。底层仍是 `system_param` 的同一条记录，
+成本折算读取的也是同一份，不会出现两套价格。
 
 ### 4) `GET /api/admin/readings` 仪表原始读数查询
 

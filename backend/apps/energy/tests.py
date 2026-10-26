@@ -54,7 +54,23 @@ def etype(code: str = EnergyType.ELECTRIC) -> EnergyType:
 
 
 class AggregationTests(TestCase):
-    """小时差值的口径测试。"""
+    """小时差值的口径测试。
+
+    这几条用例验证的是「整点 ± 偏移」的差值口径，固定按 offset=60 跑；
+    现场/测试环境的 `settings.local.yaml` 可能改成 600 做错峰，不能让它影响断言。
+    """
+
+    def setUp(self):
+        original = conf.get
+        patcher = mock.patch.object(
+            conf,
+            "get",
+            side_effect=lambda key, default=None: 60
+            if key == "collect.hourly_offset_seconds"
+            else original(key, default),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @classmethod
     def setUpTestData(cls):
@@ -276,7 +292,22 @@ class AggregationTests(TestCase):
 
 
 class SlotTests(TestCase):
-    """采样时刻（slots）—— 差值区间由它决定，错了会整体偏一个小时。"""
+    """采样时刻（slots）—— 差值区间由它决定，错了会整体偏一个小时。
+
+    用例固定按 offset=60 验证；环境配置可能为错峰改成 600，不能依赖外部文件。
+    """
+
+    def setUp(self):
+        original = conf.get
+        patcher = mock.patch.object(
+            conf,
+            "get",
+            side_effect=lambda key, default=None: 60
+            if key == "collect.hourly_offset_seconds"
+            else original(key, default),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_整点采样槽的采样时刻(self):
         from apps.energy.services import slots
@@ -2836,12 +2867,17 @@ class ProductionDayTests(TestCase):
 
 
 class StandardUnitTests(TestCase):
-    """v1.6.0：标准单耗按产线 × 能源维护，并驱动线/车间的标准值。"""
+    """v1.7.0：标准单耗按「产线 + 瓶型容量」CRUD，电/水/汽三列一组。"""
 
     @classmethod
     def setUpTestData(cls):
+        cls.workshop = ProductionLine.objects.create(
+            line_code="WS-SU", line_name="碳水车间",
+            node_type=ProductionLine.NODE_WORKSHOP, line_type=ProductionLine.TYPE_WORKSHOP,
+        )
         cls.line = ProductionLine.objects.create(
-            line_code="W103", line_name="一线", node_type=ProductionLine.NODE_LINE
+            line_code="W903", line_name="一线", node_type=ProductionLine.NODE_LINE,
+            parent=cls.workshop, product="冰红茶 500ml",
         )
         cls.gw = EnergyGateway.objects.create(
             code="GW-SU", name="标准测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
@@ -2854,59 +2890,144 @@ class StandardUnitTests(TestCase):
     def setUp(self):
         self.client = Client()
 
-    def test_矩阵读取时未标定为null(self):
+    def _put(self, capacity="500ml", electric="8.5", water="2.1", steam="0.15"):
+        payload = {
+            "line": "W903",
+            "bottleCapacity": capacity,
+            "values": {"ELECTRIC": electric, "WATER": water, "STEAM": steam},
+            "remark": "考核值",
+        }
+        return self.client.put(
+            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+        )
+
+    def test_空表也能返回筛选选项(self):
         body = json.loads(self.client.get("/api/admin/standard-units").content)
         self.assertEqual(len(body["lines"]), 1)
+        self.assertEqual(body["lines"][0]["capacity"], "500ml")
+        self.assertEqual(body["lines"][0]["workshop"], "碳水车间")
         self.assertEqual(len(body["energies"]), 3)
-        row = next(r for r in body["rows"] if r["energy"] == EnergyType.ELECTRIC)
-        self.assertIsNone(row["value"])
-        self.assertTrue(row["perLineAvailable"])
+        self.assertEqual(body["rows"], [])
 
-    def test_批量保存与清空(self):
-        payload = {
-            "items": [
-                {"line": "W103", "energy": "ELECTRIC", "value": "8.5", "remark": "考核值"},
-                {"line": "W103", "energy": "WATER", "value": None},
-            ]
-        }
-        res = self.client.put(
-            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+    def test_新增一组后按行返回三列(self):
+        res = self._put()
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(
+            StandardUnitConsumption.objects.filter(line=self.line, bottle_capacity="500ml").count(), 3
+        )
+        body = json.loads(self.client.get("/api/admin/standard-units").content)
+        self.assertEqual(len(body["rows"]), 1)
+        row = body["rows"][0]
+        self.assertEqual(row["workshop"], "碳水车间")
+        self.assertEqual(row["bottleCapacity"], "500ml")
+        self.assertEqual(row["values"]["ELECTRIC"], 8.5)
+        self.assertEqual(row["values"]["WATER"], 2.1)
+        self.assertEqual(row["values"]["STEAM"], 0.15)
+
+    def test_筛选车间产线与容量(self):
+        self._put("500ml", "8.5")
+        self._put("550ml", "9.0")
+        body = json.loads(
+            self.client.get(
+                "/api/admin/standard-units",
+                {"workshop": "WS-SU", "line": "W903", "capacity": "550"},
+            ).content
+        )
+        self.assertEqual(len(body["rows"]), 1)
+        self.assertEqual(body["rows"][0]["bottleCapacity"], "550ml")
+
+    def test_修改与删除整组(self):
+        self._put("500ml", "8.5")
+        self._put("500ml", "7.8")
+        self.assertEqual(
+            StandardUnitConsumption.objects.filter(line=self.line, bottle_capacity="500ml").count(), 3
+        )
+        res = self.client.delete(
+            "/api/admin/standard-units?line=W903&capacity=500ml"
         )
         self.assertEqual(res.status_code, 200, res.content)
-        row = StandardUnitConsumption.objects.get(line=self.line, energy_type=etype())
-        self.assertEqual(row.value, Decimal("8.5000"))
-        self.assertEqual(row.remark, "考核值")
-
-        # 空串 = 清空为未标定，与 0 不同
-        payload["items"] = [{"line": "W103", "energy": "ELECTRIC", "value": ""}]
-        res = self.client.put(
-            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+        self.assertFalse(
+            StandardUnitConsumption.objects.filter(line=self.line, bottle_capacity="500ml").exists()
         )
-        self.assertEqual(res.status_code, 200)
-        row.refresh_from_db()
-        self.assertIsNone(row.value)
 
-    def test_负数整批拒绝且不落半批(self):
+    def test_零值保存但不参与目标(self):
+        res = self._put("500ml", "0", "", "")
+        self.assertEqual(res.status_code, 200)
+        body = json.loads(self.client.get("/api/admin/standard-units").content)
+        self.assertEqual(body["rows"][0]["values"]["ELECTRIC"], 0)
+        self.assertIsNone(body["rows"][0]["values"]["WATER"])
+        data = build_line(self.line, datetime(2026, 10, 22, 10, 30))
+        self.assertIsNone(data["standardUnitKwh"], "0 视为未配置，不能画 0 目标线")
+        snap = build_overview(datetime(2026, 10, 22, 10, 30))
+        self.assertIsNone(snap["workshop"]["targetUnitKwh"])
+
+    def test_负数拒绝且不落库(self):
+        res = self._put("500ml", "8.5", "-1", "")
+        self.assertEqual(res.status_code, 400)
+        self.assertFalse(StandardUnitConsumption.objects.exists())
+
+    def test_按产线当前瓶型选择标准(self):
+        self._put("500ml", "8.5")
+        self._put("550ml", "9.0")
+        data = build_line(self.line, datetime(2026, 10, 22, 10, 30))
+        self.assertEqual(data["standardUnitKwh"], 8.5, "line.product 是 500ml，应选 500ml 那组")
+        self.line.product = "绿茶 550ml"
+        self.line.save(update_fields=["product"])
+        data = build_line(self.line, datetime(2026, 10, 22, 10, 30))
+        self.assertEqual(data["standardUnitKwh"], 9.0)
+
+
+class EnergyPriceTests(TestCase):
+    """v1.7.0：能源单价独立成一页，并从系统参数页移出。"""
+
+    def setUp(self):
+        call_command("seed_params", stdout=StringIO())
+        self.client = Client()
+
+    def test_能源单价页返回三项(self):
+        body = json.loads(self.client.get("/api/admin/energy-prices").content)
+        self.assertEqual(len(body["items"]), 3)
+        self.assertEqual(
+            {i["key"] for i in body["items"]},
+            {"price.electric", "price.water", "price.steam"},
+        )
+        self.assertTrue(all(i["group"] == "能源价格" for i in body["items"]))
+
+    def test_保存能源单价(self):
         payload = {
             "items": [
-                {"line": "W103", "energy": "ELECTRIC", "value": "9"},
-                {"line": "W103", "energy": "WATER", "value": "-1"},
+                {"key": "price.electric", "value": "0.72"},
+                {"key": "price.water", "value": ""},
             ]
         }
         res = self.client.put(
-            "/api/admin/standard-units", data=json.dumps(payload), content_type="application/json"
+            "/api/admin/energy-prices", data=json.dumps(payload), content_type="application/json"
+        )
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(SystemParam.objects.get(key="price.electric").value, Decimal("0.72"))
+        self.assertIsNone(SystemParam.objects.get(key="price.water").value)
+
+    def test_系统参数页不再重复显示能源单价(self):
+        body = json.loads(self.client.get("/api/admin/params").content)
+        keys = {r["key"] for r in body["list"]}
+        self.assertFalse(any(k.startswith("price.") for k in keys))
+        self.assertIn("package.bottles_per_case", keys)
+        body = json.loads(self.client.get("/api/admin/params", {"group": "能源价格"}).content)
+        self.assertEqual(len(body["list"]), 3)
+
+    def test_非能源键和负数拒绝(self):
+        res = self.client.put(
+            "/api/admin/energy-prices",
+            data=json.dumps({"items": [{"key": "price.electric", "value": "-1"}]}),
+            content_type="application/json",
         )
         self.assertEqual(res.status_code, 400)
-        self.assertFalse(StandardUnitConsumption.objects.exists(), "校验失败不能留下半批数据")
-
-    def test_标准值进入线详情与车间目标(self):
-        StandardUnitConsumption.objects.create(
-            line=self.line, energy_type=etype(), value=Decimal("8.5")
+        res = self.client.put(
+            "/api/admin/energy-prices",
+            data=json.dumps({"items": [{"key": "package.bottles_per_case", "value": "24"}]}),
+            content_type="application/json",
         )
-        data = build_line(self.line, datetime(2026, 10, 22, 10, 30))
-        self.assertEqual(data["standardUnitKwh"], 8.5)
-        snap = build_overview(datetime(2026, 10, 22, 10, 30))
-        self.assertEqual(snap["workshop"]["targetUnitKwh"], 8.5)
+        self.assertEqual(res.status_code, 400)
 
 
 class ReadingHourUsageTests(TestCase):

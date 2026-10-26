@@ -4,7 +4,7 @@
 # 构建上下文 = **仓库根目录**（不是 frontend/），因为要一并拷贝
 # deploy/docker/nginx.default.conf 到镜像里。
 #
-#   docker build -f deploy/docker/Dockerfile -t eep-frontend:1.6.0 .
+#   docker build -f deploy/docker/Dockerfile -t eep-frontend:1.7.0 .
 #   或：cd deploy/docker && docker compose build frontend
 #
 # 拉不到 Docker Hub 时（国内服务器常见）用 ARG 换成加速地址：

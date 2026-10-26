@@ -515,27 +515,49 @@ export interface LoginLog {
   loginAt: string;
 }
 
-/** 标准单耗矩阵的一个格子（产线 × 能源类型） */
+/** 标准单耗：配置页的一行 = 产线 × 瓶型容量，电/水/汽三列。 */
 export interface StandardUnitRow {
+  /** 稳定键：`line|bottleCapacity` */
+  key: string;
   line: string;
   lineName: string;
-  energy: string;
-  energyName: string;
-  /** 展示单位，如 kWh/千瓶 */
-  unit: string;
-  /** null = 未标定，与 0 不是一回事 */
-  value: number | null;
+  workshop: string;
+  workshopCode: string;
+  bottleCapacity: string;
+  /** 键为 ELECTRIC / WATER / STEAM；null = 未标定，0 在界面显示 - */
+  values: Record<string, number | null>;
   remark: string;
   updatedAt?: string | null;
   updatedBy?: string;
-  /** 水/汽没有分线实测；仍可配置，但界面要标注 */
-  perLineAvailable: boolean;
 }
 
-export interface StandardUnitMatrix {
-  lines: { code: string; name: string; sort: number }[];
+/** 新增/修改标准单耗时可选的组织节点 */
+export interface StandardUnitLineOption {
+  code: string;
+  name: string;
+  workshop: string;
+  workshopCode: string;
+  product: string;
+  /** 从 product 提取的默认瓶型容量，如 500ml */
+  capacity: string;
+}
+
+export interface StandardUnitOptions {
+  workshops: { code: string; name: string }[];
+  lines: StandardUnitLineOption[];
   energies: { code: string; name: string; unit: string; perUnit: string }[];
   rows: StandardUnitRow[];
+}
+
+/** 能源单价（能源配置管理 → 能源单价） */
+export interface EnergyPriceRow {
+  key: string;
+  name: string;
+  value: number | null;
+  unit: string;
+  group?: string;
+  updatedAt?: string | null;
+  updatedBy?: string;
 }
 
 /** 系统参数 */

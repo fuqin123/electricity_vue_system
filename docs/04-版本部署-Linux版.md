@@ -543,7 +543,7 @@ docker compose ps                                      # 五个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.6.0-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.7.0-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz
@@ -579,6 +579,17 @@ docker compose logs --tail=6 rollup         # 期望末尾是 06:30 结算窗口
 - 迁移 `0013_v160_line_codes` 会把六条产线原地改码为 W103/W101/W102/W301/W104/W105；如果库里同时存在旧码和新码，迁移会报冲突并停下，先人工核对再升级。
 - 迁移 `0014_v160_standard_unit` 只建新表；标准单耗初始为空（未标定），在后台「系统管理 → 标准单耗」录入。
 - `rebuild_summaries` 会清空并重建三张汇总表；请安排在维护窗口，执行前可先 `--dry-run` 看范围。
+
+### 4.6 v1.7.0 升级（能源配置管理）
+
+```bash
+docker compose up -d
+# 迁移会自动执行：0015 标准单耗增加瓶型容量、0016 归位能源单价分组
+# 本版不需要重建日/月/年汇总
+```
+
+升级后后台「能源配置管理」下出现「标准单耗配置」「能源单价」两页；系统参数页不再显示三项能源单价。
+迁移 0015 会为没有标准配置的产线补空白行（value=NULL），不会覆盖已有值。
 
 ## 五、方案 C：一键部署脚本
 

@@ -27,11 +27,11 @@ set -eu
 
 cd "$(dirname "$0")"
 
-# ⚠ 版本号**只有这一处默认值**：docker-compose.yml 用 `${EEP_VERSION:-1.6.0}` 取同一个默认，
+# ⚠ 版本号**只有这一处默认值**：docker-compose.yml 用 `${EEP_VERSION:-1.7.0}` 取同一个默认，
 #   所以改版本只需改这两处的默认值（或直接 export EEP_VERSION）。
 #   2026-10 曾出现「compose 打 1.1.0、package.json 已 1.5.0」的漂移（见 docs/06 代码审查报告），
 #   硬编码两处就是根因 —— 现在靠单一来源消除。
-VERSION="${EEP_VERSION:-1.6.0}"
+VERSION="${EEP_VERSION:-1.7.0}"
 # go2rtc 不在默认清单里：它是可选服务（--profile stream），
 # 现场现在跑的是 Windows 版网关，塞进包里只会白白多出 100MB+。
 IMAGES="eep-frontend:$VERSION eep-backend:$VERSION mysql:8.0"

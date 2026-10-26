@@ -872,18 +872,18 @@ class SystemParam(models.Model):
 
 
 class StandardUnitConsumption(models.Model):
-    """标准单耗：按**产线 × 能源类型**维护，单位统一为「能源单位 / 千瓶」。
+    """标准单耗：按**产线 × 瓶型容量 × 能源类型**维护，单位统一为「能源单位 / 千瓶」。
 
-    为什么要独立一张表，而不是塞进 SystemParam：
-      · 参数键会随产线增删而漂移（`std.W103.electric`），既没有外键也没有
-        组合唯一约束，删一条产线后旧键会永久留在参数表里；
-      · 前后端都需要稳定的「线 × 能源」矩阵，外键 + unique(line, energy_type)
-        才表达得了这件事。
-    成本单价 / 箱规仍留在 SystemParam（它们是全厂参数，不是按线参数）。
+    同一产线会切换瓶型（500ml / 550ml / 1L），标准单耗必须带上瓶型容量；
+    后台配置页把同一 (line, bottle_capacity) 的电/水/汽三行拼成一行显示。
 
-    `value = NULL` 表示**未标定**，与 0 是两回事：界面显示 `--`，不要画成 0。
-    水 / 汽目前只有车间总表，没有分线实测；这两列仍允许配置（为后续分线计量
-    留位置），但界面必须标注「无分线实测」。
+    为什么独立一张表，而不是塞进 SystemParam：
+      · 参数键会随产线 / 瓶型增删而漂移，既没有外键也没有组合唯一约束；
+      · 外键 + unique(line, bottle_capacity, energy_type) 才能表达稳定配置。
+    能源单价 / 箱规仍留在 SystemParam（全厂参数，不按产线拆分）。
+
+    `value = NULL` 表示**未标定**；0 在配置页显示 `-`，且不参与目标线计算。
+    水 / 汽目前只有车间总表，没有分线实测；这两列仍允许配置，界面标注「无分线实测」。
     """
 
     line = models.ForeignKey(
@@ -892,9 +892,13 @@ class StandardUnitConsumption(models.Model):
     energy_type = models.ForeignKey(
         EnergyType, on_delete=models.CASCADE, related_name="standard_units", verbose_name="能源类型"
     )
+    bottle_capacity = models.CharField(
+        "瓶型容量", max_length=32, blank=True, default="",
+        help_text="如 500ml / 1L；同一产线可按瓶型分别配置",
+    )
     value = models.DecimalField(
         "标准单耗", max_digits=14, decimal_places=4, null=True, blank=True,
-        help_text="每千瓶消耗量；NULL=未标定",
+        help_text="每千瓶消耗量；NULL=未标定，0 在界面显示为 -",
     )
     remark = models.CharField("说明", max_length=200, blank=True, default="")
     updated_at = models.DateTimeField("更新时间", auto_now=True)
@@ -902,15 +906,18 @@ class StandardUnitConsumption(models.Model):
 
     class Meta:
         db_table = "energy_standard_unit"
-        ordering = ["line__sort", "line__line_code", "energy_type__type_code"]
+        ordering = ["line__sort", "line__line_code", "bottle_capacity", "energy_type__type_code"]
         verbose_name = "标准单耗"
         verbose_name_plural = "标准单耗"
         constraints = [
-            models.UniqueConstraint(fields=("line", "energy_type"), name="uniq_standard_line_energy"),
+            models.UniqueConstraint(
+                fields=("line", "bottle_capacity", "energy_type"),
+                name="uniq_standard_line_capacity_energy",
+            ),
         ]
 
     def __str__(self) -> str:
-        return f"{self.line.line_code} {self.energy_type.type_code}={self.value}"
+        return f"{self.line.line_code} {self.bottle_capacity or '-'} {self.energy_type.type_code}={self.value}"
 
 
 class EnergyAlarm(models.Model):

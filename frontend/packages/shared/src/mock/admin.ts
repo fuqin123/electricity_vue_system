@@ -88,6 +88,9 @@ export function mockMenus(): SysMenu[] {
     [7, 5, '水计量', '/energy/water', 'water', 'menu'],
     [8, 5, '汽计量', '/energy/steam', 'steam', 'menu'],
     [9, 5, '能源报表', '/energy/report', 'document', 'menu'],
+    [30, 0, '能源配置管理', '/energy-config', 'setting', 'catalog'],
+    [31, 30, '标准单耗配置', '/energy-config/standard-unit', 'list', 'menu'],
+    [32, 30, '能源单价', '/energy-config/price', 'param', 'menu'],
     [10, 0, '告警管理', '/alarm', 'bell', 'catalog'],
     [11, 10, '实时告警', '/alarm/realtime', 'alert', 'menu'],
     [12, 10, '历史告警', '/alarm/history', 'history', 'menu'],
@@ -106,7 +109,6 @@ export function mockMenus(): SysMenu[] {
     [25, 23, '角色管理', '/system/role', 'team', 'menu'],
     [26, 23, '菜单管理', '/system/menu', 'menu', 'menu'],
     [27, 23, '系统参数', '/system/param', 'param', 'menu'],
-    [29, 23, '标准单耗', '/system/standard-unit', 'param', 'menu'],
     [28, 23, '数据字典', '/system/dict', 'book', 'menu']
   ];
   return defs.map(([id, parentId, name, path, icon, type], i) => ({

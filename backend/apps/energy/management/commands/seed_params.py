@@ -1,7 +1,7 @@
-"""登记系统参数（成本单价 / 箱规 / 标准变动费用），幂等。
+"""登记系统参数（能源单价 / 箱规 / 标准变动费用），幂等。
 
 只补「库里没有的键」，**不覆盖后台已经改过的值** —— 这些参数由能源管理员在
-后台「系统参数」页维护，重跑本命令不能把他们的修改冲掉（与 seed_registry 同一套约定）。
+后台「能源配置管理 → 能源单价」/「系统参数」页维护，重跑本命令不能把他们的修改冲掉（与 seed_registry 同一套约定）。
 
 用法：
     python manage.py seed_params            # 缺什么补什么
@@ -24,7 +24,7 @@ DEFAULTS: list[dict] = [
         "name": "电价",
         "value": Decimal("0.65"),
         "unit": "元/kWh",
-        "group": "成本参数",
+        "group": "能源价格",
         "remark": "综合电价（含峰谷平加权）。上线前请用财务结算单实际值回填。",
     },
     {
@@ -32,7 +32,7 @@ DEFAULTS: list[dict] = [
         "name": "工业水价",
         "value": Decimal("4.50"),
         "unit": "元/t",
-        "group": "成本参数",
+        "group": "能源价格",
         "remark": "车间进水单价。水价含污水处理费时在此一并登记。",
     },
     {
@@ -40,7 +40,7 @@ DEFAULTS: list[dict] = [
         "name": "蒸汽单价",
         "value": Decimal("260.00"),
         "unit": "元/t",
-        "group": "成本参数",
+        "group": "能源价格",
         "remark": "外购蒸汽结算单价，按锅炉房结算口径回填。",
     },
     {
@@ -63,7 +63,7 @@ DEFAULTS: list[dict] = [
 
 
 class Command(BaseCommand):
-    help = "登记 / 查看系统参数（成本单价、箱规、标准变动费用）"
+    help = "登记 / 查看系统参数（能源单价、箱规、标准变动费用）"
 
     def add_arguments(self, parser):
         parser.add_argument("--show", action="store_true", help="打印当前全部参数")

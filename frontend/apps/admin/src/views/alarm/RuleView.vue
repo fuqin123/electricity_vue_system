@@ -83,7 +83,7 @@ function fetchRules(query: PageQuery): Promise<PageResult<RuleRow>> {
       show-icon
       class="mb-16"
       title="本页是只读对照，不是规则编辑器"
-      description="告警规则由后端引擎定义（backend/apps/energy/services/alerts.py），改判定逻辑需要发版；阈值类参数（单价、箱规、目标单耗）在「系统管理 → 系统参数」维护，停摆阈值在 backend/config/settings.local.yaml 的 collect.stale_alert_hours。"
+      description="告警规则由后端引擎定义（backend/apps/energy/services/alerts.py），改判定逻辑需要发版；能源单价在「能源配置管理 → 能源单价」、标准单耗在「标准单耗配置」、箱规/标准变动费用在「系统管理 → 系统参数」维护，停摆阈值在 backend/config/settings.local.yaml 的 collect.stale_alert_hours。"
     />
 
     <TablePage :columns="columns" :fetch="fetchRules" keyword-placeholder="规则编码 / 名称 / 条件" :max-height="520">
