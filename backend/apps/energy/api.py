@@ -631,7 +631,7 @@ def _meter_today_usage() -> dict:
         row["meter_id"]: row
         for row in EnergyHourly.objects.filter(
             B.hour_q(B.day_start(day), B.day_end(day)),
-            quality__in=EnergyHourly.TRUSTED,
+            quality__in=EnergyHourly.SUMMABLE,
         )
         .values("meter_id")
         .annotate(total=Sum("consumption"), hours=Count("id"))
@@ -1750,7 +1750,7 @@ def admin_quality(request: HttpRequest) -> JsonResponse:
         ok_rows = EnergyHourly.objects.filter(
             B.hour_q(B.day_start(day), B.day_end(day)),
             meter__in=meters,
-            quality__in=EnergyHourly.TRUSTED,
+            quality__in=EnergyHourly.SUMMABLE,
         )
         received = ok_rows.values("stat_date", "stat_hour").distinct().count()
         got = set(ok_rows.values_list("stat_date", "stat_hour"))

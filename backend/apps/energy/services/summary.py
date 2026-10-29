@@ -124,10 +124,10 @@ def production_total(
     return Decimal(total) if total is not None else None
 
 
-def _quality_from(covered: int, expected: int) -> str:
+def _quality_from(covered: int, expected: int, has_partial: bool = False) -> str:
     if expected <= 0 or covered <= 0:
         return Q_MISSING
-    if covered >= expected:
+    if covered >= expected and not has_partial:
         return Q_OK
     return Q_PARTIAL
 
@@ -149,38 +149,46 @@ def _period_value(dim: str, start: date_cls) -> object:
     return start.year
 
 
-def _elec_metrics(lines: list[ProductionLine], start: datetime, end: datetime) -> tuple[Decimal | None, int]:
-    """一组产线在生产日窗口内的电量合计，以及「所有电表都有可信数据」的小时数。
+def _elec_metrics(
+    lines: list[ProductionLine], start: datetime, end: datetime
+) -> tuple[Decimal | None, int, bool]:
+    """一组产线在生产日窗口内的电量合计、覆盖小时数、是否含 partial。
 
-    「齐全」= 那个小时上这组产线**每一块电表**都有可信的小时行。
-    只要有一块表缺数，这个小时就不算 covered —— 与小时级「宁可空白」的口径一致。
-    `start/end` 是生产日窗口（06:00 起止），不是自然日期。
+    `partial` 是端点偏差/补采造成的「有值但时段不完美」数据：计入合计（不丢数），
+    但把汇总行标成 partial，并交给 11:00 的人工复核告警。missing/reset/spike 仍不计。
     """
     meter_qs = EnergyMeter.objects.filter(
         line__in=lines, energy_type__type_code=EnergyType.ELECTRIC, enabled=True
     )
     n_meters = meter_qs.count()
     if n_meters == 0:
-        return None, 0
+        return None, 0, False
     rows = EnergyHourly.objects.filter(
         B.hour_q(start, end),
         meter__in=meter_qs,
-        quality__in=EnergyHourly.TRUSTED,
+        quality__in=EnergyHourly.SUMMABLE,
     )
     total = rows.aggregate(t=Sum("consumption"))["t"]
     covered = (
         rows.values("stat_date", "stat_hour").annotate(n=Count("id")).filter(n=n_meters).count()
     )
-    return (Decimal(total) if total is not None else None), covered
+    has_partial = rows.filter(quality=EnergyHourly.Q_PARTIAL).exists()
+    return (Decimal(total) if total is not None else None), covered, has_partial
 
 
-def _one_type_metrics(meter: EnergyMeter, start: datetime, end: datetime) -> tuple[Decimal | None, int]:
-    """单个计量点（车间水/汽总表）在生产日窗口内的合计与覆盖小时数。"""
+def _one_type_metrics(
+    meter: EnergyMeter, start: datetime, end: datetime
+) -> tuple[Decimal | None, int, bool]:
+    """单个计量点（车间水/汽总表）的合计、覆盖小时数、是否含 partial。"""
     rows = EnergyHourly.objects.filter(
-        B.hour_q(start, end), meter=meter, quality__in=EnergyHourly.TRUSTED
+        B.hour_q(start, end), meter=meter, quality__in=EnergyHourly.SUMMABLE
     )
     total = rows.aggregate(t=Sum("consumption"))["t"]
-    return (Decimal(total) if total is not None else None), rows.count()
+    return (
+        Decimal(total) if total is not None else None,
+        rows.count(),
+        rows.filter(quality=EnergyHourly.Q_PARTIAL).exists(),
+    )
 
 
 def _upsert(model, line: ProductionLine, etype: EnergyType, dim: str, start: date_cls, **fields) -> str:
@@ -225,14 +233,17 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                 # 一块总表时行为与旧实现一致；多块则求和（缺一块即整段 None）
                 total = Decimal(0)
                 covered = 0
+                has_partial = False
                 for m in meters:
-                    sub_total, sub_covered = _one_type_metrics(m, window_start, window_end)
+                    sub_total, sub_covered, sub_partial = _one_type_metrics(m, window_start, window_end)
                     if sub_total is None:
                         total = None
                         covered = 0
+                        has_partial = False
                         break
                     total += sub_total
                     covered = max(covered, sub_covered)
+                    has_partial = has_partial or sub_partial
                 written.append(
                     _upsert(
                         EnergyDaily,
@@ -244,13 +255,13 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                         unit=etype.unit,
                         covered_count=covered,
                         expected_count=24,
-                        quality=_quality_from(covered, 24),
+                        quality=_quality_from(covered, 24, has_partial),
                     )
                 )
 
         # ── 产线节点：电力 ──
         for line in lines:
-            total, covered = _elec_metrics([line], window_start, window_end)
+            total, covered, has_partial = _elec_metrics([line], window_start, window_end)
             etype = types.get(EnergyType.ELECTRIC)
             if etype is not None:
                 written.append(
@@ -264,7 +275,7 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                         unit=etype.unit,
                         covered_count=covered,
                         expected_count=24,
-                        quality=_quality_from(covered, 24),
+                        quality=_quality_from(covered, 24, has_partial),
                     )
                 )
 
@@ -272,7 +283,7 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
         # 挂到 aux 节点自己名下，这样「车间合计 = 产线 + 辅机」可以直接由
         # 本车间所有节点的日行相加得出，不必在查询时特判。
         for aux in ProductionLine.objects.filter(node_type=ProductionLine.NODE_AUX):
-            total, covered = _elec_metrics([aux], window_start, window_end)
+            total, covered, has_partial = _elec_metrics([aux], window_start, window_end)
             etype = types.get(EnergyType.ELECTRIC)
             if etype is not None:
                 written.append(
@@ -286,7 +297,7 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                         unit=etype.unit,
                         covered_count=covered,
                         expected_count=24,
-                        quality=_quality_from(covered, 24),
+                        quality=_quality_from(covered, 24, has_partial),
                     )
                 )
     return written
@@ -317,6 +328,7 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
                 agg = rows.aggregate(t=Sum("consumption"), c=Sum("covered_count"))
                 # 该周期有多少天是有可信数据的（用来算覆盖率）
                 covered_days = rows.filter(quality__in=(Q_OK, Q_PARTIAL)).count()
+                has_partial = rows.filter(quality=Q_PARTIAL).exists()
                 total = agg["t"]
                 if dim == DIM_YEAR:
                     expected = _days_in(start, end, now)
@@ -331,7 +343,7 @@ def summarize_periods(dim: str, days: list[date_cls], now: datetime | None = Non
                         unit=etype.unit,
                         covered_count=covered_days,
                         expected_count=expected,
-                        quality=_quality_from(covered_days, expected),
+                        quality=_quality_from(covered_days, expected, has_partial),
                     )
                 )
     return written
@@ -555,8 +567,8 @@ def period_rows(
             quality = Q_MISSING
         elif open_period:
             # 当期：从小时表现算。已结束的周期才允许读汇总表（汇总表是每日结算的产物）
-            kwh, covered = _elec_metrics(agg_lines, window_start, window_end)
-            quality = _quality_from(covered, expected)
+            kwh, covered, has_partial = _elec_metrics(agg_lines, window_start, window_end)
+            quality = _quality_from(covered, expected, has_partial)
         else:
             if dim == DIM_DAY:
                 rows = EnergyDaily.objects.filter(
@@ -576,11 +588,13 @@ def period_rows(
                 covered = min(
                     [r.covered_count for r in rows if r.covered_count] or [0]
                 )
+            # 汇总行本身可能已经是 partial（含端点偏差小时）；现算时再用小时行覆盖它
+            has_partial = rows.filter(quality=Q_PARTIAL).exists()
             # 昨天 / 今天还没被每日结算写完整 → 退回小时表现算（见 _day_not_settled）
             live_fallback = unsettled_yesterday and covered < expected
             if live_fallback:
-                kwh, covered = _elec_metrics(agg_lines, window_start, window_end)
-            quality = _quality_from(covered, expected)
+                kwh, covered, has_partial = _elec_metrics(agg_lines, window_start, window_end)
+            quality = _quality_from(covered, expected, has_partial)
 
         # ── 水 / 汽（只有车间级有）──
         # 逐车间累加，但**只累加登记了该类总表的车间**。

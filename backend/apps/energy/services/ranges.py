@@ -323,13 +323,16 @@ def _hour_matrix(
         if bad:
             out[b] = (None, bad[0]["quality"])
             continue
-        usable = [r for r in got if r["quality"] in EnergyHourly.TRUSTED]
+        usable = [r for r in got if r["quality"] in EnergyHourly.SUMMABLE]
         if not usable:
-            # 同 snapshot.py：一块表都没给出可信值时，合计是 None 而不是 0
+            # 同 snapshot.py：一块表都没给出可计入值时，合计是 None 而不是 0
             out[b] = (None, EnergyHourly.Q_PARTIAL)
             continue
         total = sum((r["consumption"] or Decimal(0) for r in usable), Decimal(0))
-        quality = EnergyHourly.Q_OK if len(usable) == len(exp) else EnergyHourly.Q_PARTIAL
+        partial = len(usable) != len(exp) or any(
+            r["quality"] == EnergyHourly.Q_PARTIAL for r in usable
+        )
+        quality = EnergyHourly.Q_PARTIAL if partial else EnergyHourly.Q_OK
         out[b] = (total, quality)
     return out
 
@@ -468,7 +471,7 @@ def _utility_series(
             out.append(float(val) if val is not None else None)
             continue
         agg = EnergyHourly.objects.filter(
-            B.hour_q(start, end), meter__in=meters, quality__in=EnergyHourly.TRUSTED
+            B.hour_q(start, end), meter__in=meters, quality__in=EnergyHourly.SUMMABLE
         ).aggregate(t=Sum("consumption"))
         out.append(float(agg["t"]) if agg["t"] is not None else None)
     return out

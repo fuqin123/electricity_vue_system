@@ -16,7 +16,7 @@
 | `Dockerfile.backend` | 后端镜像：Python 3.12 + gunicorn；**采集容器复用同一个镜像** |
 | `entrypoint.backend.sh` | 等数据库 → 建库 → migrate → seed → exec 主进程 |
 | `nginx.default.conf` | 容器内站点配置（`/screen/` `/admin/` `/api/` `/live/`） |
-| `docker-compose.yml` | 编排：frontend / backend / collector / rollup / mysql（+ 可选 stream） |
+| `docker-compose.yml` | 编排：frontend / backend / collector / review / rollup / mysql（+ 可选 stream） |
 | `.env.example` | 口令与参数模板，`cp .env.example .env` 后填 |
 | `build-offline-bundle.sh` | 构建机执行：出镜像 → `docker save` → 打离线压缩包 |
 | `load-and-run.sh` | 目标机执行：导镜像 → 生成 .env → 起服务 → 等健康检查 |
@@ -52,7 +52,7 @@ MySQL 首次建数据卷要 30~60 秒，期间 backend 会停在「等待数据�
 cd deploy/docker
 cp .env.example .env            # build 阶段 compose 也要校验必填项
 ./build-offline-bundle.sh
-# 产物：dist/eep-docker-bundle-v1.7.0-<日期>.tar.gz
+# 产物：dist/eep-docker-bundle-v1.7.1-<日期>.tar.gz
 # Docker Hub 不通时加加速前缀（只影响 mysql 这类公共基础镜像）：
 #   REGISTRY_MIRROR=docker.m.daocloud.io ./build-offline-bundle.sh
 ```
@@ -80,7 +80,7 @@ cd eep-docker-bundle-*/runtime && ./load-and-run.sh
 按顺序打，每一环都能单独定位问题：
 
 ```bash
-# ① 五个容器都在、健康检查通过（frontend/backend/collector/rollup/mysql）
+# ① 六个容器都在、健康检查通过（frontend/backend/collector/review/rollup/mysql）
 docker compose ps
 
 # ② 前端本身活着（nginx 的自检口，不依赖后端）

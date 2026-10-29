@@ -198,15 +198,16 @@ def _finished_hour_cell(
         # 任何一块表缺数/换表，合计就不成立 —— 不返回偏小的值
         return HourCell(None, bad[0].quality)
 
-    usable = [r for r in rows if r.quality in EnergyHourly.TRUSTED]
+    usable = [r for r in rows if r.quality in EnergyHourly.SUMMABLE]
     if not usable:
-        # ⚠ 一块表都没给出可信值（全是 partial / spike）时，合计必须是 None。
-        #   sum(空) = 0 会让界面显示「这一小时 0 kWh」——
-        #   和「产量未接入给 0」是同一类错误：0 会被当成「确实没用电」。
+        # ⚠ 一块表都没给出可计入值（全是 spike）时，合计必须是 None。
         #   宁可显示 `--`，也不要给一个看着正常的 0。
         return HourCell(None, EnergyHourly.Q_PARTIAL, partial=True)
     total = sum((r.consumption or Decimal(0) for r in usable), Decimal(0))
-    partial = len(usable) != len(rows)  # 有 spike / partial 被排除在外
+    # partial 行保留数值（现场要求不丢 5/10 分钟偏差的数据），但仍标成 partial
+    partial = len(usable) != len(rows) or any(
+        r.quality == EnergyHourly.Q_PARTIAL for r in usable
+    )
     return HourCell(total, EnergyHourly.Q_PARTIAL if partial else EnergyHourly.Q_OK, partial=partial)
 
 
@@ -408,7 +409,7 @@ def _range_kwh(meters_qs, start: datetime, end: datetime) -> Decimal | None:
     agg = EnergyHourly.objects.filter(
         B.hour_q(start, end),
         meter__in=meters_qs,
-        quality__in=EnergyHourly.TRUSTED,
+        quality__in=EnergyHourly.SUMMABLE,
     ).aggregate(t=Sum("consumption"))
     return agg["t"]
 
@@ -872,7 +873,7 @@ def _workshop_period(dim: str, now: datetime, real: bool) -> dict:
     agg = EnergyHourly.objects.filter(
         B.hour_q(start, end),
         meter__energy_type__type_code=EnergyType.ELECTRIC,
-        quality__in=EnergyHourly.TRUSTED,
+        quality__in=EnergyHourly.SUMMABLE,
     ).aggregate(total=Sum("consumption"))
     out = S.production_total(list(ProductionLine.active_lines_qs()), start, end) or Decimal(0)
     return {"output": int(out) if real else NULL, "kwh": agg["total"] or Decimal(0)}

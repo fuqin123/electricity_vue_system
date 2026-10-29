@@ -33,6 +33,7 @@ const GROUP_TYPE: Record<string, 'primary' | 'success' | 'warning' | 'info'> = {
   成本参数: 'success',
   能耗阈值: 'primary',
   采集策略: 'info',
+  数据质量: 'warning',
   大屏参数: 'info',
   运维策略: 'warning',
   告警通知: 'warning'

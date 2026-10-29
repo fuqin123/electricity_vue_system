@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.7.0 ｜ 最后更新：2026-10-26
+> 版本：v1.7.1 ｜ 最后更新：2026-10-29
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -285,6 +285,13 @@
 `price.electric` / `price.water` / `price.steam` / `package.bottles_per_case` / `cost.standard_per_case`。
 其中 `price.*` 归入「能源价格」组，由「能源配置管理 → 能源单价」页维护；**系统参数列表默认不返回该组**，
 避免同一价格有两个修改入口。
+
+数据质量参数（v1.7.1，`group=数据质量`）：
+
+| 键 | 默认 | 单位 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `data_quality.review_hour` | 11 | 时 | 每天异常时段复核时刻，可含小数（11.5=11:30） |
+| `data_quality.deviation_minutes` | 10 | 分钟 | 端点/区间时长允许偏差；范围内视为正常，超出仍保留数值并生成复核告警 |
 
 ### 3.5) `GET/PUT/DELETE /api/admin/standard-units` 标准单耗（v1.7.0）
 
@@ -1051,7 +1058,8 @@ Authorization: Bearer <token>
 | `meter_collect_fail` | 最近一轮采集失败（`last_ok=false`），带出错误原因 | critical |
 | `gateway_offline` | 该网关最近一轮点位**全部失败**（0/N）。⚠ 与网关列表页的「在线」徽标是两件事 | critical |
 | `collect_stale` | 最新成功读数超过 `collect.stale_alert_hours` 未更新，或尚无任何数据 | critical |
-| `hour_quality` | 近 24 小时出现 `reset`（换表/清零）或 `spike`（尖峰）。**不含 missing** —— 缺数由覆盖率与采集失败覆盖，重复报会把告警页刷成流水账 | major |
+| `hour_quality` | 近 24 小时出现 `reset`（换表/清零）或 `spike`（尖峰）。**不含 missing / partial** —— 缺数由覆盖率与采集失败覆盖，partial 由 `hour_deviation` 复核规则覆盖 | major |
+| `hour_deviation` | 上一生产日出现 **partial** 小时（端点/区间偏差超过 `data_quality.deviation_minutes`），在 `data_quality.review_hour` 后生成；`value` 给差值、`threshold` 给实际时段；需人工确认，**不自动恢复**（v1.7.1） | minor |
 | `coverage_low` | **上一生产日**（06:00—次日06:00）日汇总 `covered_count < expected_count`，即日合计少算了若干小时。**只判 06:30 结算后重算过的行**（`computed_at` ≥ 次日 06:25）：06:30 前的当天快照不是结论（含 06:00–06:30 重启触发的补跑）；仍挂着的历史告警所属日期也会一并复核，避免换日被误判为恢复（B-553 / v1.6.0） | minor |
 
 ⚠ **操作审计日志尚未实现**：契约原先要求「确认必须写审计日志」，而操作日志表还没建，

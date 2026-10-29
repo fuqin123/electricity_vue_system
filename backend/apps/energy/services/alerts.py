@@ -44,8 +44,10 @@ from ..models import (
     EnergyHourly,
     EnergyMeter,
     EnergyRaw,
+    EnergyReviewLog,
 )
 from . import business_day as B
+from . import data_quality as DQ
 from .coverage import first_data_map
 
 logger = logging.getLogger(__name__)
@@ -341,6 +343,69 @@ def _rule_coverage(col: _Collector, now: datetime) -> None:
 # ── 入口 ────────────────────────────────────────────────────
 
 
+def _rule_hour_deviation(col: _Collector, now: datetime) -> None:
+    """每天复核时刻后，把上一生产日的 partial 小时生成人工复核告警。
+
+    partial 是端点偏差/补采造成的「有值但时段不完美」数据，已计入汇总；
+    这里只负责**提请人工判定**，不自动剔除数据。每天只执行一次（EnergyReviewLog），
+    未执行复核时数据照常写入/展示。告警不参与自动恢复，必须由人确认。
+    """
+    category = EnergyAlarm.CAT_HOUR_DEVIATION
+    if not DQ.review_due(now) or DQ.reviewed_today(now):
+        # 没到复核时刻/今天已复核：不参与 resolve_stale，避免把待复核告警自动关掉
+        col.categories.discard(category)
+        return
+
+    target = DQ.review_target_day(now)
+    start, end = B.day_start(target), B.day_end(target)
+    qs = (
+        EnergyHourly.objects.filter(
+            B.hour_q(start, end), quality=EnergyHourly.Q_PARTIAL
+        )
+        .select_related("meter", "line", "energy_type")
+        .order_by("stat_date", "stat_hour", "meter__code")
+    )
+    abnormal = qs.count()
+    before = col.created
+    deviation = DQ.deviation_minutes()
+
+    for r in qs[:MAX_PER_RULE]:
+        if r.start_at is not None and r.end_at is not None:
+            period = f"{r.start_at:%m-%d %H:%M}—{r.end_at:%m-%d %H:%M}"
+            span_min = int((r.end_at - r.start_at).total_seconds() // 60)
+        else:
+            period = f"{r.stat_date:%m-%d} {r.stat_hour:02d}:00—{r.stat_hour + 1:02d}:00"
+            span_min = 60
+        unit = r.unit or ""
+        delta = f"{r.consumption} {unit}".strip() if r.consumption is not None else "--"
+        col.add(
+            category,
+            f"HOUR-DEVIATION:{r.meter.code}:{r.stat_date:%Y-%m-%d}:{r.stat_hour}",
+            level=EnergyAlarm.LEVEL_MINOR,
+            source=f"{r.line.line_name} · {r.meter.name}",
+            content=(
+                f"{r.meter.name} 在 {period} 的差值为 {delta}，"
+                f"端点/区间偏离超过 {deviation} 分钟；请人工判定该时段数据是否可用"
+            ),
+            value=f"差值 {delta}",
+            threshold=f"时段 {period}（{span_min}min）",
+            meter=r.meter,
+            line=r.line,
+        )
+
+    EnergyReviewLog.objects.create(
+        review_date=now.date(),
+        target_day=target,
+        abnormal_hours=abnormal,
+        alarms_created=col.created - before,
+    )
+    # 复核告警只能人工确认，不能让下一轮 resolve_stale 自动关掉
+    col.categories.discard(category)
+
+
+
+
+
 #: 类别 → 规则实现。evaluate(categories=...) 按这个表挑几条跑。
 _RULES = {
     EnergyAlarm.CAT_METER_UNCONNECTED: lambda col, now, ctx: _rule_unconnected(col, ctx["meters"], ctx["first_ok"]),
@@ -349,6 +414,7 @@ _RULES = {
     EnergyAlarm.CAT_GATEWAY_OFFLINE: lambda col, now, ctx: _rule_gateway(col),
     EnergyAlarm.CAT_COLLECT_STALE: lambda col, now, ctx: _rule_stale(col, now),
     EnergyAlarm.CAT_COVERAGE: lambda col, now, ctx: _rule_coverage(col, now),
+    EnergyAlarm.CAT_HOUR_DEVIATION: lambda col, now, ctx: _rule_hour_deviation(col, now),
 }
 
 

@@ -474,6 +474,7 @@ curl -s http://127.0.0.1/healthz
 | `frontend` | `Dockerfile` 构建（Nginx） | 托管大屏 + 后台静态产物，反代 `/api/`、`/live/` |
 | `backend` | `Dockerfile.backend` 构建（gunicorn） | Django 接口；启动时自动 migrate + seed |
 | `collector` | **与 backend 同一个镜像** | 每 5 分钟 `collect --aggregate --if-due` |
+| `review` | **与 backend 同一个镜像** | 每分钟检查 `data_quality.review_hour`，生成异常时段人工复核告警 |
 | `rollup` | **与 backend 同一个镜像** | 每天 06:30 `summarize --rollup`，结算生产日 / 月 / 年 |
 | `mysql` | `mysql:8.0` | 业务库；换现场已有库见 docker/README 第 6 节 |
 | `stream` | `alexxit/go2rtc` | 可选，`--profile stream` 才启动 |
@@ -534,7 +535,7 @@ docker compose up -d --build                           # 首次：建库 + 迁�
 
 docker compose build frontend && docker compose up -d frontend    # 只更新前端
 docker compose logs -f collector                       # 现场最该看的一路
-docker compose ps                                      # 五个容器的健康状态
+docker compose ps                                      # 六个容器的健康状态
 ```
 
 ### 4.4 离线环境交付
@@ -543,7 +544,7 @@ docker compose ps                                      # 五个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.7.0-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.7.1-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz
@@ -590,6 +591,19 @@ docker compose up -d
 
 升级后后台「能源配置管理」下出现「标准单耗配置」「能源单价」两页；系统参数页不再显示三项能源单价。
 迁移 0015 会为没有标准配置的产线补空白行（value=NULL），不会覆盖已有值。
+
+### 4.7 v1.7.1 升级（异常时段复核）
+
+```bash
+docker compose up -d
+# 迁移 0017 建 energy_review_log；0018 更新告警 category 选项
+# 新增 review 容器（每分钟检查复核时刻）；采集/结算任务不变
+```
+
+升级后到「系统管理 → 系统参数 → 数据质量」确认：
+`data_quality.review_hour`（默认 11 时）与 `data_quality.deviation_minutes`（默认 10 分钟）。
+复核时刻到达后，上一生产日的 partial 小时会生成带差值和时段的 `hour_deviation` 告警；
+未复核时数据仍正常显示，不需要重建汇总。
 
 ## 五、方案 C：一键部署脚本
 

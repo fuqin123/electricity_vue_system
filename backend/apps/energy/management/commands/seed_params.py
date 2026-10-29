@@ -44,6 +44,22 @@ DEFAULTS: list[dict] = [
         "remark": "外购蒸汽结算单价，按锅炉房结算口径回填。",
     },
     {
+        "key": "data_quality.review_hour",
+        "name": "异常数据复核时刻",
+        "value": Decimal("11"),
+        "unit": "时",
+        "group": "数据质量",
+        "remark": "每天首次到达该时刻（可含小数，11.5=11:30）后生成异常时段复核告警；未复核的数据仍正常显示。",
+    },
+    {
+        "key": "data_quality.deviation_minutes",
+        "name": "异常时段允许偏差",
+        "value": Decimal("10"),
+        "unit": "分钟",
+        "group": "数据质量",
+        "remark": "端点偏离/区间时长在该范围内视为正常；超出仍保留数值并进入 11:00 人工复核告警。",
+    },
+    {
         "key": "package.bottles_per_case",
         "name": "箱规",
         "value": Decimal("24"),

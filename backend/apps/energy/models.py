@@ -30,7 +30,8 @@
 
   1. **缺数绝不补 0。** 所有用量字段（`consumption`）与读数端点都可空：
      NULL = 没采到 / 不可信，0 = 确实没用。两者语义相反。
-  2. **只有 `quality='ok'` 才进合计。** 见 `EnergyHourly.TRUSTED`。
+  2. **`ok` 与可人工复核的 `partial` 进入合计；`missing` / `reset` / `spike` 不进。**
+     见 `EnergyHourly.TRUSTED`（严格可信）与 `SUMMABLE`（可计入合计）。
 
 ⚠ 产量侧（灌装机计数器 / 装箱机 PLC / MES 班报工）**尚未改造**，
   `production_hourly` 目前只有 `ingest_production` 写入的 null 占位，
@@ -580,8 +581,11 @@ class EnergyHourly(models.Model):
         (Q_RESET, "累计值回退"),
         (Q_SPIKE, "异常尖峰"),
     ]
-    #: 只有这些质量才允许进入日 / 月 / 年合计
+    #: 严格可信：用于需要「绝对干净」的判定（如覆盖率/质量告警的原有口径）
     TRUSTED = (Q_OK,)
+    #: 可计入合计：partial 是端点偏差/补采造成的**有值但时段不完美**的数据，
+    #: 现场要求保留并在 11:00 生成人工复核告警；missing/reset/spike 仍不进合计。
+    SUMMABLE = (Q_OK, Q_PARTIAL)
 
     meter = models.ForeignKey(
         EnergyMeter, on_delete=models.CASCADE, related_name="hourly", verbose_name="计量点"
@@ -920,6 +924,30 @@ class StandardUnitConsumption(models.Model):
         return f"{self.line.line_code} {self.bottle_capacity or '-'} {self.energy_type.type_code}={self.value}"
 
 
+class EnergyReviewLog(models.Model):
+    """异常时段人工复核的每日执行记录（幂等标记 + 审计）。
+
+    11:00（可配置）的复核任务由 collect 的告警评估顺带触发：当天第一次跑完后写一行，
+    之后每 5 分钟评估时跳过，避免同一批异常时段反复生成/累加告警。
+    未执行复核时，异常时段数据仍按正常口径参与汇总与展示。
+    """
+
+    review_date = models.DateField("复核日期", unique=True)
+    target_day = models.DateField("目标生产日")
+    reviewed_at = models.DateTimeField("执行时间", auto_now_add=True)
+    abnormal_hours = models.PositiveIntegerField("异常小时数", default=0)
+    alarms_created = models.PositiveIntegerField("生成告警数", default=0)
+
+    class Meta:
+        db_table = "energy_review_log"
+        ordering = ["-review_date"]
+        verbose_name = "异常数据复核记录"
+        verbose_name_plural = "异常数据复核记录"
+
+    def __str__(self) -> str:
+        return f"{self.review_date} → {self.target_day} {self.abnormal_hours}h"
+
+
 class EnergyAlarm(models.Model):
     """能源计量告警 —— 「数据没被正确计量」这件事的落库记录。
 
@@ -969,6 +997,7 @@ class EnergyAlarm(models.Model):
     CAT_GATEWAY_OFFLINE = "gateway_offline"
     CAT_COLLECT_STALE = "collect_stale"
     CAT_COVERAGE = "coverage_low"
+    CAT_HOUR_DEVIATION = "hour_deviation"
     CATEGORY_CHOICES = (
         (CAT_METER_UNCONNECTED, "计量点未接入"),
         (CAT_METER_FAIL, "计量点采集失败"),
@@ -976,6 +1005,7 @@ class EnergyAlarm(models.Model):
         (CAT_GATEWAY_OFFLINE, "网关离线"),
         (CAT_COLLECT_STALE, "采集停摆"),
         (CAT_COVERAGE, "周期覆盖率不足"),
+        (CAT_HOUR_DEVIATION, "异常时段待复核"),
     )
 
     code = models.CharField("告警标识", max_length=120, db_index=True, help_text="稳定标识，用于去重与自动恢复")

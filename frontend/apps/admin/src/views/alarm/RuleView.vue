@@ -43,8 +43,9 @@ const rows = ref<RuleRow[]>([
   { id: 2, code: 'R-METER-FAIL', name: '计量点采集失败', target: '计量点位', condition: '最近一轮采集失败（last_ok=false），并带出错误原因与最近成功时刻', level: '严重', levelType: 'danger', enabled: true, impl: 'alerts._rule_collect_fail' },
   { id: 3, code: 'R-GATEWAY-FAIL', name: '网关整轮采集失败', target: '网关', condition: '该网关最近一轮的点位全部失败（0/N）。注意：这与网关列表页的「在线」徽标是两件事', level: '严重', levelType: 'danger', enabled: true, impl: 'alerts._rule_gateway' },
   { id: 4, code: 'R-COLLECT-STALE', name: '采集停摆', target: '采集服务', condition: '最新成功读数超过 collect.stale_alert_hours 未更新；或尚无任何采集数据。由大屏读路径兜底触发', level: '严重', levelType: 'danger', enabled: true, impl: 'alerts._rule_stale' },
-  { id: 5, code: 'R-HOUR-QUALITY', name: '小时数据不可信', target: '计量点位', condition: '近 24 小时内存在缺数 / 累计值回退（疑似换表清零）/ 异常尖峰的小时，按点位合并为一条', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_hour_quality' },
-  { id: 6, code: 'R-COVERAGE', name: '周期覆盖率不足', target: '日汇总', condition: '昨日日汇总 covered_count < expected_count，即该日合计少算了若干小时', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_coverage' },
+  { id: 5, code: 'R-HOUR-QUALITY', name: '小时数据不可信', target: '计量点位', condition: '近 24 小时内存在累计值回退（疑似换表清零）或异常尖峰的小时，按点位合并为一条；缺数由覆盖率/复核规则覆盖', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_hour_quality' },
+  { id: 6, code: 'R-COVERAGE', name: '周期覆盖率不足', target: '日汇总', condition: '上一生产日日汇总 covered_count < expected_count，即该日合计少算了若干小时', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_coverage' },
+  { id: 11, code: 'R-HOUR-DEVIATION', name: '异常时段待复核', target: '上一生产日', condition: '端点/区间时长偏差超过「系统参数 → 数据质量 → 异常时段允许偏差」，在复核时刻生成；需人工确认，不自动恢复', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_hour_deviation' },
   // ── 以下依赖产量，产量侧接入后才启用（接口与表结构已就位）──
   { id: 7, code: 'R-UNIT-KWH-HIGH', name: '单位电耗超上限', target: '产线 / 车间', condition: `单位电耗 > ${thresholds.unitKwhHigh.toFixed(2)} kWh/千瓶`, level: '严重', levelType: 'danger', enabled: false, impl: '待产量接入' },
   { id: 8, code: 'R-OUTPUT-LOW', name: '本小时低产', target: '产线', condition: `整点预期产量 < 额定的 ${Math.round(thresholds.outputLowRate * 100)}%`, level: '警告', levelType: 'warning', enabled: false, impl: '待产量接入' },
@@ -83,7 +84,7 @@ function fetchRules(query: PageQuery): Promise<PageResult<RuleRow>> {
       show-icon
       class="mb-16"
       title="本页是只读对照，不是规则编辑器"
-      description="告警规则由后端引擎定义（backend/apps/energy/services/alerts.py），改判定逻辑需要发版；能源单价在「能源配置管理 → 能源单价」、标准单耗在「标准单耗配置」、箱规/标准变动费用在「系统管理 → 系统参数」维护，停摆阈值在 backend/config/settings.local.yaml 的 collect.stale_alert_hours。"
+      description="告警规则由后端引擎定义（backend/apps/energy/services/alerts.py），改判定逻辑需要发版；能源单价在「能源配置管理 → 能源单价」、标准单耗在「标准单耗配置」、箱规/标准变动费用在「系统管理 → 系统参数」维护，停摆阈值在 backend/config/settings.local.yaml 的 collect.stale_alert_hours；异常数据复核时刻/允许偏差在「系统管理 → 系统参数 → 数据质量」。"
     />
 
     <TablePage :columns="columns" :fetch="fetchRules" keyword-placeholder="规则编码 / 名称 / 条件" :max-height="520">

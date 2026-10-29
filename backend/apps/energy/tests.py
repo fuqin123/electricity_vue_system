@@ -30,6 +30,7 @@ from apps.energy.models import (
     EnergyMeter,
     EnergyDaily,
     EnergyRaw,
+    EnergyReviewLog,
     EnergyType,
     PeriodSummary,
     ProductionHourly,
@@ -3100,6 +3101,136 @@ class RebuildSummariesTests(TestCase):
         self.assertEqual(row.consumption, Decimal("48.000"))
         self.assertEqual(row.covered_count, 24)
         self.assertEqual(EnergyHourly.objects.count(), 24, "源小时表不能被清理")
+
+
+class DataQualityTests(TestCase):
+    """v1.7.1：可配置偏差、partial 入账、11:00 人工复核告警。"""
+
+    DAY = datetime(2026, 10, 22).date()  # 生产日 10-22 06:00 → 10-23 06:00
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.workshop = ProductionLine.objects.create(
+            line_code="WS-DQ", line_name="数据质量车间",
+            node_type=ProductionLine.NODE_WORKSHOP, line_type=ProductionLine.TYPE_WORKSHOP,
+        )
+        cls.line = ProductionLine.objects.create(
+            line_code="W905", line_name="质量线", node_type=ProductionLine.NODE_LINE,
+            parent=cls.workshop, product="冰红茶 500ml",
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-DQ", name="质量测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-DQ-01", name="质量测试表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+
+    def setUp(self):
+        # 偏差/相位断言按 60 秒采样偏移验证，避免测试环境为错峰改成 600 后干扰用例
+        original = conf.get
+        patcher = mock.patch.object(
+            conf,
+            "get",
+            side_effect=lambda key, default=None: 60
+            if key == "collect.hourly_offset_seconds"
+            else original(key, default),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _set_param(self, key, value, unit="", group="数据质量"):
+        SystemParam.objects.update_or_create(
+            key=key,
+            defaults={"name": key, "value": Decimal(str(value)), "unit": unit, "group": group},
+        )
+
+    def _partial_hour(self, hour=10, consumption="30", quality=None):
+        start = datetime.combine(self.DAY, datetime.min.time()) + timedelta(hours=hour)
+        return EnergyHourly.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            stat_date=self.DAY, stat_hour=hour, consumption=Decimal(consumption), unit="kWh",
+            quality=quality or EnergyHourly.Q_PARTIAL,
+            start_at=start + timedelta(minutes=10),
+            end_at=start + timedelta(hours=1, minutes=10),
+        )
+
+    def test_偏差内正常_偏差外partial(self):
+        self._set_param("data_quality.deviation_minutes", 10, "分钟")
+        # 端点偏 10 分钟：允许
+        self.read_ok = EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 10, 22, 9, 10), reading=Decimal("100"), ok=True,
+        )
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 10, 22, 10, 10), reading=Decimal("130"), ok=True,
+        )
+        res = compute_hour(self.meter, self.DAY, 9)
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK, "10 分钟偏差在配置范围内应视为正常")
+        # 端点偏 11 分钟（相对 9:01/10:01 采样槽）：partial
+        self._set_param("data_quality.deviation_minutes", 10, "分钟")
+        EnergyRaw.objects.filter(meter=self.meter).delete()
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 10, 22, 9, 12), reading=Decimal("100"), ok=True,
+        )
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+            collect_time=datetime(2026, 10, 22, 10, 12), reading=Decimal("130"), ok=True,
+        )
+        res = compute_hour(self.meter, self.DAY, 9)
+        self.assertEqual(res["quality"], EnergyHourly.Q_PARTIAL)
+
+    def test_partial计入日汇总但仍标partial(self):
+        for h in range(24):
+            stat_date, stat_hour = B.hour_bucket(self.DAY, h)
+            EnergyHourly.objects.create(
+                meter=self.meter, line=self.line, energy_type=self.meter.energy_type,
+                stat_date=stat_date, stat_hour=stat_hour,
+                consumption=Decimal("2"), unit="kWh", quality=EnergyHourly.Q_PARTIAL,
+                start_at=datetime.combine(stat_date, datetime.min.time()) + timedelta(hours=stat_hour, minutes=10),
+                end_at=datetime.combine(stat_date, datetime.min.time()) + timedelta(hours=stat_hour + 1, minutes=10),
+            )
+        S.summarize_days(self.DAY)
+        row = EnergyDaily.objects.get(line=self.line, energy_type=etype(), stat_date=self.DAY)
+        self.assertEqual(row.consumption, Decimal("48.000"), "partial 有值，不能丢")
+        self.assertEqual(row.covered_count, 24)
+        self.assertEqual(row.quality, PeriodSummary.Q_PARTIAL, "有偏差小时，汇总仍标 partial")
+        data = build_line(self.line, B.day_end(self.DAY) - timedelta(seconds=1), closed=True)
+        self.assertEqual(data["today"]["kwh"], 48.0)
+
+    def test_复核时刻前不生成_到点生成一次且不自动恢复(self):
+        self._set_param("data_quality.review_hour", "11", "时")
+        self._set_param("data_quality.deviation_minutes", 10, "分钟")
+        self._partial_hour()
+        before = datetime(2026, 10, 23, 10, 59)
+        alerts.evaluate(now=before, categories={EnergyAlarm.CAT_HOUR_DEVIATION})
+        self.assertFalse(EnergyReviewLog.objects.exists())
+        self.assertFalse(EnergyAlarm.objects.filter(category=EnergyAlarm.CAT_HOUR_DEVIATION).exists())
+
+        now = datetime(2026, 10, 23, 11, 0)
+        alerts.evaluate(now=now, categories={EnergyAlarm.CAT_HOUR_DEVIATION})
+        alarm = EnergyAlarm.objects.get(category=EnergyAlarm.CAT_HOUR_DEVIATION)
+        self.assertIn("30.000", alarm.value)
+        self.assertIn("10:10", alarm.threshold)
+        log = EnergyReviewLog.objects.get(review_date=now.date())
+        self.assertEqual(log.target_day, self.DAY)
+        self.assertEqual(log.abnormal_hours, 1)
+
+        alerts.evaluate(now=datetime(2026, 10, 23, 11, 5), categories={EnergyAlarm.CAT_HOUR_DEVIATION})
+        alarm.refresh_from_db()
+        self.assertEqual(alarm.status, EnergyAlarm.STATUS_ACTIVE, "复核告警不能被自动恢复")
+        self.assertEqual(alarm.repeat, 1)
+        self.assertEqual(EnergyReviewLog.objects.count(), 1)
+
+    def test_复核时间可配置(self):
+        self._set_param("data_quality.review_hour", "11.5", "时")
+        self._partial_hour()
+        alerts.evaluate(now=datetime(2026, 10, 23, 11, 15), categories={EnergyAlarm.CAT_HOUR_DEVIATION})
+        self.assertFalse(EnergyReviewLog.objects.exists())
+        alerts.evaluate(now=datetime(2026, 10, 23, 11, 30), categories={EnergyAlarm.CAT_HOUR_DEVIATION})
+        self.assertTrue(EnergyReviewLog.objects.exists())
 
 
 class ProductionIngestTests(TestCase):

@@ -53,7 +53,7 @@ x-settings-mount: &eep-settings-mount
 # 后端与采集器共用同一镜像、同一套连接参数，只差跑什么命令。
 # 不放 container_name / volumes / depends_on，避免上面那个覆盖陷阱。
 x-backend-base: &eep-backend-base
-  image: eep-backend:${EEP_VERSION:-1.7.0}
+  image: eep-backend:${EEP_VERSION:-1.7.1}
   build:
     context: ../..
     dockerfile: deploy/docker/Dockerfile.backend
@@ -71,7 +71,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: eep-frontend:${EEP_VERSION:-1.7.0}
+    image: eep-frontend:${EEP_VERSION:-1.7.1}
     container_name: eep-frontend
     restart: unless-stopped
     ports:
@@ -153,6 +153,34 @@ services:
       # (1146, "Table 'eep_energy.energy_meter' doesn't exist")。
       # backend 的 HEALTHCHECK 打 /healthz，而 entrypoint 是「先 migrate+seed
       # 再 exec gunicorn」，所以 healthy 严格等价于「表已经建好了」。
+      backend:
+        condition: service_healthy
+
+  # ── 异常时段人工复核：每分钟检查一次系统参数里的复核时刻 ─────
+  # 实际执行由 EnergyReviewLog 每天幂等；未到点/已复核时只做一次轻量查询。
+  # 不依赖采集轮次，因此系统参数里的 11:00 能在 1 分钟内生效。
+  review:
+    <<: *eep-backend-base
+    container_name: eep-review
+    environment:
+      EEP_DB_HOST: ${EEP_DB_HOST:-mysql}
+      EEP_DB_PORT: "${EEP_DB_PORT:-3306}"
+      EEP_AUTO_MIGRATE: "false"
+      EEP_AUTO_SEED: "false"
+    healthcheck:
+      disable: true
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          python manage.py review_abnormal || true
+          sleep 60
+        done
+    volumes:
+      - *eep-settings-mount
+      - eep-review-logs:/app/logs
+    depends_on:
       backend:
         condition: service_healthy
 
@@ -280,6 +308,8 @@ volumes:
   eep-backend-logs:
     driver: local
   eep-collector-logs:
+    driver: local
+  eep-review-logs:
     driver: local
   eep-rollup-logs:
     driver: local

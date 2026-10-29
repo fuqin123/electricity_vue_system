@@ -9,7 +9,8 @@
     usage(H) = end(H) − end(H−1)
     end(H)   = 「时间 ≤ H:00:00 + 1h」的最后一条有效读数（即距 15:00 最近的一次采样）
 
-端点取法（v1.2.2 起）：**距整点最近的、且在 ±20 分钟容差内的那条读数**。
+端点取法：**距整点最近的、且在可配置容差内的那条读数**；容差默认 20 分钟，
+后台「系统参数 → 数据质量 → 异常时段允许偏差」可调整端点/区间时长的判定阈值。
 容差是必须的 —— 没有它，本小时没采到样时会拿隔天的读数来相减并得到 0（见 B-503）。
 
 用「上小时末读数」当起点而不是「本小时第一条读数」，好处是：
@@ -40,12 +41,17 @@ from django.db import transaction
 from eep import conf
 
 from ..models import EnergyHourly, EnergyMeter, EnergyRaw
+from . import data_quality as DQ
 from . import slots
 
 logger = logging.getLogger(__name__)
 
-#: 端点读数距离整点超过多少分钟就算「偏离」（采集中断过）
+#: 端点读数搜索窗口的基础值；实际取 max(本值, 后台配置的异常时段偏差)
 BOUNDARY_TOLERANCE = timedelta(minutes=int(conf.get("collect.boundary_tolerance_minutes", 20)))
+
+
+def _boundary_tolerance() -> timedelta:
+    return timedelta(minutes=max(BOUNDARY_TOLERANCE.total_seconds() / 60, DQ.deviation_minutes()))
 #: 累计值回退超过该比例时，在说明里记为「疑似换表」
 RESET_RATIO = Decimal(str(conf.get("collect.filter.reset_threshold_ratio", 0.5)))
 #: 小数位（库字段是 3 位）
@@ -92,8 +98,9 @@ def boundary_reading(meter: EnergyMeter, boundary: datetime) -> EnergyRaw | None
        密采样时最近的是整点前最后一条（差几十秒）；
        整点采样时最近的是采样槽内第一条（差几分钟）。两者都在容差内。
     """
-    lo = boundary - BOUNDARY_TOLERANCE
-    hi = boundary + BOUNDARY_TOLERANCE
+    tolerance = _boundary_tolerance()
+    lo = boundary - tolerance
+    hi = boundary + tolerance
     rows = EnergyRaw.objects.filter(
         meter=meter, ok=True, reading__isnull=False, collect_time__gte=lo, collect_time__lte=hi
     ).only("id", "collect_time", "reading")
@@ -105,23 +112,6 @@ def boundary_reading(meter: EnergyMeter, boundary: datetime) -> EnergyRaw | None
         if best_gap is None or gap < best_gap:
             best, best_gap = r, gap
     return best
-
-
-#: 区间长度与 1 小时的允许偏差，超过就标 partial（读数虽有，但这一小时不干净）
-SPAN_TOLERANCE = timedelta(minutes=5)
-
-#: 端点相对**采样时刻**的允许偏差。
-#: `ok` 的含义是「这一小时的端点按期采到了」，而不只是「有个数能减出约 1 小时」。
-#:
-#: 为什么需要它（v1.2.2 补的一个口子）：
-#:   只用「最近 + ±20 分钟容差 + 区间长约 1 小时」三条，仍会放过一种情况 ——
-#:   两个端点都偏离采样时刻同样的方向、同样的幅度。
-#:   例如某天的读数落在 14:49:37 与 15:50:23，区间 60.8 分钟，看起来一切正常，
-#:   但这两个点其实各自偏了 11 分钟，这一小时的「窗口」整体平移了 10 分钟。
-#:   数值不是错的（没有重复计、也没有陈旧值），但它不该被标成「干净」。
-#:   这里按「相对采样时刻的偏差」判定，与 `collect.hourly_offset_seconds` 无关 ——
-#:   偏移改成 600 秒也不会让所有小时都变 partial。
-PHASE_TOLERANCE = timedelta(minutes=10)
 
 
 def compute_hour(meter: EnergyMeter, day: date_cls, hour: int) -> dict:
@@ -173,8 +163,9 @@ def compute_hour(meter: EnergyMeter, day: date_cls, hour: int) -> dict:
     # 区间长度必须接近 1 小时：端点各自允许 ±20 分钟偏差，
     # 两者叠加最坏可到 ±40 分钟。偏差在 5 分钟以内认为这一小时是干净的；
     # 再大说明端点被挪过位置（例如补采落在很晚的位置），标 partial 但仍然给数。
+    tolerance = timedelta(minutes=DQ.deviation_minutes())
     span = (end.collect_time - start.collect_time).total_seconds()
-    if abs(span - 3600) > SPAN_TOLERANCE.total_seconds():
+    if abs(span - 3600) > tolerance.total_seconds():
         return {
             **base,
             "usage": delta,
@@ -183,10 +174,10 @@ def compute_hour(meter: EnergyMeter, day: date_cls, hour: int) -> dict:
                     f"偏离 1 小时，差值仅供参考",
         }
 
-    # 相位判定：两个端点是否都按期采到了（见 PHASE_TOLERANCE 的说明）
+    # 相位判定：两个端点是否都落在可配置的偏差范围内
     start_lag = abs((start.collect_time - slots.slot_ready_at(hour_start)).total_seconds())
     end_lag = abs((end.collect_time - slots.slot_ready_at(end_limit)).total_seconds())
-    if max(start_lag, end_lag) > PHASE_TOLERANCE.total_seconds():
+    if max(start_lag, end_lag) > tolerance.total_seconds():
         return {
             **base,
             "usage": delta,
