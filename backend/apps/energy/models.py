@@ -535,6 +535,16 @@ class EnergyRaw(models.Model):
         EnergyType, on_delete=models.PROTECT, related_name="readings", verbose_name="能源类型"
     )
     collect_time = models.DateTimeField("采集时间", db_index=True, help_text="精确到小时，如 2026-09-24 10:00:00")
+    slot_boundary = models.DateTimeField(
+        "采样槽",
+        null=True,
+        blank=True,
+        help_text=(
+            "这条读数属于哪个整点边界的采样槽（v1.7.3 起）。"
+            "补采只补本槽缺失点位；取值时也按槽过滤，"
+            "避免上一槽的迟到读数被当成下一槽的端点"
+        ),
+    )
     reading = models.DecimalField(
         "累计读数", max_digits=18, decimal_places=4, null=True, blank=True,
         help_text="采集失败时为 NULL —— 绝不能写 0，0 会被差值当成真实读数",
@@ -555,6 +565,7 @@ class EnergyRaw(models.Model):
         indexes = [
             models.Index(fields=["line", "energy_type", "collect_time"], name="idx_raw_line_time"),
             models.Index(fields=["collect_time"], name="idx_raw_collect_time"),
+            models.Index(fields=["meter", "slot_boundary", "ok"], name="idx_raw_meter_slot"),
         ]
 
     def __str__(self) -> str:

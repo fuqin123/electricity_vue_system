@@ -53,7 +53,7 @@ x-settings-mount: &eep-settings-mount
 # 后端与采集器共用同一镜像、同一套连接参数，只差跑什么命令。
 # 不放 container_name / volumes / depends_on，避免上面那个覆盖陷阱。
 x-backend-base: &eep-backend-base
-  image: eep-backend:${EEP_VERSION:-1.7.2}
+  image: eep-backend:${EEP_VERSION:-1.7.3}
   build:
     context: ../..
     dockerfile: deploy/docker/Dockerfile.backend
@@ -71,7 +71,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: eep-frontend:${EEP_VERSION:-1.7.2}
+    image: eep-frontend:${EEP_VERSION:-1.7.3}
     container_name: eep-frontend
     restart: unless-stopped
     ports:
@@ -136,8 +136,8 @@ services:
         python manage.py collect --aggregate --if-due || true
         # 之后**每一轮都对齐到下一个 interval 刻度**（整 5 分钟）。
         # 同一份代码下：测试环境 hourly_offset_seconds=600 会在 :10 采；
-        # 生产保持原偏移、每 5 分钟一轮。失败也只在下一个刻度重试，
-        # 避免测试环境对同一批设备每分钟重试、和生产抢通讯。
+        # 生产保持原偏移、每 5 分钟一轮。失败也只在下一个刻度重试；
+        # v1.7.3 起补采只读本槽缺失点位，已成功点位不再陪跑，减少设备通讯量。
         while true; do
           now=$$(date +%s)
           next=$$(( (now / interval + 1) * interval ))

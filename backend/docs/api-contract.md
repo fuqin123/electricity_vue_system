@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.7.2 ｜ 最后更新：2026-11-02
+> 版本：v1.7.3 ｜ 最后更新：2026-11-02
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -368,6 +368,11 @@
 无匹配行时 `hourUsage = null`，`hourStatus` 区分 `pending`（最新读数尚未结算）与
 `not_boundary`（不在整点 ±20 分钟窗口）；匹配到质量异常时照给 `hourQuality`，
 `consumption = null` 的行显示 `--`，任何情况都不补 0。
+
+> v1.7.3 说明：`energy_raw` 新增内部字段 `slot_boundary`（读数所属采样槽），
+> 用于「只补缺失点位」和按槽取端点。本接口的响应结构不变；`hourUsage` 的归属
+> 仍由 `EnergyHourly.end_at` 决定。若现场需要按槽排查，直接在库里看
+> `energy_raw.slot_boundary` 即可（旧数据为 NULL）。
 
 ---
 

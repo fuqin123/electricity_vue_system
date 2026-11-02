@@ -544,7 +544,7 @@ docker compose ps                                      # 六个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.7.2-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.7.3-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz
@@ -616,6 +616,24 @@ docker compose up -d
 本版修复采集器在 `prepare()` 失败/异常路径未关闭 TCP client 的问题；
 升级后可用 `ss -tnp | grep <网关IP>` 观察失败轮次后连接数是否回落。
 若水表仍长时间无响应，请按 `docs/05` §6.2.1 检查串口服务器/设备侧与是否有第二个采集环境。
+
+### 4.9 v1.7.3 升级（采样槽与按点位补采）
+
+```bash
+docker compose build backend frontend
+docker compose up -d
+# 迁移 0019 只给 energy_raw 加 slot_boundary 列与 (meter,slot_boundary,ok) 索引
+# 不回填历史行；历史小时/日报不需要重建
+```
+
+本版修复「一块水表失败导致整网关成功点位每 5 分钟被重读」和「相邻采样槽串读」：
+
+- 升级后第一轮会把当前槽所有点位读一次（旧数据没有槽标记），之后只补缺失点位；
+- 生产偏移 60 秒时，1:00 槽可补到 2:00，2:05 才开始 2:00 槽；
+  测试偏移 600 秒时对应 1:10—2:05，2:10 切下一槽；
+- 验证方法：让一块表保持失败，观察 collector 日志出现「补采缺失点位 1/N」，
+  而其他表在同一小时的 `energy_raw` 行数不再增加；
+- 若升级后仍每 5 分钟整轮重读，先确认镜像 tag/迁移 0019 是否真的生效。
 
 ## 五、方案 C：一键部署脚本
 

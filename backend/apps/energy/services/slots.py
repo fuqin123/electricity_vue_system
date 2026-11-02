@@ -26,6 +26,18 @@
 于是每个小时都被系统性地少算或多数一点点 —— 单看一小时看不出来，
 但月累计、年累计会稳定偏掉。
 
+## 补采窗口（v1.7.3 起）
+
+设当前整点为 B、偏移 O 秒：
+
+    · B 槽的采样从 `B + O` 开始，到 **下一槽的采样时刻 `B + 1h + O` 结束**；
+    · 在这段窗口内，`due_slot()` 始终返回 B，即使已经跨过整点（如 2:00—2:05）；
+    · 到 `B + 1h + O` 才切换到下一槽，避免「整点前最后 5 分钟无处可补」。
+
+这样现场看到的节奏是：1:05 采 1:00 槽，失败则 1:10、1:15… 一直补到 2:00；
+2:05 才开始采 2:00 槽（测试环境偏移 600 秒时整体顺延到 1:10—2:05 / 2:10）。
+**补采只针对本槽缺失的计量点**，已成功的点位不会因为别的表失败被反复重读。
+
 ## hourly 节奏的代价（必须让现场知道）
 
 1. **一次采样失败会连带毁掉两个小时的值**（前一个小时的 end 与后一个小时的 start 是同一条读数）；
@@ -71,17 +83,38 @@ def slot_ready_at(boundary: datetime) -> datetime:
     return boundary + timedelta(seconds=hourly_offset_seconds())
 
 
-def due_slot(now: datetime | None = None) -> datetime | None:
-    """当前应当采样的「边界整点」；None 表示本小时的采样窗口还没到。
+def slot_deadline(boundary: datetime) -> datetime:
+    """某个采样槽的补采截止时刻 = **下一槽的采样时刻**。
 
-    hourly 节奏下：整点后过了 offset 秒就返回该整点，否则返回 None。
-    minute 节奏下：永远返回本小时整点（表示「随时可以采」）。
+    v1.7.3 之前，槽在整点（B+1h）就结束，导致最后 5 分钟无法补采、
+    下一槽又要等偏移时间才开始。现在槽一直开放到 `B + 1h + offset`，
+    与「下一槽从几点开始」严格对齐，不会出现空档。
+    """
+    return slot_ready_at(boundary + timedelta(hours=1))
+
+
+def due_slot(now: datetime | None = None) -> datetime | None:
+    """当前应当采样的「边界整点」；None 表示还没有任何可采样的槽。
+
+    hourly 节奏下：
+      · `B + offset` 之后返回 B；
+      · 还没到 B + offset 时，**上一槽 B − 1h 仍然开放**（到 B + offset 截止），
+        所以整点后的前 offset 秒返回的是上一槽，而不是「什么都不采」。
+
+    这样计划任务每 5 分钟跑一次时，1:05 采 1:00 槽，失败可以一直补到 2:00；
+    2:05 才切到 2:00 槽。只有 offset 大于 1 小时这种不合理配置才会返回 None。
     """
     now = now or datetime.now()
     b = hour_start(now)
     if cadence() == CADENCE_MINUTE:
         return b
-    return b if now >= slot_ready_at(b) else None
+    if now >= slot_ready_at(b):
+        return b
+
+    prev = b - timedelta(hours=1)
+    if now >= slot_ready_at(prev) and now < slot_deadline(prev):
+        return prev
+    return None
 
 
 def next_run_at(now: datetime | None = None) -> datetime:
@@ -97,15 +130,14 @@ def next_run_at(now: datetime | None = None) -> datetime:
     return slot_ready_at(b + timedelta(hours=1))
 
 
-def slot_window(boundary: datetime, grace_seconds: int = 300) -> tuple[datetime, datetime]:
-    """某个边界采样时刻的容忍窗口 —— 用来判断「这个小时是不是已经采过了」。
+def nearest_slot(moment: datetime) -> datetime:
+    """离指定时刻最近的整点边界（手工采集 / 非常驻调用使用）。
 
-    窗口卡在 [offset + 1s, offset + grace]：
-      · 下界用 +1 秒，避开「上一次采样的读数恰好落在 offset 内」的边界歧义；
-      · 上界给 5 分钟，容忍调度延迟（cron 每 5 分钟跑一次的场景）。
+    `--if-due` 必须用 `due_slot()`（它知道补采窗口）；只有「现在就要读一轮、
+    不属于任何补采」的场景才用本函数，避免把手工读数归到上一槽。
     """
-    start = slot_ready_at(boundary) + timedelta(seconds=1)
-    return start, start + timedelta(seconds=max(0, grace_seconds))
+    b = hour_start(moment)
+    return b if (moment - b) <= (b + timedelta(hours=1) - moment) else b + timedelta(hours=1)
 
 
 def describe() -> str:

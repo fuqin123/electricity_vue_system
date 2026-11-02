@@ -6,12 +6,19 @@
 
 对某小时 H（如 14:00—15:00）：
 
-    usage(H) = end(H) − end(H−1)
-    end(H)   = 「时间 ≤ H:00:00 + 1h」的最后一条有效读数（即距 15:00 最近的一次采样）
+    usage(H) = read(15:00) − read(14:00)
+    read(B)  = `slot_boundary = B` 的采样槽里、离预定采样时刻最近的一条有效读数
 
-端点取法：**距整点最近的、且在可配置容差内的那条读数**；容差默认 20 分钟，
-后台「系统参数 → 数据质量 → 异常时段允许偏差」可调整端点/区间时长的判定阈值。
-容差是必须的 —— 没有它，本小时没采到样时会拿隔天的读数来相减并得到 0（见 B-503）。
+端点取法（v1.7.3 起）：**优先按 `EnergyRaw.slot_boundary` 精确认领**，同一槽内取
+离预定采样时刻最近的一条；没有槽标记的旧数据才退回「距整点最近且在容差内」。
+容差默认 20 分钟，后台「系统参数 → 数据质量 → 异常时段允许偏差」可调整端点/区间
+时长的判定阈值。容差是必须的 —— 没有它，本小时没采到样时会拿隔天的读数来相减
+并得到 0（见 B-503）。
+
+⚠ 不能只按「距整点最近」取端点：现场每 5 分钟补采失败点位时，上一槽的最后一条
+  补采（如 14:55）与本槽第一条（15:05）到 15:00 的距离几乎相等，谁胜出取决于
+  秒级抖动。串槽后 14 点会被算成 55 分钟、15 点被算成 65 分钟。按槽归属后，
+  14:55 属于 14:00 槽，绝不会污染 15:00 的端点。
 
 用「上小时末读数」当起点而不是「本小时第一条读数」，好处是：
   · 相邻两小时首尾相接，不会漏计也不会重复计；
@@ -64,45 +71,46 @@ def hour_window(day: date_cls, hour: int) -> tuple[datetime, datetime]:
     return start, start + timedelta(hours=1)
 
 
-def _last_reading_before(meter: EnergyMeter, upper: datetime) -> EnergyRaw | None:
-    """取「采样时间 ≤ upper」的最后一条有效读数（仅作兜底参考，差值计算不用它）。"""
-    return (
-        EnergyRaw.objects.filter(meter=meter, ok=True, reading__isnull=False, collect_time__lte=upper)
-        .order_by("-at")
-        .first()
-    )
-
-
 def boundary_reading(meter: EnergyMeter, boundary: datetime) -> EnergyRaw | None:
-    """取「整点 boundary」的读数 = **距该整点最近的一条有效读数**（容差 ±20 分钟）。
+    """取「整点 boundary」的读数。
 
-    三条规则各自换来的东西（都是踩过坑才定下来的，别改）：
+    优先查 `slot_boundary == boundary` 的读数，并在槽内取**离预定采样时刻最近**
+    的一条。槽归属由采集时写入，能区分「上一槽的迟到补采」与「本槽的第一条采样」——
+    两者到整点的距离可能只差几秒，只按时间就近必然偶尔串槽（B-555）。
 
-    ① **用「最近」而不是「该整点之前的最后一条」。**
-       同一个采样槽可能因为失败重试出现多条读数（`collect --if-due` 就是
-       每 5 分钟重试直到本小时采完）。取最近的一条时，槽内第一条永远胜出；
-       若取「之后最后一条」，一次 10:30 的补采会把 09:01→10:30 这 89 分钟
-       当成「09 点这一小时」：09 点多算、10 点少算，两条区间又都会因为
-       偏离 1 小时被判 partial 而不计入合计 —— 现场只看到「这几小时没数据」。
+    没有槽标记的是 v1.7.3 之前的旧数据，按老规则回退：
+    **距整点最近、且落在 ±容差内的那条读数**。三条老规则仍然有效：
 
-    ② **必须有容差下限（这是 v1.2.2 修掉的最严重的一个问题）。**
-       老实现只写了 `at <= boundary` 这一个上界，于是当本小时**根本没采到样**时，
-       它会一路往前找到几小时前、甚至隔天的读数来相减。
-       两条陈旧读数相减通常正好得 0，而且不触发任何异常分支、只被标成 partial ——
-       界面上一看就是「这一小时一点电都没用」。
-       数字量级正常、没有报错、没有告警，这是最难发现也最危险的一类错。
-       现在超出容差直接判**缺数（usage=None）**，界面显示 `--`：
-       宁可让人看见「这里没数」，也不要给一个来源不明的数。
+    ① **用「最近」而不是「该整点之前的最后一条」**：槽内补采不会把区间拉长；
+    ② **必须有容差下限**：本小时没采到样时，绝不能拿几小时前甚至隔天的读数
+       相减（两条陈旧读数常常正好得 0，界面显示「这一小时一点电都没用」）；
+    ③ 容差同时覆盖密采样（整点前几十秒）与整点采样（槽内几分钟）两种节奏。
 
-    ③ 容差同时覆盖两种采样节奏：
-       密采样时最近的是整点前最后一条（差几十秒）；
-       整点采样时最近的是采样槽内第一条（差几分钟）。两者都在容差内。
+    新槽数据不再套用容差上下限：一条读数属于哪个槽由采集时决定，即使迟到
+    也仍然属于该槽；它离预定时刻多远，会由 `compute_hour` 判成 partial 并进入
+    人工复核，而不是被静默丢弃。
     """
+    slot_rows = list(
+        EnergyRaw.objects.filter(
+            meter=meter, ok=True, reading__isnull=False, slot_boundary=boundary
+        )
+        .order_by("collect_time")
+        .only("id", "collect_time", "reading")
+    )
+    if slot_rows:
+        target = slots.slot_ready_at(boundary)
+        return min(slot_rows, key=lambda r: abs((r.collect_time - target).total_seconds()))
+
     tolerance = _boundary_tolerance()
     lo = boundary - tolerance
     hi = boundary + tolerance
     rows = EnergyRaw.objects.filter(
-        meter=meter, ok=True, reading__isnull=False, collect_time__gte=lo, collect_time__lte=hi
+        meter=meter,
+        ok=True,
+        reading__isnull=False,
+        slot_boundary__isnull=True,
+        collect_time__gte=lo,
+        collect_time__lte=hi,
     ).only("id", "collect_time", "reading")
 
     best: EnergyRaw | None = None

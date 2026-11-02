@@ -387,13 +387,41 @@ class SlotTests(TestCase):
         b = datetime(2026, 9, 22, 15, 0, 0)
         self.assertEqual(slots.slot_ready_at(b), b + timedelta(seconds=slots.hourly_offset_seconds()))
 
-    def test_due_slot_在采样窗口前为None(self):
+    def test_整点偏移内补上一槽_偏移后才切本槽(self):
         from apps.energy.services import slots
 
-        # 偏移 60 秒：15:00:30 还没到采样时刻
-        self.assertIsNone(slots.due_slot(datetime(2026, 9, 22, 15, 0, 30)))
-        # 15:01:30 已到 → 本小时（15 点）该采了
-        self.assertEqual(slots.due_slot(datetime(2026, 9, 22, 15, 1, 30)), datetime(2026, 9, 22, 15, 0, 0))
+        # 偏移 60 秒：15:00:30 还没到 15 点槽的采样时刻，但 14 点槽仍可补采
+        self.assertEqual(
+            slots.due_slot(datetime(2026, 9, 22, 15, 0, 30)), datetime(2026, 9, 22, 14, 0, 0)
+        )
+        # 15:01:00 起才切到 15 点槽
+        self.assertEqual(
+            slots.due_slot(datetime(2026, 9, 22, 15, 1, 0)), datetime(2026, 9, 22, 15, 0, 0)
+        )
+
+    def test_补采窗口到下一槽采样时刻为止(self):
+        from apps.energy.services import slots
+
+        # 15 点槽一直开放到 16:01（下一槽采样时刻），16:00:30 仍补 15 点
+        self.assertEqual(
+            slots.due_slot(datetime(2026, 9, 22, 16, 0, 30)), datetime(2026, 9, 22, 15, 0, 0)
+        )
+        self.assertEqual(
+            slots.slot_deadline(datetime(2026, 9, 22, 15, 0, 0)), datetime(2026, 9, 22, 16, 1, 0)
+        )
+        self.assertEqual(
+            slots.due_slot(datetime(2026, 9, 22, 16, 1, 0)), datetime(2026, 9, 22, 16, 0, 0)
+        )
+
+    def test_手工采集归属到最近的整点(self):
+        from apps.energy.services import slots
+
+        self.assertEqual(
+            slots.nearest_slot(datetime(2026, 9, 22, 15, 29, 0)), datetime(2026, 9, 22, 15, 0, 0)
+        )
+        self.assertEqual(
+            slots.nearest_slot(datetime(2026, 9, 22, 15, 31, 0)), datetime(2026, 9, 22, 16, 0, 0)
+        )
 
     def test_下一次运行时刻(self):
         from apps.energy.services import slots
@@ -403,12 +431,26 @@ class SlotTests(TestCase):
 
 
 class IfDueGuardTests(TestCase):
-    """`collect --if-due` 的幂等守卫 —— 决定「这一轮到底采不采」。
+    """`collect --if-due` 的幂等守卫 —— 决定「这一轮到底采哪些点位」。
 
     现场最常见的两个疑问，都在这里锁死：
       · 10 点采到了，10:05 / 10:10 … 还会再采吗？ → 不会，直到 11 点。
-      · 11:01 有一路失败，11:06 会再试吗？        → 会，一直试到本小时采全。
+      · 11:01 有一路失败，11:06 会再试吗？        → 会，但**只重试失败的那一路**，
+        已经成功的点位不会被反复读取（v1.7.3）。
     """
+
+    def setUp(self):
+        # 补采窗口边界按 offset=60 验证；测试环境配置可能是错峰的 600，不能依赖外部文件。
+        original = conf.get
+        patcher = mock.patch.object(
+            conf,
+            "get",
+            side_effect=lambda key, default=None: 60
+            if key == "collect.hourly_offset_seconds"
+            else original(key, default),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @classmethod
     def setUpTestData(cls):
@@ -435,25 +477,33 @@ class IfDueGuardTests(TestCase):
             frozen.now.return_value = moment
             return collect.Command()._is_due(None)
 
-    def _read(self, meter: EnergyMeter, at: datetime, ok: bool = True) -> EnergyRaw:
+    def _read(
+        self, meter: EnergyMeter, at: datetime, ok: bool = True, slot: datetime | None = None
+    ) -> EnergyRaw:
         return EnergyRaw.objects.create(
             meter=meter,
             line=meter.line,
             energy_type=meter.energy_type,
             collect_time=at,
+            slot_boundary=slot or slots.hour_start(at),
             reading=Decimal("100"),
             ok=ok,
             raw="test",
         )
 
-    def test_采样窗口未到时不采(self):
-        """整点后还没到 hourly_offset_seconds —— 这一步就是 offset 配置真正生效的地方。
+    def test_整点偏移内只补上一槽不提前采本槽(self):
+        """11:00:59 仍属于 10 点槽（补采窗口到 11:01）；11:01 才切到 11 点槽。
 
-        没有它，计划任务若在 11:00:00 整触发，就会绕过刻意留出的避让窗口，
-        在整点瞬间读表（表内累计可能还没刷新完）。
+        这一步就是 offset 配置真正生效的地方：计划任务若在 11:00:00 整触发，
+        补的是 10 点槽，不会绕过避让窗口在整点瞬间读 11 点的表。
         """
         b = datetime(2026, 9, 23, 11, 0, 0)
-        self.assertFalse(self._due(slots.slot_ready_at(b) - timedelta(seconds=1)))
+        prev = b - timedelta(hours=1)
+        for meter in self.meters:
+            self._read(meter, slots.slot_ready_at(prev), slot=prev)
+
+        self.assertFalse(self._due(datetime(2026, 9, 23, 11, 0, 59)))
+        self.assertTrue(self._due(datetime(2026, 9, 23, 11, 1, 0)))
 
     def test_本小时采全后跳过(self):
         """10 点那一轮采全了 → 之后每 5 分钟都跳过，直到 11 点。"""
@@ -476,11 +526,274 @@ class IfDueGuardTests(TestCase):
         self.assertTrue(self._due(slots.slot_ready_at(b) + timedelta(minutes=5)))
 
     def test_上一小时的读数顶不了本小时(self):
-        """11 点该采时，10:59 的读数不算数（守卫只看本小时整点之后的读数）。"""
+        """11 点该采时，10:59 的读数不算数（守卫只看当前采样槽）。"""
         b = datetime(2026, 9, 23, 11, 0, 0)
         for meter in self.meters:
             self._read(meter, b - timedelta(minutes=1))
         self.assertTrue(self._due(slots.slot_ready_at(b) + timedelta(minutes=4)))
+
+    def test_只补缺失点位(self):
+        """★ v1.7.3：一个点位失败，不能把同网关已成功的点位再读一遍。"""
+        from apps.energy.services.collect import missing_meters
+
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        self._read(self.meters[0], slots.slot_ready_at(b), slot=b)
+        missing = missing_meters(b)
+        self.assertEqual([m.id for m in missing], [self.meters[1].id])
+
+    def test_补采窗口跨整点延续到下一槽采样前(self):
+        """11:00:30 仍补 10 点槽；11:01 切到 11 点槽 —— 不是「整点一到就丢弃上一槽」。"""
+        from apps.energy.services.collect import missing_meters
+
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        prev = b - timedelta(hours=1)
+        self._read(self.meters[0], slots.slot_ready_at(prev), slot=prev)
+
+        self.assertTrue(self._due(datetime(2026, 9, 23, 11, 0, 30)))
+        self.assertEqual([m.id for m in missing_meters(b)], [self.meters[0].id, self.meters[1].id])
+        self.assertEqual(
+            [m.id for m in missing_meters(prev)], [self.meters[1].id]
+        )
+
+    def test_升级前的读数按旧窗口视为已完成(self):
+        """没有 slot_boundary 的旧行不能因为升级被整轮重采一次。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        for meter in self.meters:
+            EnergyRaw.objects.create(
+                meter=meter,
+                line=meter.line,
+                energy_type=meter.energy_type,
+                collect_time=slots.slot_ready_at(b),
+                reading=Decimal("100"),
+                ok=True,
+                raw="legacy",
+            )
+        self.assertFalse(self._due(slots.slot_ready_at(b) + timedelta(minutes=4)))
+
+    def test_禁用网关的点位不参与守卫(self):
+        """停用网关下的点位永远不会被采集，不能让它把守卫卡成每 5 分钟都该采。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        for meter in self.meters:
+            self._read(meter, slots.slot_ready_at(b), slot=b)
+        off_gw = EnergyGateway.objects.create(
+            code="GW-OFF",
+            name="停用网关",
+            kind=EnergyGateway.KIND_MODBUS,
+            host="127.0.0.1",
+            port=9,
+            enabled=False,
+        )
+        EnergyMeter.objects.create(
+            code="E-OFF-01",
+            name="停用网关表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=self.line,
+            gateway=off_gw,
+            unit="kWh",
+        )
+        self.assertFalse(self._due(slots.slot_ready_at(b) + timedelta(minutes=4)))
+
+    def test_命令只把缺失点位传给采集服务(self):
+        """锁住命令层接线：--if-due 必须把 missing 的 id 列表和槽传给 collect_round。"""
+        b = datetime(2026, 9, 23, 11, 0, 0)
+        self._read(self.meters[0], slots.slot_ready_at(b), slot=b)
+        summary = {
+            "gateways": [],
+            "total": 1,
+            "ok": 1,
+            "fail": 0,
+            "readings": 1,
+            "dry_run": False,
+            "slot": f"{b:%Y-%m-%d %H:%M}",
+        }
+        with (
+            mock.patch("apps.energy.management.commands.collect.datetime") as frozen,
+            mock.patch.object(collect, "collect_round", return_value=summary) as round_mock,
+            mock.patch.object(collect, "aggregate_recent", return_value=0),
+            mock.patch.object(collect.S, "refresh_just_closed_day"),
+            mock.patch.object(
+                collect.alerts, "evaluate", return_value={"created": 0, "resolved": 0, "active": 0}
+            ),
+        ):
+            frozen.now.return_value = b + timedelta(minutes=5)
+            collect.Command().handle(
+                gateway=None,
+                dry_run=False,
+                aggregate=False,
+                json=True,
+                summarize=False,
+                if_due=True,
+            )
+
+        kwargs = round_mock.call_args.kwargs
+        self.assertEqual(kwargs["meter_ids"], [self.meters[1].id])
+        self.assertEqual(kwargs["slot"], b)
+
+
+class SlotAttributionTests(TestCase):
+    """v1.7.3：端点按采样槽归属，不再只按「距整点最近」抢读数（B-555）。"""
+
+    def setUp(self):
+        original = conf.get
+        patcher = mock.patch.object(
+            conf,
+            "get",
+            side_effect=lambda key, default=None: 60
+            if key == "collect.hourly_offset_seconds"
+            else original(key, default),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A3", line_name="三线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-SLOT", name="槽测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=3
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="E-SLOT-01",
+            name="槽测试表",
+            energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE,
+            line=cls.line,
+            gateway=cls.gw,
+            unit="kWh",
+        )
+
+    def read(self, at: datetime, value: str, slot: datetime | None) -> EnergyRaw:
+        return EnergyRaw.objects.create(
+            meter=self.meter,
+            line=self.line,
+            energy_type=self.meter.energy_type,
+            collect_time=at,
+            slot_boundary=slot,
+            reading=Decimal(value),
+            ok=True,
+            raw="test",
+        )
+
+    def test_上一槽补采不会串到下一槽(self):
+        """★ 14:55:01 的 14 点槽补采离 15:00 更近，但 15 点端点必须取 15:00 槽的 15:05。"""
+        self.read(datetime(2026, 9, 22, 14, 5, 0), "100", datetime(2026, 9, 22, 14, 0))
+        self.read(datetime(2026, 9, 22, 14, 55, 1), "120", datetime(2026, 9, 22, 14, 0))
+        self.read(datetime(2026, 9, 22, 15, 5, 0), "130", datetime(2026, 9, 22, 15, 0))
+
+        res = compute_hour(self.meter, DAY, 14)
+        self.assertEqual(res["usage"], Decimal("30.000"))
+        self.assertEqual(res["start_at"], datetime(2026, 9, 22, 14, 5, 0))
+        self.assertEqual(res["end_at"], datetime(2026, 9, 22, 15, 5, 0))
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK)
+
+    def test_晚到的成功读数计入本槽并判partial(self):
+        """11:20 才补到的成功读数仍是本槽数据，不能因为超出端点容差就判 missing。"""
+        self.read(datetime(2026, 9, 22, 14, 5, 0), "100", datetime(2026, 9, 22, 14, 0))
+        self.read(datetime(2026, 9, 22, 15, 20, 0), "130", datetime(2026, 9, 22, 15, 0))
+
+        res = compute_hour(self.meter, DAY, 14)
+        self.assertEqual(res["usage"], Decimal("30.000"))
+        self.assertEqual(res["quality"], EnergyHourly.Q_PARTIAL)
+        self.assertIn("区间长度", res["note"])
+
+    def test_旧数据没有槽标记仍按时间回退(self):
+        """v1.7.3 之前的原始读数没有 slot_boundary，历史重算必须保持原口径。"""
+        self.read(datetime(2026, 9, 22, 14, 5, 0), "100", None)
+        self.read(datetime(2026, 9, 22, 15, 5, 0), "130", None)
+
+        res = compute_hour(self.meter, DAY, 14)
+        self.assertEqual(res["usage"], Decimal("30.000"))
+        self.assertEqual(res["quality"], EnergyHourly.Q_OK)
+
+
+class CollectRoundFilterTests(TestCase):
+    """v1.7.3：collect_round 只读缺失点位，并按采样槽写原始读数与日志。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.line = ProductionLine.objects.create(line_code="A4", line_name="四线")
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-RETRY", name="补采测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=4
+        )
+        cls.m0 = EnergyMeter.objects.create(
+            code="E-RETRY-01", name="补采表 1", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+        cls.m1 = EnergyMeter.objects.create(
+            code="E-RETRY-02", name="补采表 2", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw, unit="kWh",
+        )
+
+    class _FakeCollector:
+        def __init__(self, results):
+            self.results = results
+            self.codes: list[str] = []
+
+        def read_all(self, meters):
+            self.codes = [m.code for m in meters]
+            return {m.code: self.results[m.code] for m in meters}
+
+    def _factory(self, results, captured):
+        def factory(gateway, **kwargs):  # noqa: ANN001, ARG001
+            fake = self._FakeCollector(results)
+            captured.append(fake)
+            return fake
+
+        return factory
+
+    def _seed_slot_success(self, at: datetime, slot: datetime) -> None:
+        EnergyRaw.objects.create(
+            meter=self.m0,
+            line=self.line,
+            energy_type=self.m0.energy_type,
+            collect_time=at,
+            slot_boundary=slot,
+            reading=Decimal("100"),
+            ok=True,
+            raw="test",
+        )
+
+    def test_只读缺失点位且日志按整网关统计(self):
+        from apps.energy.services.collect import collect_round
+
+        b = datetime(2026, 9, 22, 15, 0)
+        self._seed_slot_success(datetime(2026, 9, 22, 15, 5), b)
+        results = {self.m1.code: CollectResult(ok=True, value=Decimal("200"))}
+        captured: list[CollectRoundFilterTests._FakeCollector] = []
+        with mock.patch(
+            "apps.energy.services.collect.build_collector",
+            side_effect=self._factory(results, captured),
+        ):
+            summary = collect_round(meter_ids=[self.m1.id], slot=b)
+
+        self.assertEqual(captured[0].codes, [self.m1.code])
+        self.assertEqual(summary["total"], 1)
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(
+            EnergyRaw.objects.filter(meter=self.m1, slot_boundary=b).get().reading,
+            Decimal("200"),
+        )
+        log = EnergyCollectLog.objects.get(gateway=self.gw)
+        self.assertEqual((log.total, log.ok_count, log.fail_count), (2, 2, 0))
+        self.assertIn("补采缺失点位 1/2", log.message)
+
+    def test_补采失败不会把整网关判成全失败(self):
+        from apps.energy.services.collect import collect_round
+
+        b = datetime(2026, 9, 22, 15, 0)
+        self._seed_slot_success(datetime(2026, 9, 22, 15, 5), b)
+        results = {self.m1.code: CollectResult(ok=False, error="No response")}
+        captured: list[CollectRoundFilterTests._FakeCollector] = []
+        with mock.patch(
+            "apps.energy.services.collect.build_collector",
+            side_effect=self._factory(results, captured),
+        ):
+            summary = collect_round(meter_ids=[self.m1.id], slot=b)
+
+        self.assertEqual(summary["fail"], 1)
+        log = EnergyCollectLog.objects.get(gateway=self.gw)
+        self.assertEqual((log.total, log.ok_count, log.fail_count), (2, 1, 1))
+        self.assertGreater(log.ok_count, 0, "同网关其他点位已成功，不能构成整网关全失败证据")
 
 
 class LineStatusTests(TestCase):

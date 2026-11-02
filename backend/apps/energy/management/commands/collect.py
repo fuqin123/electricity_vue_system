@@ -10,9 +10,10 @@
 
 ★ 现场推荐用法（hourly 节奏）：计划任务每 5 分钟跑一次
       python manage.py collect --aggregate --if-due
-  `--if-due` 会先检查本小时的采样是否已经完成：
-  已完成就直接退出，所以「每 5 分钟跑一次」等价于「每小时采一次」，
-  而万一某次因为机器重启 / 网络抖动没跑成，下一个 5 分钟会自动补上 ——
+  `--if-due` 先确定当前采样槽（如 1:00 槽，补采窗口到 2:00），再找出本槽
+  **还没有成功读数**的计量点，只对这些点位补采。已成功的点位不会因为
+  同网关的某块表失败而被反复重读（v1.7.3）。
+  某一轮因为机器重启 / 网络抖动没跑成，下一个 5 分钟会自动补上 ——
   比「每小时准点跑一次、错过就丢一小时」可靠得多。
 
 ⚠ 周期汇总**不在本命令的默认路径里**（v1.4.2 起）：日 / 月 / 年汇总改成每天结算一次
@@ -36,8 +37,7 @@ from django.core.management.base import BaseCommand
 
 from apps.energy.services.aggregate import aggregate_recent
 from apps.energy.services import alerts
-from apps.energy.services.collect import collect_round
-from apps.energy.models import EnergyMeter, PeriodSummary, EnergyRaw
+from apps.energy.services.collect import collect_round, missing_meters
 from apps.energy.services import slots
 from apps.energy.services import summary as S
 
@@ -63,14 +63,38 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if options["if_due"] and not options["dry_run"] and not self._is_due(options.get("gateway")):
-            self.stdout.write(
-                f"本小时的采样已完成，跳过（节奏：{slots.describe()}）。"
-                "需要强制重采请去掉 --if-due。"
-            )
-            return
+        now = datetime.now()
+        meter_ids = None
 
-        summary = collect_round(gateway_codes=options.get("gateway"), dry_run=options["dry_run"])
+        if options["if_due"] and not options["dry_run"]:
+            slot = slots.due_slot(now)
+            if slot is None:
+                self.stdout.write(f"当前没有可补采的采样槽，跳过（节奏：{slots.describe()}）。")
+                return
+
+            missing = missing_meters(slot, options.get("gateway"))
+            if not missing:
+                self.stdout.write(
+                    f"{slot:%Y-%m-%d %H:%M} 这一槽已采全，跳过（节奏：{slots.describe()}）。"
+                    "需要强制重采请去掉 --if-due。"
+                )
+                return
+
+            meter_ids = [m.id for m in missing]
+            self.stdout.write(
+                f"补采 {slot:%Y-%m-%d %H:%M} 槽缺失的 {len(missing)} 个点位"
+                f"（其余点位本槽已成功，不再重读）。"
+            )
+        else:
+            # 手工采集不属于补采，归到离当前时刻最近的整点，避免落到上一槽。
+            slot = slots.nearest_slot(now)
+
+        summary = collect_round(
+            gateway_codes=options.get("gateway"),
+            meter_ids=meter_ids,
+            slot=slot,
+            dry_run=options["dry_run"],
+        )
 
         if options["json"]:
             self.stdout.write(json.dumps(summary, ensure_ascii=False))
@@ -117,35 +141,18 @@ class Command(BaseCommand):
     # ── 幂等守卫 ──────────────────────────────────────────
 
     def _is_due(self, gateway_codes) -> bool:
-        """本小时的采样是否还没完成（两个条件都要满足才认为「该采」）。
+        """当前采样槽是否还有缺失点位（有才需要跑一轮）。
 
-        **条件一：本小时的采样时刻已经到了。**
-        由 `slots.due_slot()` 判定，即「整点 + `collect.hourly_offset_seconds`」。
-        这一步不能省 —— 现场把计划任务起在整点触发时（如每 5 分钟一次的
-        10:55 / 11:00 / 11:05），没有它就会在 **11:00:00 整**立刻开采，
-        把刻意留出的避让窗口（避开整点瞬间的采集竞争与表内累计刷新）绕过去，
-        配置里写的 `hourly_offset_seconds` 也就成了摆设。
-
-        **条件二：每一个启用中的计量点在本小时都已经有一条有效读数。**
-        用「全部」而不是「任意」，正是**重试机制本身**：某点位这一轮失败时，
-        下一个 5 分钟会自动把整轮重跑一遍，直到全部拿到读数为止。
-        采集中途被打断（只采到一部分）同理 —— 也会重跑。
-        多出来的读数无害：`boundary_reading` 取的是「距整点最近的一条」，槽内第一条永远胜出。
-
-        ⚠ 重试的有效窗口只到本小时结束：过了整点，本小时的采样槽就过去了，
-        之后再补采到的读数离整点太远，会被判成 partial / 缺数（见 aggregate.py 的容差）。
+        ① **槽由 `slots.due_slot()` 决定**：整点 + `hourly_offset_seconds` 后
+           开始采样；还没到偏移时，上一槽仍然开放（补采窗口到下一槽采样时刻）。
+           所以计划任务在 11:00:00 触发时补的是 10:00 槽，不会提前读 11:00 槽。
+        ② **只检查缺失点位，不再要求「整轮全部重跑」**（v1.7.3）：
+           同网关里一块水表失败，不会把已经成功的电表再读一遍；
+           补采列表由 `services.collect.missing_meters()` 统一给出。
+        ③ **启用网关下没有点位时返回 False**：没有可采的东西，不应让
+           每 5 分钟的计划任务空跑一轮。
         """
-        now = datetime.now()
-        if slots.due_slot(now) is None:
+        slot = slots.due_slot(datetime.now())
+        if slot is None:
             return False
-        b = slots.hour_start(now)
-        ms = EnergyMeter.objects.filter(enabled=True)
-        if gateway_codes:
-            ms = ms.filter(gateway__code__in=gateway_codes)
-        ms = list(ms)
-        if not ms:
-            return True
-        done = set(
-            EnergyRaw.objects.filter(meter__in=ms, collect_time__gte=b, ok=True).values_list("meter_id", flat=True)
-        )
-        return len(done) < len(ms)
+        return bool(missing_meters(slot, gateway_codes))
