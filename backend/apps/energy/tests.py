@@ -54,6 +54,77 @@ def etype(code: str = EnergyType.ELECTRIC) -> EnergyType:
     return EnergyType.objects.get(type_code=code)
 
 
+class CollectorCloseTests(TestCase):
+    """v1.7.2：采集连接在成功 / 失败 / 连接异常路径上都必须 close。
+
+    现场症状：水表连续几小时 No response，服务端可能积累半开 TCP 连接。
+    根因不是重试次数不够，而是 prepare 失败时 read_all 直接 return、没有 close。
+    """
+
+    class _Fake(BaseCollector):
+        def __init__(self, *, prepare_error=None, prepare_raise=False, read_ok=False):
+            super().__init__(mock.Mock(code="GW-FAKE"), retry_times=1, retry_backoff=0)
+            self.prepare_error = prepare_error
+            self.prepare_raise = prepare_raise
+            self.read_ok = read_ok
+            self.closed = 0
+            self.prepared = 0
+
+        def prepare(self):
+            self.prepared += 1
+            if self.prepare_raise:
+                raise RuntimeError("connect exploded")
+            return self.prepare_error or ""
+
+        def read_one(self, meter):
+            return CollectResult(ok=self.read_ok, value=None, error="" if self.read_ok else "no response")
+
+        def close(self):
+            self.closed += 1
+
+    class _Meter:
+        def __init__(self, code="E-T-01"):
+            self.code = code
+
+    def test连接成功且读取失败后关闭(self):
+        c = self._Fake(prepare_error="", read_ok=False)
+        c.read_all([self._Meter()])
+        self.assertEqual(c.prepared, 1)
+        self.assertEqual(c.closed, 1, "失败重试结束后必须关闭")
+
+    def test连接成功且读取成功后关闭(self):
+        c = self._Fake(prepare_error="", read_ok=True)
+        out = c.read_all([self._Meter()])
+        self.assertTrue(out["E-T-01"].ok)
+        self.assertEqual(c.closed, 1)
+
+    def testprepare返回失败也关闭(self):
+        c = self._Fake(prepare_error="无法连接", read_ok=False)
+        out = c.read_all([self._Meter()])
+        self.assertFalse(out["E-T-01"].ok)
+        self.assertEqual(c.closed, 1, "prepare 失败提前 return 的路径必须 close")
+
+    def testprepare抛异常也关闭(self):
+        c = self._Fake(prepare_raise=True, read_ok=False)
+        out = c.read_all([self._Meter()])
+        self.assertFalse(out["E-T-01"].ok)
+        self.assertEqual(c.closed, 1, "prepare 异常也必须走 finally close")
+
+    def test_modbus连接失败时关闭半开client(self):
+        gw = mock.Mock()
+        gw.host = "127.0.0.1"
+        gw.port = 502
+        gw.code = "GW-T"
+        with mock.patch("apps.energy.collectors.modbus_rtu.ModbusTcpClient") as factory:
+            client = factory.return_value
+            client.connect.return_value = False
+            collector = ModbusRtuOverTcpCollector(gw, timeout_ms=100)
+            err = collector.prepare()
+        self.assertTrue(err)
+        client.close.assert_called_once()
+        self.assertIsNone(collector.client)
+
+
 class AggregationTests(TestCase):
     """小时差值的口径测试。
 

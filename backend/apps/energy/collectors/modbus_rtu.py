@@ -146,22 +146,29 @@ class ModbusRtuOverTcpCollector(BaseCollector):
                 retries=1,
             )
             if not self.client.connect():
+                self.close()  # 连接失败也不能把半开 socket 留给服务端
                 return f"无法连接串口服务器 {self.gateway.host}:{self.gateway.port}"
         except Exception as exc:  # noqa: BLE001
+            self.close()
             return f"连接异常：{type(exc).__name__} {exc}"
         return ""
 
     def on_read_failed(self, meter, error: str) -> None:
-        """RS485 是共享总线，一次超时后流里常残留半包；重连比在原连接上硬重试可靠。"""
+        """RS485 是共享总线，一次超时后流里常残留半包；重连比在原连接上硬重试可靠。
+
+        `prepare()` 内部先 close；这里仍显式关闭一次，确保失败路径上
+        pymodbus 的 client/socket 都不会继续挂在本进程里。
+        """
+        self.close()
         self.prepare()
 
     def close(self) -> None:
-        if self.client is not None:
+        client, self.client = self.client, None
+        if client is not None:
             try:
-                self.client.close()
+                client.close()
             except Exception:  # noqa: BLE001
                 pass
-            self.client = None
 
     # ── 读一个计量点 ─────────────────────────────────────────
     def read_one(self, meter) -> CollectResult:

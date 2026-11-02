@@ -73,14 +73,19 @@ class BaseCollector:
         if not meters:
             return out
 
-        err = self.prepare()
-        if err:
-            for m in meters:
-                out[m.code] = CollectResult(ok=False, error=err)
-            logger.warning("网关 %s 连接失败：%s", self.gateway.code, err)
-            return out
-
+        # ⚠ 连接成功、失败、甚至 prepare 抛异常都必须 close：
+        #   否则服务端会积累半开 TCP 连接，表现为之后几小时偶发/持续读不到数。
         try:
+            try:
+                err = self.prepare()
+            except Exception as exc:  # noqa: BLE001 —— 一轮采集不能因连接异常整轮崩掉
+                err = f"{type(exc).__name__}: {exc}"
+            if err:
+                for m in meters:
+                    out[m.code] = CollectResult(ok=False, error=err)
+                logger.warning("网关 %s 连接失败：%s", self.gateway.code, err)
+                return out
+
             for m in meters:
                 out[m.code] = self._read_with_retry(m)
         finally:

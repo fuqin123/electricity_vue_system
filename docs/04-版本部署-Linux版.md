@@ -544,7 +544,7 @@ docker compose ps                                      # 六个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.7.1-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.7.2-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz
@@ -604,6 +604,18 @@ docker compose up -d
 `data_quality.review_hour`（默认 11 时）与 `data_quality.deviation_minutes`（默认 10 分钟）。
 复核时刻到达后，上一生产日的 partial 小时会生成带差值和时段的 `hour_deviation` 告警；
 未复核时数据仍正常显示，不需要重建汇总。
+
+### 4.8 v1.7.2 升级（采集连接关闭）
+
+```bash
+docker compose build backend frontend
+docker compose up -d
+# 无数据库迁移；collector/backend 重启后生效
+```
+
+本版修复采集器在 `prepare()` 失败/异常路径未关闭 TCP client 的问题；
+升级后可用 `ss -tnp | grep <网关IP>` 观察失败轮次后连接数是否回落。
+若水表仍长时间无响应，请按 `docs/05` §6.2.1 检查串口服务器/设备侧与是否有第二个采集环境。
 
 ## 五、方案 C：一键部署脚本
 
