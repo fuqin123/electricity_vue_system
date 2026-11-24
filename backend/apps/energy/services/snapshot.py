@@ -343,9 +343,12 @@ def _workshop_kwh_cells(day: date_cls, now: datetime, closed: bool = False) -> d
     return hourly_cells(meters, day, now, closed=closed)
 
 
-def _utility_cells(kind: str, day: date_cls, now: datetime, closed: bool = False) -> dict[int, HourCell]:
-    meters = list(EnergyMeter.objects.filter(energy_type__type_code=kind, scope=EnergyMeter.SCOPE_WORKSHOP, enabled=True))
-    return hourly_cells(meters, day, now, closed=closed)
+def _utility_meters(kind: str) -> list[EnergyMeter]:
+    return list(
+        EnergyMeter.objects.filter(
+            energy_type__type_code=kind, scope=EnergyMeter.SCOPE_WORKSHOP, enabled=True
+        )
+    )
 
 
 def _sum_cells(cells: dict[int, HourCell], *, upto: int | None = None, running: bool = False):
@@ -702,13 +705,26 @@ def _utility_metric(kind: str, now: datetime, unit: str, closed: bool = False) -
     current_index = None if closed else B.hour_index_at(today, now)
     upto = 23 if current_index is None else current_index
 
-    cells = _utility_cells(kind, today, now, closed)
-    y_cells = _utility_cells(kind, yesterday, now, closed=True)
+    meters = _utility_meters(kind)
+    cells = hourly_cells(meters, today, now, closed=closed)
+    y_cells = hourly_cells(meters, yesterday, now, closed=True)
 
     trend = [round_any(cells[i].value, 2) if cells[i].value is not None else NULL for i in range(24)]
 
     today_total, cov, exp = _sum_cells(cells, upto=upto, running=True)
-    y_total, _, _ = _sum_cells(y_cells, upto=23)
+    y_total, y_cov, y_exp = _sum_cells(y_cells, upto=23)
+
+    # v1.7.7：水表链路不稳，24 小时没采齐时用「06:00 → 次日 06:00」累计读数补算。
+    # 今日只有在查历史整日（closed）时才补；昨天在本函数里始终是已结束的一天。
+    if kind == EnergyType.WATER:
+        if closed and (today_total is None or cov < exp):
+            alt = S.day_boundary_total(meters, today)
+            if alt is not None:
+                today_total, cov, exp = alt, 24, 24
+        if y_total is None or y_cov < y_exp:
+            alt = S.day_boundary_total(meters, yesterday)
+            if alt is not None:
+                y_total = alt
 
     # 瞬时流量：设备响应里的瞬时字段（var2/var3/var4）含义尚未与现场核对，
     # 先用「当前小时用量 ÷ 已覆盖时长」作为平均流量（t/h）的估算值。

@@ -46,6 +46,7 @@ from ..models import (
 )
 from . import business_day as B
 from . import coverage as C
+from .aggregate import boundary_reading
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,40 @@ def _elec_metrics(
     return (Decimal(total) if total is not None else None), covered, has_partial
 
 
+def day_boundary_usage(meter: EnergyMeter, day: date_cls) -> Decimal | None:
+    """用生产日 06:00 → 次日 06:00 的**原始累计读数**补算一天用量（v1.7.7）。
+
+    为什么需要它：现场水表传输不稳，逐小时差值经常缺数；但一天的真实用量
+    仍然等于「次日 06:00 读数 − 当日 06:00 读数」。两端读数都在时，日合计
+    可以直接补出来，不必因为中间缺了几个小时就让整天的用水量变成 `--`。
+
+    ⚠ 只作为**逐小时数据不完整时的兜底**（见 `summarize_days`）：24 小时齐全时
+      仍以小时之和为准，保证与大屏、电/汽口径一致。
+    ⚠ 差值 < 0 视为换表 / 归零，返回 None —— 负数绝不能进合计，也不能补 0。
+    """
+    start = boundary_reading(meter, B.day_start(day))
+    end = boundary_reading(meter, B.day_end(day))
+    if start is None or end is None:
+        return None
+    delta = (end.reading - start.reading).quantize(Q3)
+    if delta < 0:
+        return None
+    return delta
+
+
+def day_boundary_total(meters: list[EnergyMeter], day: date_cls) -> Decimal | None:
+    """一组水表按日边界补算的合计；任一块表缺端点读数则不成立（不返回偏小值）。"""
+    if not meters:
+        return None
+    total = Decimal(0)
+    for meter in meters:
+        value = day_boundary_usage(meter, day)
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def _one_type_metrics(
     meter: EnergyMeter, start: datetime, end: datetime
 ) -> tuple[Decimal | None, int, bool]:
@@ -236,6 +271,15 @@ def summarize_days(day: date_cls, now: datetime | None = None) -> list[str]:
                 has_partial = False
                 for m in meters:
                     sub_total, sub_covered, sub_partial = _one_type_metrics(m, window_start, window_end)
+                    if code == EnergyType.WATER and (sub_total is None or sub_covered < 24):
+                        # v1.7.7：水表链路不稳，逐小时差值没凑齐 24 小时时，
+                        # 直接用生产日 06:00 → 次日 06:00 的累计读数相减补一天用量。
+                        # 两端读数任一缺失 / 差值回退 → 仍走原来的 partial/missing。
+                        alt = day_boundary_usage(m, day)
+                        if alt is not None:
+                            sub_total = alt
+                            sub_covered = 24
+                            sub_partial = True
                     if sub_total is None:
                         total = None
                         covered = 0
@@ -621,13 +665,28 @@ def period_rows(
                     if open_period or live_fallback:
                         # 多块总表时求和（如车间进水 + 车间回用）；
                         # 从未接入的那块先排除，否则它会永久否决本车间
+                        participating = C.participating(meters)
                         subtotal = None
-                        for m in C.participating(meters):
-                            v = _one_type_metrics(m, window_start, window_end)[0]
+                        incomplete = False
+                        for m in participating:
+                            v, c, _p = _one_type_metrics(m, window_start, window_end)
                             if v is None:
                                 subtotal = None
+                                incomplete = True
                                 break
                             subtotal = v if subtotal is None else subtotal + v
+                            if c < 24:
+                                incomplete = True
+                        # v1.7.7：逐小时没凑齐时（水表链路不稳），日粒度用
+                        # 06:00 → 次日 06:00 的累计读数补算；找不到端点仍用原值
+                        if (
+                            dim == DIM_DAY
+                            and etype.type_code == EnergyType.WATER
+                            and (subtotal is None or incomplete)
+                        ):
+                            alt = day_boundary_total(participating, start)
+                            if alt is not None:
+                                subtotal = alt
                         val = subtotal
                     elif dim == DIM_DAY:
                         rows = EnergyDaily.objects.filter(

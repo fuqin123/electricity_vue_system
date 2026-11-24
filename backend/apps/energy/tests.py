@@ -4369,3 +4369,111 @@ class VideoConfigTests(TestCase):
 
         all_nodes = Client().get("/api/admin/lines", {"pageSize": 200}).json()["list"]
         self.assertIn("AUX-T1", [r["code"] for r in all_nodes])
+
+
+class WaterDailyFallbackTests(TestCase):
+    """v1.7.7：水表链路不稳时，用生产日 06:00 → 次日 06:00 的读数补日用量。
+
+    口径：
+      · 24 小时齐全 → 仍按小时之和（与电/汽一致，不改变既有数字）；
+      · 小时不齐（含 0 小时）但两端 06:00 读数都在 → 用间隔 24 小时的直接读数相减；
+      · 端点缺失或差值为负（换表/归零）→ 不补算，保留原来的 partial / missing。
+    """
+
+    DAY = datetime(2026, 10, 22).date()
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.ws = ProductionLine.default_workshop()
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-WFB", name="水表补算网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
+        cls.meter = EnergyMeter.objects.create(
+            code="W-FB-01", name="车间进水总表", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=cls.ws, gateway=cls.gw, unit="t",
+        )
+
+    def setUp(self):
+        EnergyRaw.objects.filter(meter=self.meter).delete()
+        EnergyHourly.objects.filter(meter=self.meter).delete()
+        EnergyDaily.objects.filter(line=self.ws, energy_type=self.meter.energy_type).delete()
+
+    def _reading(self, when, value):
+        EnergyRaw.objects.create(
+            meter=self.meter, line=self.ws, energy_type=self.meter.energy_type,
+            collect_time=when, reading=Decimal(value), ok=True,
+        )
+
+    def _hourly(self, count: int, value: str = "1"):
+        for idx in range(count):
+            stat_date, stat_hour = B.hour_bucket(self.DAY, idx)
+            EnergyHourly.objects.create(
+                meter=self.meter, line=self.ws, energy_type=self.meter.energy_type,
+                stat_date=stat_date, stat_hour=stat_hour,
+                consumption=Decimal(value), quality=EnergyHourly.Q_OK,
+            )
+
+    def _daily_row(self):
+        return EnergyDaily.objects.get(
+            line=self.ws, energy_type=self.meter.energy_type, stat_date=self.DAY
+        )
+
+    def test_小时不齐时按日边界读数补算(self):
+        self._hourly(10, "1")  # 只有 10 个小时
+        self._reading(B.day_start(self.DAY), "1000")
+        self._reading(B.day_end(self.DAY), "1120")
+
+        S.summarize_days(self.DAY, now=B.day_end(self.DAY) + timedelta(hours=1))
+        row = self._daily_row()
+        self.assertEqual(row.consumption, Decimal("120.000"))
+        self.assertEqual(row.covered_count, 24, "边界补算成立时，日用量是完整的")
+        self.assertEqual(row.quality, PeriodSummary.Q_PARTIAL, "逐小时不完整，仍标 partial")
+
+        key = self.DAY.strftime("%Y-%m-%d")
+        prow = S.period_rows(
+            PeriodSummary.DIM_DAY, PeriodSummary.SCOPE_WORKSHOP, None,
+            [key], now=B.day_end(self.DAY) + timedelta(days=1),
+        )[key]
+        self.assertEqual(prow.water_t, Decimal("120.000"))
+
+    def test_24小时齐全时仍按小时之和(self):
+        self._hourly(24, "1")  # 24 小时合计 24
+        self._reading(B.day_start(self.DAY), "1000")
+        self._reading(B.day_end(self.DAY), "1120")  # 边界差 120，不应覆盖小时值
+
+        S.summarize_days(self.DAY, now=B.day_end(self.DAY) + timedelta(hours=1))
+        row = self._daily_row()
+        self.assertEqual(row.consumption, Decimal("24.000"))
+        self.assertEqual(row.covered_count, 24)
+        self.assertEqual(row.quality, PeriodSummary.Q_OK)
+
+    def test_缺少结束端点时不补算(self):
+        self._hourly(10, "1")
+        self._reading(B.day_start(self.DAY), "1000")  # 只有起点
+
+        S.summarize_days(self.DAY, now=B.day_end(self.DAY) + timedelta(hours=1))
+        row = self._daily_row()
+        self.assertEqual(row.consumption, Decimal("10.000"))
+        self.assertEqual(row.covered_count, 10)
+        self.assertEqual(row.quality, PeriodSummary.Q_PARTIAL)
+
+    def test_边界差值为负时不补算(self):
+        self._hourly(10, "1")
+        self._reading(B.day_start(self.DAY), "1200")
+        self._reading(B.day_end(self.DAY), "1100")  # 换表 / 归零
+
+        S.summarize_days(self.DAY, now=B.day_end(self.DAY) + timedelta(hours=1))
+        row = self._daily_row()
+        self.assertEqual(row.consumption, Decimal("10.000"), "负差值不能进合计")
+        self.assertEqual(row.covered_count, 10)
+
+    def test_大屏昨日用水也走同一补算口径(self):
+        """`_utility_metric` 的昨日合计是另一条直接读小时表的路径，必须同口径。"""
+        self._hourly(8, "1")
+        self._reading(B.day_start(self.DAY), "1000")
+        self._reading(B.day_end(self.DAY), "1120")
+
+        # 现在 = 生产日 D+1 的 08:00（D 已结束、D+1 不在本用例关心的范围）
+        now = B.day_start(self.DAY + timedelta(days=1)) + timedelta(hours=2)
+        data = build_overview(now=now, closed=False)
+        self.assertEqual(data["workshop"]["yesterday"]["waterT"], 120.0)
