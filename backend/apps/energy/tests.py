@@ -30,6 +30,10 @@ from apps.energy.models import (
     EnergyMeter,
     EnergyDaily,
     EnergyRaw,
+    MeterBindingAssignment,
+    MeterBindingDevice,
+    MeterBindingType,
+    MeterBindingWorkshop,
     EnergyReviewLog,
     EnergyType,
     PeriodSummary,
@@ -3929,3 +3933,300 @@ class MeterDataTypeTests(TestCase):
         self.assertEqual(registry._data_type_for("float64"), "float64")
         with self.assertRaises(ValueError):
             registry._data_type_for("float128")
+
+
+class MeterBindingTests(TestCase):
+    """v1.7.4：绑定树（车间 → 类型 → 设备 → 计量点）。
+
+    绑定页现在是「左侧结构 + 右侧分配」：
+      · 三层节点都可先建空壳，再给设备勾选计量点；
+      · 车间/类型/设备可改名、删除，删除只删绑定关系；
+      · 计量页在某个能源有绑定设备后，完全按绑定树出分类。
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.ws = ProductionLine.default_workshop()
+        assert cls.ws is not None, "测试库缺少车间节点 —— 检查迁移 0009"
+        cls.line = ProductionLine.objects.create(
+            line_code="TB-L1", line_name="测试一线", node_type=ProductionLine.NODE_LINE,
+            line_type=ProductionLine.TYPE_LINE, parent=cls.ws,
+        )
+        cls.aux = ProductionLine.objects.create(
+            line_code="TB-AUX", line_name="测试辅机", node_type=ProductionLine.NODE_AUX,
+            line_type=ProductionLine.TYPE_LINE, parent=cls.ws,
+        )
+        cls.other_ws = ProductionLine.objects.create(
+            line_code="TB-WS2", line_name="测试二车间", node_type=ProductionLine.NODE_WORKSHOP,
+            line_type=ProductionLine.TYPE_WORKSHOP,
+        )
+        cls.other_line = ProductionLine.objects.create(
+            line_code="TB-L2", line_name="测试二线", node_type=ProductionLine.NODE_LINE,
+            line_type=ProductionLine.TYPE_LINE, parent=cls.other_ws,
+        )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-TB", name="绑定测试网关", kind=EnergyGateway.KIND_MODBUS,
+            host="127.0.0.1", port=1,
+        )
+        cls.m1 = EnergyMeter.objects.create(
+            code="TB-E1", name="一线生产线电表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw,
+            slave=1, register=1000, usage_type="生产线用电", device_name="生产线",
+        )
+        cls.m2 = EnergyMeter.objects.create(
+            code="TB-E2", name="一线吹瓶机电表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.line, gateway=cls.gw,
+            slave=2, register=1000, usage_type="生产线用电", device_name="吹瓶机",
+        )
+        cls.m_aux = EnergyMeter.objects.create(
+            code="TB-AUX-E1", name="辅机冰水电表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.aux, gateway=cls.gw,
+            slave=3, register=1000, usage_type="辅机用电", device_name="冰水",
+        )
+        cls.m_water = EnergyMeter.objects.create(
+            code="TB-W1", name="车间水表", energy_type=etype(EnergyType.WATER),
+            scope=EnergyMeter.SCOPE_WORKSHOP, line=cls.ws, gateway=cls.gw,
+            slave=4, register=1000, usage_type="车间进水", device_name="进水总表",
+        )
+        cls.m_other = EnergyMeter.objects.create(
+            code="TB-OTHER", name="二车间电表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=cls.other_line, gateway=cls.gw,
+            slave=5, register=1000, usage_type="生产线用电", device_name="生产线",
+        )
+        cls.day = datetime(2026, 9, 22).date()
+        # 24 个生产日小时（06:00—次日 05:00）都有值，让区间合计能成立
+        for h in range(24):
+            stat_date = cls.day if h >= B.DAY_START_HOUR else cls.day + timedelta(days=1)
+            for meter, value in ((cls.m1, "10.0"), (cls.m2, "20.0"), (cls.m_aux, "5.0")):
+                EnergyHourly.objects.create(
+                    meter=meter, line=meter.line, energy_type=meter.energy_type,
+                    stat_date=stat_date, stat_hour=h,
+                    consumption=Decimal(value), quality=EnergyHourly.Q_OK,
+                )
+
+    def _api(self, method: str, url: str, payload: dict | None = None):
+        client = Client()
+        if method == "get":
+            return client.get(url, payload or {})
+        if method == "delete":
+            return client.delete(url)
+        return getattr(client, method)(
+            url, data=json.dumps(payload or {}), content_type="application/json"
+        )
+
+    def _tree_fixture(self, *, ws_name="绑定碳水", type_name="生产用电", device_name="一线"):
+        ws = self._api("post", "/api/admin/meter-binding-workshops", {"name": ws_name})
+        self.assertEqual(ws.status_code, 200, ws.content)
+        ws_id = ws.json()["workshop"]["id"]
+        btype = self._api(
+            "post",
+            "/api/admin/meter-binding-types",
+            {"workshopId": ws_id, "energy": "elec", "name": type_name},
+        )
+        self.assertEqual(btype.status_code, 200, btype.content)
+        type_id = btype.json()["type"]["id"]
+        device = self._api(
+            "post",
+            "/api/admin/meter-binding-devices",
+            {"typeId": type_id, "name": device_name},
+        )
+        self.assertEqual(device.status_code, 200, device.content)
+        return ws_id, type_id, device.json()["device"]["id"]
+
+    def test_三层节点可先建空壳再给设备分配计量点(self):
+        ws_id, type_id, device_id = self._tree_fixture()
+        tree = self._api("get", "/api/admin/meter-bindings/tree")
+        self.assertEqual(tree.status_code, 200)
+        data = tree.json()
+        self.assertEqual(len(data["workshops"]), 1)
+        ws = data["workshops"][0]
+        self.assertEqual(ws["name"], "绑定碳水")
+        self.assertEqual(ws["types"][0]["name"], "生产用电")
+        self.assertEqual(ws["types"][0]["devices"][0]["meterCount"], 0)
+
+        saved = self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device_id}/meters",
+            {"meterCodes": [self.m1.code, self.m2.code]},
+        )
+        self.assertEqual(saved.status_code, 200, saved.content)
+        self.assertEqual(saved.json()["saved"], 2)
+        self.assertEqual(saved.json()["device"]["meterCodes"], ["TB-E1", "TB-E2"])
+
+        tree2 = self._api("get", "/api/admin/meter-bindings/tree").json()
+        device = tree2["workshops"][0]["types"][0]["devices"][0]
+        self.assertEqual(device["meterCount"], 2)
+        self.assertEqual(device["meters"][0]["code"], "TB-E1")
+
+        # 空数组 = 解绑全部；节点本身保留
+        cleared = self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device_id}/meters",
+            {"meterCodes": []},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.json()["device"]["meterCount"], 0)
+
+    def test_按设备按类型按单表查询用量(self):
+        ws_id, type_id, device1 = self._tree_fixture(device_name="一线")
+        self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device1}/meters",
+            {"meterCodes": [self.m1.code, self.m2.code]},
+        )
+        device2 = self._api(
+            "post",
+            "/api/admin/meter-binding-devices",
+            {"typeId": type_id, "name": "辅机"},
+        ).json()["device"]["id"]
+        self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device2}/meters",
+            {"meterCodes": [self.m_aux.code]},
+        )
+
+        base = {
+            "date": self.day.isoformat(),
+            "granularity": "hour",
+            "kind": "elec",
+            "workshop": f"BWS-{ws_id}",
+        }
+        device_res = self._api("get", "/api/energy/range", {**base, "binding": device1})
+        self.assertEqual(device_res.status_code, 200, device_res.content)
+        body = device_res.json()
+        self.assertEqual(body["binding"], device1)
+        self.assertEqual(body["series"][0]["name"], "绑定碳水 · 生产用电 · 一线")
+        self.assertEqual(body["series"][0]["values"][8], 30.0)
+        self.assertEqual(body["totals"]["kwh"], 720.0)
+
+        type_res = self._api("get", "/api/energy/range", {**base, "bindingType": type_id})
+        self.assertEqual(type_res.status_code, 200, type_res.content)
+        tbody = type_res.json()
+        self.assertEqual(tbody["bindingType"], type_id)
+        self.assertEqual(tbody["meterCount"], 3)
+        self.assertEqual(tbody["series"][0]["name"], "绑定碳水 · 生产用电")
+        self.assertEqual(tbody["series"][0]["values"][8], 35.0)
+
+        meter_res = self._api(
+            "get", "/api/energy/range", {**base, "binding": device1, "meter": self.m1.code}
+        )
+        self.assertEqual(meter_res.status_code, 200, meter_res.content)
+        mbody = meter_res.json()
+        self.assertEqual(mbody["meter"], self.m1.code)
+        self.assertEqual(mbody["series"][0]["values"][8], 10.0)
+        self.assertEqual(mbody["totals"]["kwh"], 240.0)
+
+    def test_设备类型能源与计量点必须一致(self):
+        _, _, device_id = self._tree_fixture()
+        res = self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device_id}/meters",
+            {"meterCodes": [self.m1.code, self.m_water.code]},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("能源类型", res.json()["detail"])
+
+    def test_同一块表可分配给多个设备且删除设备不删表(self):
+        _, type_id, device1 = self._tree_fixture(device_name="一线")
+        device2 = self._api(
+            "post",
+            "/api/admin/meter-binding-devices",
+            {"typeId": type_id, "name": "二线"},
+        ).json()["device"]["id"]
+        for device_id in (device1, device2):
+            res = self._api(
+                "put",
+                f"/api/admin/meter-binding-devices/{device_id}/meters",
+                {"meterCodes": [self.m1.code]},
+            )
+            self.assertEqual(res.status_code, 200, res.content)
+
+        self.assertEqual(MeterBindingAssignment.objects.filter(meter=self.m1).count(), 2)
+        self._api("delete", f"/api/admin/meter-binding-devices/{device1}")
+        self.assertTrue(EnergyMeter.objects.filter(code=self.m1.code).exists())
+        self.assertEqual(
+            MeterBindingAssignment.objects.filter(device_id=device2, meter=self.m1).count(), 1
+        )
+
+    def test_删除车间级联删除类型设备关系但保留计量点(self):
+        ws_id, type_id, device_id = self._tree_fixture()
+        self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device_id}/meters",
+            {"meterCodes": [self.m1.code, self.m2.code]},
+        )
+        res = self._api("delete", f"/api/admin/meter-binding-workshops/{ws_id}")
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(MeterBindingWorkshop.objects.filter(pk=ws_id).exists())
+        self.assertFalse(MeterBindingType.objects.filter(pk=type_id).exists())
+        self.assertFalse(MeterBindingDevice.objects.filter(pk=device_id).exists())
+        self.assertEqual(MeterBindingAssignment.objects.count(), 0)
+        self.assertTrue(EnergyMeter.objects.filter(code=self.m1.code).exists())
+
+    def test_重名与类型能源修改校验(self):
+        ws_id, type_id, _ = self._tree_fixture()
+        self.assertEqual(
+            self._api("post", "/api/admin/meter-binding-workshops", {"name": "绑定碳水"}).status_code,
+            409,
+        )
+        self.assertEqual(
+            self._api(
+                "post",
+                "/api/admin/meter-binding-types",
+                {"workshopId": ws_id, "energy": "elec", "name": "生产用电"},
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self._api(
+                "post",
+                "/api/admin/meter-binding-devices",
+                {"typeId": type_id, "name": "一线"},
+            ).status_code,
+            409,
+        )
+        res = self._api(
+            "put", f"/api/admin/meter-binding-types/{type_id}", {"energy": "water"}
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("能源不可修改", res.json()["detail"])
+
+    def test_配置绑定后分类树只返回绑定树(self):
+        ws_id, type_id, device_id = self._tree_fixture()
+        self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device_id}/meters",
+            {"meterCodes": [self.m1.code, self.m2.code]},
+        )
+        res = self._api("get", "/api/energy/meter-categories", {"kind": "elec"})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data["tree"]), 1, "绑定模式不应再混入原始台账分类")
+        ws = data["tree"][0]
+        self.assertEqual(ws["workshop"], "绑定碳水")
+        self.assertEqual(ws["workshopCode"], f"BWS-{ws_id}")
+        self.assertTrue(ws["bindingDriven"])
+        types = ws["types"]
+        self.assertEqual(len(types), 1)
+        self.assertEqual(types[0]["usageType"], "生产用电")
+        self.assertTrue(types[0]["bindingDriven"])
+        self.assertEqual(len(types[0]["bindings"]), 1)
+        self.assertEqual(types[0]["bindings"][0]["name"], "一线")
+        self.assertEqual(types[0]["bindings"][0]["meterCount"], 2)
+        # 单块仪表用被引用的物理表，不含该类型的其它原始表
+        self.assertEqual(
+            sorted(d["code"] for d in types[0]["devices"]), ["TB-E1", "TB-E2"]
+        )
+        self.assertEqual(data["bindingCount"], 1)
+
+    def test_没有绑定配置时分类树仍用原始台账(self):
+        res = self._api("get", "/api/energy/meter-categories", {"kind": "elec"})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        ws = next(w for w in data["tree"] if w["workshopCode"] == "WS-CARB")
+        self.assertFalse(ws["bindingDriven"])
+        types = {t["usageType"]: t for t in ws["types"]}
+        self.assertIn("生产线用电", types)
+        self.assertFalse(types["生产线用电"]["bindingDriven"])
+        self.assertIn("TB-E1", [d["code"] for d in types["生产线用电"]["devices"]])
+        self.assertEqual(data["bindingCount"], 0)

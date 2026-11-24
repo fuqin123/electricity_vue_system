@@ -34,6 +34,8 @@ from ..models import (
     EnergyHourly,
     EnergyMeter,
     EnergyType,
+    MeterBindingDevice,
+    MeterBindingType,
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
@@ -497,6 +499,9 @@ def usage_range(
     usage_type: str | None = None,
     device: str | None = None,
     node_code: str | None = None,
+    binding_id: int | None = None,
+    binding_type_id: int | None = None,
+    meter_code: str | None = None,
 ) -> dict:
     """按时间段取用量。
 
@@ -506,9 +511,13 @@ def usage_range(
         day / month 的桶本身就是整天/整月，端点会被规范到所属周期边界。
     :param kind / workshop / usage_type / device / node_code:
         ★ v1.5.2 后台三级筛选（车间 → 用能类型 → 设备）。
-        这三层任一项给定时，走「按计量点集合直接取数」的通道（见 `_meter_focus`），
-        不再按「车间合计 + 各线」出多条序列 —— 用户已经明确要看某个设备，
-        再叠一整套产线序列只会让图变成一锅粥。
+        这三层任一项给定时，走「按计量点集合直接取数」的通道，不再按
+        「车间合计 + 各线」出多条序列。
+    :param binding_id / binding_type_id / meter_code:
+        ★ v1.7.4 绑定设备 / 绑定类型（全部设备）/ 单表查询。
+        绑定树模式下，第三级选设备传 binding_id，选「全部设备」传
+        binding_type_id；单表仍用 meter_code。优先级：
+        meter > binding_id > binding_type_id。冲突参数直接 ValueError。
 
     ⚠ hour 粒度**只到最后一个已结算整点**：区间终点落在当前小时时，当前小时不入桶
       （15 点时最大可查 14 点）。当前小时的用量在下个整点采到端点前无定义，
@@ -533,10 +542,102 @@ def usage_range(
     #   ② 能源类型不是电 —— 水/汽没有「各条产线」这种拆法，常规的
     #      「车间合计 + 各线」分支全是电表口径，硬套会给水/汽页面返回电的序列
     #      （面板显示电气数据，现场会直接按错的数字调度）。
+    # 绑定 / 单表：比三级维度更精确的口径。与 kind / workshop 的冲突必须报错
+    # 而不是静默忽略 —— 静默忽略会返回「另一个口径的数」，界面看着正常，
+    # 实际不是用户选的东西。
+    binding_device: MeterBindingDevice | None = None
+    if binding_id:
+        binding_device = (
+            MeterBindingDevice.objects.select_related(
+                "type__workshop", "type__energy_type"
+            )
+            .prefetch_related(
+                "assignments__meter__energy_type",
+                "assignments__meter__line",
+                "assignments__meter__line__parent",
+            )
+            .filter(pk=binding_id)
+            .first()
+        )
+        if binding_device is None:
+            raise ValueError(f"绑定设备不存在：{binding_id}")
+        btype = binding_device.type
+        if kind and btype.energy_type.type_code != _type_code(kind):
+            raise ValueError("绑定设备的能源类型与查询不匹配")
+        expected_workshop = f"BWS-{btype.workshop_id}"
+        if workshop and workshop.upper() != expected_workshop:
+            raise ValueError("绑定设备不属于所选车间")
+
+    binding_type: MeterBindingType | None = None
+    if binding_device is None and binding_type_id:
+        binding_type = (
+            MeterBindingType.objects.select_related("workshop", "energy_type")
+            .prefetch_related(
+                "devices__assignments__meter__energy_type",
+                "devices__assignments__meter__line",
+                "devices__assignments__meter__line__parent",
+            )
+            .filter(pk=binding_type_id)
+            .first()
+        )
+        if binding_type is None:
+            raise ValueError(f"绑定类型不存在：{binding_type_id}")
+        if kind and binding_type.energy_type.type_code != _type_code(kind):
+            raise ValueError("绑定类型的能源类型与查询不匹配")
+        expected_workshop = f"BWS-{binding_type.workshop_id}"
+        if workshop and workshop.upper() != expected_workshop:
+            raise ValueError("绑定类型不属于所选车间")
+
+    meter: EnergyMeter | None = None
+    if meter_code:
+        meter = (
+            EnergyMeter.objects.select_related("line", "line__parent", "energy_type")
+            .filter(code=meter_code)
+            .first()
+        )
+        if meter is None:
+            raise ValueError(f"计量点不存在：{meter_code}")
+        if not meter.enabled:
+            raise ValueError(f"计量点已停用：{meter_code}")
+        if kind and meter.type_code != _type_code(kind):
+            raise ValueError("计量点的能源类型与查询不匹配")
+        # BWS-* 是绑定树车间的虚拟编码，单表本身不受它约束；
+        # 真实车间编码仍要做归属校验。
+        if (
+            workshop
+            and not workshop.upper().startswith("BWS-")
+            and (meter.workshop is None or meter.workshop.line_code != workshop.upper())
+        ):
+            raise ValueError("计量点不属于所选车间")
+
     non_electric = bool(kind) and _type_code(kind) != EnergyType.ELECTRIC
-    focused = bool(usage_type or device or node_code) or non_electric
+    focused = bool(
+        usage_type or device or node_code or binding_device or binding_type or meter
+    ) or non_electric
     focus_meters: list[EnergyMeter] = []
-    if focused:
+    if meter is not None:
+        # 单表优先：比绑定更精确。两者同时给时若绑定优先，用户选了单表却拿到
+        # 整组合计，界面数字会「看起来正常但对不上」，最难排查。
+        focus_meters = [meter]
+    elif binding_device is not None:
+        focus_meters = [
+            a.meter for a in binding_device.assignments.all() if a.meter.enabled
+        ]
+        if not focus_meters:
+            raise ValueError(
+                f"绑定设备「{binding_device.name}」没有启用中的计量点"
+            )
+    elif binding_type is not None:
+        seen_ids: set[int] = set()
+        for device in binding_type.devices.all():
+            for assignment in device.assignments.all():
+                m = assignment.meter
+                if m.enabled and m.id not in seen_ids:
+                    seen_ids.add(m.id)
+                    focus_meters.append(m)
+        if not focus_meters:
+            raise ValueError(f"绑定类型「{binding_type.name}」没有启用中的计量点")
+    elif focused:
         focus_meters = meters_of(
             kind=kind, workshop=workshop, usage_type=usage_type, device=device, node_code=node_code
         )
@@ -570,7 +671,19 @@ def usage_range(
         groups = split_by_kind(focus_meters)
         first_ok = first_data_map(focus_meters)
         util: dict[str, list[float | None]] = {"water": [], "steam": []}
-        base_name = _focus_name(workshop, usage_type, device, node_code, kind)
+        if meter is not None:
+            base_name = _focus_name(workshop, usage_type, device, node_code, kind, meter=meter)
+        elif binding_device is not None:
+            btype = binding_device.type
+            base_name = " · ".join(
+                part for part in (btype.workshop.name, btype.name, binding_device.name) if part
+            )
+        elif binding_type is not None:
+            base_name = " · ".join(
+                part for part in (binding_type.workshop.name, binding_type.name) if part
+            )
+        else:
+            base_name = _focus_name(workshop, usage_type, device, node_code, kind)
 
         for code, gm in groups.items():
             # 单位按能源类型定，不看「排序后的第一块表」
@@ -624,10 +737,18 @@ def usage_range(
         )
         out_total = Decimal(0)
         prod_real = False
-        return _range_payload(
+        payload = _range_payload(
             start, end, granularity, scope, line_code, labels, series, quality_series,
             util, kwh_total, out_total, prod_real, focus_meters, win_start, win_end,
         )
+        # 回显查询命中的绑定设备 / 绑定类型 / 单表，便于前端确认「查的是哪一组表」
+        if binding_device is not None:
+            payload["binding"] = binding_device.id
+        if binding_type is not None:
+            payload["bindingType"] = binding_type.id
+        if meter is not None:
+            payload["meter"] = meter.code
+        return payload
 
     hour_buckets: list[tuple[date_cls, int]] | None = None
     if granularity == "hour":
@@ -742,11 +863,14 @@ def _focus_name(
     device: str | None,
     node_code: str | None,
     kind: str | None = None,
+    meter: EnergyMeter | None = None,
 ) -> str:
-    """焦点序列名：能拼多细就拼多细（「碳水车间 · 辅机用电 · 冰水机和水塔」）。
+    """焦点序列名：能拼多细就拼多细（「碳水车间 · 辅机用电 · 冰水」）。
 
     `kind` 只在没有更细维度时用来兜底 —— 水/汽页只传 workshop，
     不带上能源名就会得到一条叫「碳水车间」的线，看不出是水还是汽。
+    `meter` 用于「单表」查询：设备维度下再精确到具体仪表时，名字必须能区分
+    「看的是设备合计」还是「看的是其中某一块表」。
     """
     parts = []
     if workshop:
@@ -754,7 +878,9 @@ def _focus_name(
         parts.append(ws.line_name if ws else workshop)
     if usage_type:
         parts.append(usage_type)
-    if device:
+    if meter is not None:
+        parts.append(meter.name)
+    elif device:
         parts.append(device)
     elif node_code:
         node = ProductionLine.objects.filter(line_code=node_code).first()

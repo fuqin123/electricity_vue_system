@@ -93,6 +93,15 @@ const routes: RouteRecordRaw[] = [
             name: 'energy-config-price',
             component: () => import('@/views/energy/EnergyPriceView.vue'),
             meta: { title: '能源单价', desc: '电价 / 水价 / 汽价，供成本折算使用' }
+          },
+          {
+            path: 'meter-binding',
+            name: 'energy-config-meter-binding',
+            component: () => import('@/views/energy/MeterBindingView.vue'),
+            meta: {
+              title: '计量绑定',
+              desc: '按车间 / 类型 / 设备绑定计量点，供电、水、汽计量页按设备查询'
+            }
           }
         ]
       },

@@ -17,7 +17,7 @@ openapi: 3.0.3
 
 info:
   title: 能源产效管理系统 API
-  version: 1.1.0
+  version: 1.7.4
   description: |
     车间电 / 水 / 汽 能源数据与产量数据的统一接口。
 
@@ -379,6 +379,189 @@ paths:
                       list:
                         type: array
                         items: { $ref: '#/components/schemas/MeterPoint' }
+
+  /admin/meter-bindings/tree:
+    get:
+      tags: [admin]
+      summary: 计量绑定树 + 计量点池（v1.7.4）
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workshops:
+                    type: array
+                    items: { $ref: '#/components/schemas/MeterBindingWorkshopTree' }
+                  options: { $ref: '#/components/schemas/MeterBindingOptions' }
+
+  /admin/meter-binding-workshops:
+    post:
+      tags: [admin]
+      summary: 新增绑定车间
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingNamePayload' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workshop: { $ref: '#/components/schemas/MeterBindingWorkshopTree' }
+        '409': { description: 车间重名 }
+
+  /admin/meter-binding-workshops/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    put:
+      tags: [admin]
+      summary: 绑定车间改名
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingNamePayload' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workshop: { $ref: '#/components/schemas/MeterBindingWorkshopTree' }
+    delete:
+      tags: [admin]
+      summary: 删除绑定车间（级联类型/设备/绑定关系）
+      responses:
+        '200': { description: 成功 }
+
+  /admin/meter-binding-types:
+    post:
+      tags: [admin]
+      summary: 新增绑定类型
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingTypePayload' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  type: { $ref: '#/components/schemas/MeterBindingTypeTree' }
+        '409': { description: 同车间同能源类型重名 }
+
+  /admin/meter-binding-types/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    put:
+      tags: [admin]
+      summary: 绑定类型改名（能源不可改）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingNamePayload' }
+      responses:
+        '200': { description: 成功 }
+    delete:
+      tags: [admin]
+      summary: 删除绑定类型（级联设备/绑定关系）
+      responses:
+        '200': { description: 成功 }
+
+  /admin/meter-binding-devices:
+    post:
+      tags: [admin]
+      summary: 新增绑定设备
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingDevicePayload' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: '#/components/schemas/MeterBindingDeviceTree' }
+        '409': { description: 同类型设备重名 }
+
+  /admin/meter-binding-devices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    put:
+      tags: [admin]
+      summary: 绑定设备改名
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingNamePayload' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: '#/components/schemas/MeterBindingDeviceTree' }
+    delete:
+      tags: [admin]
+      summary: 删除绑定设备（只删绑定关系）
+      responses:
+        '200': { description: 成功 }
+
+  /admin/meter-binding-devices/{id}/meters:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    put:
+      tags: [admin]
+      summary: 保存设备右侧勾选的计量点
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeterBindingMetersPayload' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: '#/components/schemas/MeterBindingDeviceTree' }
+                  saved: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
   /admin/gateways:
     get:
@@ -1045,3 +1228,136 @@ components:
         format: { type: string, enum: [xlsx, pdf, csv] }
         enabled: { type: boolean }
         lastGeneratedAt: { type: string }
+
+    # ── 计量绑定树（v1.7.4）─────────────────────────────
+    MeterBindingMeter:
+      type: object
+      required: [id, code, name, energy, workshopCode, nodeCode]
+      properties:
+        id: { type: integer }
+        code: { type: string, example: E-A1-01 }
+        name: { type: string, example: 一线生产线电表 }
+        energy: { type: string, enum: [elec, water, steam] }
+        energyName: { type: string, example: 电 }
+        unit: { type: string, example: kWh }
+        workshopCode: { type: string, example: WS-CARB }
+        workshopName: { type: string, example: 碳水车间 }
+        nodeCode: { type: string, example: W103 }
+        nodeName: { type: string, example: 一线 }
+        nodeType: { type: string, enum: [line, aux, workshop] }
+        usageType: { type: string, example: 生产线用电 }
+        deviceName: { type: string, example: 生产线 }
+        enabled: { type: boolean }
+
+    MeterBindingDeviceTree:
+      type: object
+      required: [id, name, typeId, workshopId, energy, meterCodes, meterCount]
+      properties:
+        id: { type: integer }
+        name: { type: string, example: 一线 }
+        deviceName: { type: string, example: 一线 }
+        sort: { type: integer }
+        typeId: { type: integer }
+        typeName: { type: string, example: 生产用电 }
+        workshopId: { type: integer }
+        workshopName: { type: string, example: 碳水车间 }
+        energy: { type: string, enum: [elec, water, steam] }
+        energyName: { type: string, example: 电 }
+        unit: { type: string, example: kWh }
+        meterCodes:
+          type: array
+          items: { type: string }
+          example: [E-A1-01, E-A1-02]
+        meterCount: { type: integer, example: 2 }
+        meters:
+          type: array
+          items: { $ref: '#/components/schemas/MeterBindingMeter' }
+
+    MeterBindingTypeTree:
+      type: object
+      required: [id, name, energy, devices]
+      properties:
+        id: { type: integer }
+        name: { type: string, example: 生产用电 }
+        usageType: { type: string, example: 生产用电 }
+        energy: { type: string, enum: [elec, water, steam] }
+        energyName: { type: string, example: 电 }
+        unit: { type: string, example: kWh }
+        sort: { type: integer }
+        meterCount: { type: integer }
+        deviceCount: { type: integer }
+        devices:
+          type: array
+          items: { $ref: '#/components/schemas/MeterBindingDeviceTree' }
+
+    MeterBindingWorkshopTree:
+      type: object
+      required: [id, name, types]
+      properties:
+        id: { type: integer }
+        name: { type: string, example: 碳水车间 }
+        sort: { type: integer }
+        typeCount: { type: integer }
+        meterCount: { type: integer }
+        types:
+          type: array
+          items: { $ref: '#/components/schemas/MeterBindingTypeTree' }
+
+    MeterBindingOptions:
+      type: object
+      properties:
+        energies:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string, enum: [elec, water, steam] }
+              name: { type: string, example: 电 }
+              unit: { type: string, example: kWh }
+        workshops:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string, example: WS-CARB }
+              name: { type: string, example: 碳水车间 }
+        usageTypes:
+          type: array
+          items: { type: string }
+        deviceNames:
+          type: array
+          items: { type: string }
+        meters:
+          type: array
+          items: { $ref: '#/components/schemas/MeterBindingMeter' }
+
+    MeterBindingNamePayload:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, example: 碳水车间 }
+
+    MeterBindingTypePayload:
+      type: object
+      required: [workshopId, energy, name]
+      properties:
+        workshopId: { type: integer }
+        energy: { type: string, enum: [elec, water, steam] }
+        name: { type: string, example: 生产用电 }
+
+    MeterBindingDevicePayload:
+      type: object
+      required: [typeId, name]
+      properties:
+        typeId: { type: integer }
+        name: { type: string, example: 一线 }
+
+    MeterBindingMetersPayload:
+      type: object
+      required: [meterCodes]
+      properties:
+        meterCodes:
+          type: array
+          description: 空数组 = 解绑全部；同一块表允许出现在多个设备
+          items: { type: string }
+          example: [E-A1-01, E-A1-02]

@@ -51,6 +51,15 @@ _ADMIN_ROUTES = [
     ("meters", api.admin_meters, "admin-meters"),
     ("meters/<int:pk>", api.admin_meter_detail, "admin-meter-detail"),
     ("meters/<int:pk>/test", api.admin_meter_test, "admin-meter-test"),
+    # 计量绑定树（v1.7.4）：左侧车间/类型/设备 + 右侧计量点分配
+    ("meter-bindings/tree", api.admin_binding_tree, "admin-binding-tree"),
+    ("meter-binding-workshops", api.admin_binding_workshops, "admin-binding-workshops"),
+    ("meter-binding-workshops/<int:pk>", api.admin_binding_workshop_detail, "admin-binding-workshop-detail"),
+    ("meter-binding-types", api.admin_binding_types, "admin-binding-types"),
+    ("meter-binding-types/<int:pk>", api.admin_binding_type_detail, "admin-binding-type-detail"),
+    ("meter-binding-devices", api.admin_binding_devices, "admin-binding-devices"),
+    ("meter-binding-devices/<int:pk>", api.admin_binding_device_detail, "admin-binding-device-detail"),
+    ("meter-binding-devices/<int:pk>/meters", api.admin_binding_device_meters, "admin-binding-device-meters"),
     # 读取当前值：只读、不落库（与 /test 的区别见 api.admin_meter_current 的说明）
     ("meters/<int:pk>/current", api.admin_meter_current, "admin-meter-current"),
 ]

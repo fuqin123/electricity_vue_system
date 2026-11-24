@@ -544,7 +544,7 @@ docker compose ps                                      # 六个容器的健康�
 # 构建机（需能访问 npm / pypi / Docker Hub 或加速源）
 cd deploy/docker && cp .env.example .env
 ./build-offline-bundle.sh
-# → dist/eep-docker-bundle-v1.7.3-<日期>.tar.gz（三个镜像 + runtime/）
+# → dist/eep-docker-bundle-v1.7.4-<日期>.tar.gz（三个镜像 + runtime/）
 
 # 目标机（无需源码、无需外网，只要装了 docker + compose v2）
 tar xzf eep-docker-bundle-*.tar.gz
@@ -634,6 +634,29 @@ docker compose up -d
 - 验证方法：让一块表保持失败，观察 collector 日志出现「补采缺失点位 1/N」，
   而其他表在同一小时的 `energy_raw` 行数不再增加；
 - 若升级后仍每 5 分钟整轮重读，先确认镜像 tag/迁移 0019 是否真的生效。
+
+### 4.10 v1.7.4 升级（计量绑定树）
+
+```bash
+docker compose build backend frontend
+docker compose up -d
+# 迁移 0021 新建 4 张绑定树表，并把旧扁平绑定按车间名称转换后删除旧表
+```
+
+本版把「计量绑定」从一条条固定组合改成 **左树右点位** 的配置方式：
+
+- 左侧维护 `车间 → 类型 → 设备` 三层结构，可新增、改名、删除，允许先建空节点；
+- 右侧列出该设备能源类型下的全部现有计量点，勾选后保存；同一块表可分配给多个设备，
+  行内会提示「同时绑定于」哪些设备；
+- 绑定只决定查询口径，不复制、不修改 `energy_raw` / `energy_hourly`；删除节点只删
+  绑定关系，计量点本身和历史读数不受影响；
+- 某个能源只要存在「绑定设备 + 启用表」，电 / 水 / 汽计量页就**完全按绑定树**展示
+  第三级（全部设备 / 单设备 / 单块仪表）；没有绑定配置的能源仍按原始台账分类兜底；
+- 旧扁平绑定会在迁移 0021 中按车间名称转换成新树，避免升级丢配置；若现场希望从空树
+  重新配置，可在绑定页删除对应车间（只删口径，不删数据）；
+- 验证：设备合计应等于右侧勾选表之和；类型「全部设备」应等于该类型下所有设备计量点
+  去重之和；分类树返回的 `workshopCode` 为 `BWS-<id>`、`bindingDriven=true`。
+
 
 ## 五、方案 C：一键部署脚本
 

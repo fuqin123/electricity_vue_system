@@ -23,6 +23,14 @@
     PUT/DELETE  /api/admin/meters/{id}     修改 / 删除
     POST        /api/admin/meters/{id}/test          试采一次（**返回真实读数**，会更新最近读数）
     POST        /api/admin/meters/{id}/current       ★ 读取当前值（只读，**一处都不落库**）
+    GET         /api/admin/meter-bindings/tree        ★ 绑定树 + 计量点池（v1.7.4）
+    POST        /api/admin/meter-binding-workshops    新增绑定车间
+    PUT/DELETE  /api/admin/meter-binding-workshops/{id}
+    POST        /api/admin/meter-binding-types        新增绑定类型
+    PUT/DELETE  /api/admin/meter-binding-types/{id}
+    POST        /api/admin/meter-binding-devices      新增绑定设备
+    PUT/DELETE  /api/admin/meter-binding-devices/{id}
+    PUT         /api/admin/meter-binding-devices/{id}/meters  保存右侧勾选
     GET         /api/admin/collect-logs    采集日志（后台分页结构）
     GET         /api/admin/quality         数据质量（按产线）
 
@@ -45,7 +53,7 @@ from decimal import Decimal, InvalidOperation
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
-from django.db.models import Count, Max, Sum
+from django.db.models import Count, Max, Prefetch, Sum
 from django.http import HttpRequest, JsonResponse
 from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
@@ -65,6 +73,10 @@ from .models import (
     EnergyMeter,
     EnergyRaw,
     EnergyType,
+    MeterBindingAssignment,
+    MeterBindingDevice,
+    MeterBindingType,
+    MeterBindingWorkshop,
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
@@ -238,66 +250,210 @@ def _meter_node(m: EnergyMeter) -> ProductionLine:
     return m.line
 
 
+def _meter_category_device(m: EnergyMeter) -> dict:
+    """单个物理计量点 → 分类树叶子（原始模式与绑定模式的「单块仪表」共用）。"""
+    node = _meter_node(m)
+    return {
+        "code": m.code,
+        "name": m.name,
+        "deviceName": m.device_name or m.name,
+        # 第三级要既能显示设备、也要能定位到节点（产线 / 辅机 / 车间）
+        "nodeCode": node.line_code if node else None,
+        "nodeName": node.line_name if node else None,
+        "nodeType": node.node_type if node else None,
+        "lineCode": node.line_code if node and node.is_line else None,
+        "kind": m.type_code,
+        "kindLabel": m.energy_type.type_name,
+        "unit": m.unit,
+        "enabled": m.enabled,
+        "gateway": m.gateway.code if m.gateway else None,
+        # 生图/排障时直接显示「怎么读到的」
+        "address": meter_address(m),
+    }
+
+
+def _binding_category_tree(binding_devices) -> list[dict]:
+    """绑定树模式：车间 / 类型 / 设备完全按现场配置输出。
+
+    只要该能源存在「已绑定至少一块启用表」的设备，这一能源就切到绑定树模式，
+    不再返回原始按 `usage_type/device_name` 归类的树 —— 否则同一个页面会同时出现
+    两套分类（固定分类 + 自定义分类），选哪个都像，数字却可能不是一回事。
+
+    每个类型节点同时给：
+      · `bindings`：设备列表（第三级「已绑定设备」）；
+      · `devices`：该类型下所有设备引用到的物理表（去重，第三级「单块仪表」）。
+    """
+    workshops: dict[int, dict] = {}
+    for device in binding_devices:
+        btype = device.type
+        ws = btype.workshop
+        wnode = workshops.setdefault(
+            ws.id,
+            {
+                "workshop": ws.name,
+                "workshopCode": f"BWS-{ws.id}",
+                "bindingDriven": True,
+                "types": {},
+            },
+        )
+        tnode = wnode["types"].setdefault(
+            btype.id,
+            {
+                "id": btype.id,
+                "usageType": btype.name,
+                "energy": btype.energy_type.frontend_code,
+                "energyName": btype.energy_type.type_name,
+                "unit": btype.energy_type.unit,
+                "bindingDriven": True,
+                "sort": (btype.sort, btype.id),
+                "bindings": [],
+                "devices": {},
+            },
+        )
+        meters = [a.meter for a in device.assignments.all() if a.meter.enabled]
+        if not meters:
+            continue
+        tnode["bindings"].append(
+            {
+                "id": device.id,
+                "name": device.name,
+                "deviceName": device.name,
+                "usageType": btype.name,
+                "energy": btype.energy_type.frontend_code,
+                "unit": btype.energy_type.unit,
+                "meterCount": len(meters),
+                "meterCodes": [m.code for m in meters],
+                # 前端提示「这个设备由哪几块表组成」，不用再点进绑定页核对
+                "meterNames": [m.name for m in meters],
+                "sort": device.sort,
+                "bound": True,
+            }
+        )
+        for m in meters:
+            tnode["devices"][m.id] = _meter_category_device(m)
+
+    out: list[dict] = []
+    for w in workshops.values():
+        w["types"] = [
+            {
+                "id": t["id"],
+                "usageType": t["usageType"],
+                "energy": t["energy"],
+                "energyName": t["energyName"],
+                "unit": t["unit"],
+                "bindingDriven": True,
+                "deviceCount": len(t["bindings"]),
+                "bindings": t["bindings"],
+                "devices": list(t["devices"].values()),
+            }
+            for t in sorted(w["types"].values(), key=lambda x: x["sort"])
+        ]
+        out.append(w)
+    return out
+
+
 def _category_tree(energy_type: str | None = None) -> list[dict]:
     """按「车间 → 用能类型 → 设备」组织计量点，供后台三级联动筛选。
 
-    为什么由后端出这棵树而不是前端拿全量 meters 自己分组：
-      · 分组规则（车间解析、兜底命名、排序）必须与取数口径同源，
-        前端再实现一遍必然在某次改动后与后端不一致；
-      · 现场会不断加设备，前端硬编码分类迟早漏项。
+    两种模式（同一能源互斥）：
+
+      ① **绑定树模式**：只要该能源配置了「设备 + 至少一块启用表」，就完全按
+         绑定页维护的车间/类型/设备输出。分类不再依赖 `energy_meter.usage_type`
+         或 `device_name`，现场可以自由命名（v1.7.4 起）。
+      ② **原始模式**：还没有任何绑定配置时，退回按计量点台账的
+         `usage_type / device_name / 组织节点` 分组，保证旧页面开箱可用。
 
     结构：
-      [{ workshop, workshopCode, types: [
-            { usageType, devices: [
-                { code, name, deviceName, nodeCode, nodeName, kind, unit, enabled }
-            ]}]}]
+      [{ workshop, workshopCode, bindingDriven, types: [
+            { id, usageType, energy, bindingDriven, bindings: [...], devices: [...] }
+      ]}]
     """
+    type_code = _resolve_energy_type(energy_type).type_code if energy_type else None
+
+    visible_device_ids = MeterBindingAssignment.objects.filter(
+        meter__enabled=True
+    ).values("device_id")
+    binding_devices = MeterBindingDevice.objects.filter(
+        id__in=visible_device_ids
+    ).select_related("type__workshop", "type__energy_type").prefetch_related(
+        Prefetch(
+            "assignments",
+            queryset=MeterBindingAssignment.objects.select_related(
+                "meter__energy_type", "meter__line", "meter__line__parent"
+            ).order_by("sort", "id"),
+        )
+    )
+    if type_code:
+        binding_devices = binding_devices.filter(type__energy_type__type_code=type_code)
+    binding_devices = binding_devices.order_by(
+        "type__workshop__sort", "type__workshop_id",
+        "type__sort", "type_id", "sort", "id",
+    )
+    if binding_devices.exists():
+        return _binding_category_tree(binding_devices)
+
+    # ── 原始模式 ──
     qs = EnergyMeter.objects.select_related("line", "line__parent", "energy_type", "gateway")
-    if energy_type:
-        qs = qs.filter(energy_type__type_code=_resolve_energy_type(energy_type).type_code)
+    if type_code:
+        qs = qs.filter(energy_type__type_code=type_code)
     qs = qs.order_by(
         "line__parent__sort", "line__parent__line_code",
         "line__sort", "energy_type__sort", "usage_type", "code",
     )
 
-    # 用有序 dict 逐层归集，保证输出顺序稳定（前端下拉不会每次刷新换顺序）
     workshops: dict[str, dict] = {}
     for m in qs:
         ws = m.workshop
         ws_code = ws.line_code if ws else "__none__"
         ws_name = ws.line_name if ws else "未归属车间"
-
-        wnode = workshops.setdefault(ws_code, {"workshop": ws_name, "workshopCode": ws_code, "types": {}})
+        wnode = workshops.setdefault(
+            ws_code,
+            {
+                "workshop": ws_name,
+                "workshopCode": ws_code,
+                "bindingDriven": False,
+                "types": {},
+            },
+        )
         # 未填 usage_type 时按能源类型兜底命名，避免界面出现空白选项
         usage = m.usage_type or f"{m.energy_type.type_name}（未分类）"
-        tnode = wnode["types"].setdefault(usage, {"usageType": usage, "devices": []})
-
-        node = _meter_node(m)
-        tnode["devices"].append(
+        tnode = wnode["types"].setdefault(
+            usage,
             {
-                "code": m.code,
-                "name": m.name,
-                "deviceName": m.device_name or m.name,
-                # 第三级要既能显示设备、也要能定位到节点（产线 / 辅机 / 车间）
-                "nodeCode": node.line_code if node else None,
-                "nodeName": node.line_name if node else None,
-                "nodeType": node.node_type if node else None,
-                "lineCode": node.line_code if node and node.is_line else None,
-                "kind": m.type_code,
-                "kindLabel": m.energy_type.type_name,
-                "unit": m.unit,
-                "enabled": m.enabled,
-                "gateway": m.gateway.code if m.gateway else None,
-                # 生图/排障时直接显示「怎么读到的」
-                "address": meter_address(m),
-            }
+                "id": None,
+                "usageType": usage,
+                "energy": m.energy_type.frontend_code,
+                "energyName": m.energy_type.type_name,
+                "unit": m.energy_type.unit,
+                "bindingDriven": False,
+                "deviceCount": 0,
+                "bindings": [],
+                "devices": [],
+            },
         )
+        tnode["devices"].append(_meter_category_device(m))
 
+    # 现场最常用的是生产线用电，其次辅机/瓶胚/调配；纯按字符串排序会把「瓶胚用电」
+    # 排到第一，打开页面先看到的不是主要口径。
+    usage_order = {"生产线用电": 0, "辅机用电": 1, "瓶胚用电": 2, "调配用电": 3}
     out: list[dict] = []
     for w in workshops.values():
         w["types"] = [
-            {"usageType": t["usageType"], "devices": t["devices"]}
-            for t in sorted(w["types"].values(), key=lambda x: x["usageType"])
+            {
+                "id": t["id"],
+                "usageType": t["usageType"],
+                "energy": t["energy"],
+                "energyName": t["energyName"],
+                "unit": t["unit"],
+                "bindingDriven": False,
+                "deviceCount": 0,
+                "bindings": [],
+                "devices": t["devices"],
+            }
+            for t in sorted(
+                w["types"].values(),
+                key=lambda x: (usage_order.get(x["usageType"], 50), x["usageType"]),
+            )
         ]
         out.append(w)
     return out
@@ -887,10 +1043,17 @@ def meter_categories(request: HttpRequest) -> JsonResponse:
              （电计量页传 elec、水计量页传 water、汽计量页传 steam；
                不传则返回全部，供调试与后续「用量查询」页复用）
 
-    返回：[{ workshop, workshopCode, types: [{ usageType, devices: [...] }] }]
-      第一级 车间     碳水车间 / 制造车间
-      第二级 用能类型 生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电 / 车间蒸汽 …
-      第三级 设备     生产线 / 吹瓶机 / 冰水机和水塔 / 市政水表1 …
+    两种模式（同一能源互斥，见 `_category_tree`）：
+      ① 绑定树模式：该能源只要有一个「设备 + 启用表」，就完全按绑定页维护的
+         车间 / 类型 / 设备输出。`workshopCode` 为 `BWS-<绑定车间ID>`，
+         `bindingDriven=true`；每个类型带 `bindings`（设备）与 `devices`（被引用的
+         物理表，供「单块仪表」查询）。
+      ② 原始模式：没有绑定配置时按计量点台账的 usage_type / device_name 分组。
+
+    结构：
+      [{ workshop, workshopCode, bindingDriven, types: [
+            { id, usageType, energy, bindingDriven, bindings: [...], devices: [...] }
+      ]}]
 
     ⚠ 与「大屏」无关：本接口只为后台的筛选下拉服务，大屏接口一律不动。
     """
@@ -899,7 +1062,13 @@ def meter_categories(request: HttpRequest) -> JsonResponse:
         tree = _category_tree(kind)
     except EnergyType.DoesNotExist:
         return json_err(f"未知能源类型：{kind}（可选 elec / water / steam）")
-    return json_ok({"tree": tree, "count": sum(len(t["devices"]) for w in tree for t in w["types"])})
+    return json_ok(
+        {
+            "tree": tree,
+            "count": sum(len(t["devices"]) for w in tree for t in w["types"]),
+            "bindingCount": sum(len(t.get("bindings", [])) for w in tree for t in w["types"]),
+        }
+    )
 
 
 @require_GET
@@ -921,6 +1090,13 @@ def usage_range(request: HttpRequest) -> JsonResponse:
                          **不属于任何单条产线**的计量单元（现场接口表里它们的
                          「线别」列写的是设备组合名）。
                          任一项给定即进入「焦点」通道，只返回该范围一条序列。
+      binding           ★ v1.7.4 绑定设备 ID：按该设备在绑定页勾选的计量点出数。
+      bindingType       ★ v1.7.4 绑定类型 ID：合并该类型下所有设备的计量点
+                         （去重）出数，用于第三级选「全部设备」。
+      meter             ★ v1.7.4 单表查询：计量点编码，只看这一块表。
+                         meter 优先于 binding / bindingType，binding 优先于
+                         bindingType；与 kind、workshop 冲突时一律 400，
+                         不静默退化成另一个口径。
                          ⚠ 参数名**驼峰与下划线都收**（`usageType` = `usage_type`，
                            `nodeCode` = `node`）—— 前端发驼峰、手敲/脚本习惯下划线，
                            只认一种会让另一种被静默忽略、退化成车间全量口径。
@@ -993,21 +1169,46 @@ def usage_range(request: HttpRequest) -> JsonResponse:
                 return v
         return None
 
-    data = ranges.usage_range(
-        start,
-        end,
-        granularity=granularity,
-        scope=scope,
-        line_code=line_code,
-        now=now,
-        start_at=start_at,
-        end_at=end_at,
-        kind=q("kind"),
-        workshop=q("workshop"),
-        usage_type=q("usage_type", "usageType", "usage"),
-        device=q("device", "deviceName"),
-        node_code=q("node", "nodeCode", "node_code"),
-    )
+    binding_raw = q("binding", "bindingId", "binding_id")
+    binding_id: int | None = None
+    if binding_raw:
+        try:
+            binding_id = int(binding_raw)
+        except ValueError:
+            return json_err(f"binding 必须是绑定设备 ID（数字），收到 {binding_raw}")
+
+    binding_type_raw = q("bindingType", "binding_type", "binding_type_id")
+    binding_type_id: int | None = None
+    if binding_type_raw:
+        try:
+            binding_type_id = int(binding_type_raw)
+        except ValueError:
+            return json_err(
+                f"bindingType 必须是绑定类型 ID（数字），收到 {binding_type_raw}"
+            )
+
+    try:
+        data = ranges.usage_range(
+            start,
+            end,
+            granularity=granularity,
+            scope=scope,
+            line_code=line_code,
+            now=now,
+            start_at=start_at,
+            end_at=end_at,
+            kind=q("kind"),
+            workshop=q("workshop"),
+            usage_type=q("usage_type", "usageType", "usage"),
+            device=q("device", "deviceName"),
+            node_code=q("node", "nodeCode", "node_code"),
+            binding_id=binding_id,
+            binding_type_id=binding_type_id,
+            meter_code=q("meter", "meterCode", "meter_code"),
+        )
+    except ValueError as exc:
+        # 绑定 / 单表不存在、跨车间、跨能源 —— 一律明确报错，不静默退化成别的口径
+        return json_err(str(exc))
     data["cadence"] = slots.describe()
     data["serverDate"] = day.isoformat()
     data["fromHour"] = start_at.strftime("%Y-%m-%d %H:%M")
@@ -1777,6 +1978,388 @@ def admin_quality(request: HttpRequest) -> JsonResponse:
 def admin_collect_logs(request: HttpRequest) -> JsonResponse:
     rows = [collect_log_json(r) for r in EnergyCollectLog.objects.select_related("gateway").order_by("-started_at")[:500]]
     return json_ok(_paged(request, rows))
+
+
+# ── 计量绑定（v1.7.4）─────────────────────────────────────────
+
+
+def binding_meter_json(m: EnergyMeter) -> dict:
+    ws = m.workshop
+    node = m.line
+    return {
+        "id": m.id,
+        "code": m.code,
+        "name": m.name,
+        "energy": m.energy_type.frontend_code,
+        "energyName": m.energy_type.type_name,
+        "unit": m.unit,
+        "workshopCode": ws.line_code if ws else "",
+        "workshopName": ws.line_name if ws else "",
+        "nodeCode": node.line_code if node else "",
+        "nodeName": node.line_name if node else "",
+        "nodeType": node.node_type if node else "",
+        "usageType": m.usage_type,
+        "deviceName": m.device_name or m.name,
+        "enabled": m.enabled,
+    }
+
+
+def _binding_device_json(device: MeterBindingDevice, btype: MeterBindingType, workshop: MeterBindingWorkshop) -> dict:
+    meters = [binding_meter_json(a.meter) for a in device.assignments.all()]
+    return {
+        "id": device.id,
+        "name": device.name,
+        "deviceName": device.name,
+        "sort": device.sort,
+        "typeId": btype.id,
+        "typeName": btype.name,
+        "workshopId": workshop.id,
+        "workshopName": workshop.name,
+        "energy": btype.energy_type.frontend_code,
+        "energyName": btype.energy_type.type_name,
+        "unit": btype.energy_type.unit,
+        "meterCodes": [m["code"] for m in meters],
+        "meterCount": len(meters),
+        "meters": meters,
+    }
+
+
+def _binding_type_json(btype: MeterBindingType, workshop: MeterBindingWorkshop) -> dict:
+    devices = [_binding_device_json(d, btype, workshop) for d in btype.devices.all()]
+    meter_codes = {
+        m["code"]
+        for d in devices
+        for m in d["meters"]
+    }
+    return {
+        "id": btype.id,
+        "name": btype.name,
+        "usageType": btype.name,
+        "energy": btype.energy_type.frontend_code,
+        "energyName": btype.energy_type.type_name,
+        "unit": btype.energy_type.unit,
+        "sort": btype.sort,
+        "devices": devices,
+        "meterCount": len(meter_codes),
+    }
+
+
+def _binding_workshop_json(ws: MeterBindingWorkshop) -> dict:
+    types = [_binding_type_json(t, ws) for t in ws.types.all()]
+    meter_codes = {
+        m
+        for t in types
+        for d in t["devices"]
+        for m in d["meterCodes"]
+    }
+    return {
+        "id": ws.id,
+        "name": ws.name,
+        "sort": ws.sort,
+        "types": types,
+        "typeCount": len(types),
+        "meterCount": len(meter_codes),
+    }
+
+
+def _binding_options() -> dict:
+    """绑定页右侧的计量点池 + 左侧新增时的名称建议。"""
+    energies = [
+        {"code": e.frontend_code, "name": e.type_name, "unit": e.unit}
+        for e in EnergyType.objects.filter(enabled=True).order_by("sort", "id")
+    ]
+    meters = [
+        binding_meter_json(m)
+        for m in EnergyMeter.objects.select_related("line", "line__parent", "energy_type")
+        .order_by("energy_type__sort", "line__sort", "code")
+    ]
+    return {
+        "energies": energies,
+        "meters": meters,
+        "workshops": [
+            {"code": ws.line_code, "name": ws.line_name}
+            for ws in ProductionLine.workshops_qs().order_by("sort", "line_code")
+        ],
+        # 新建类型/设备时的建议词，全部来自现有计量点台账，不写死任何分类
+        "usageTypes": sorted({m["usageType"] for m in meters if m["usageType"]}),
+        "deviceNames": sorted({m["deviceName"] for m in meters if m["deviceName"]}),
+    }
+
+
+def _binding_assignment_queryset():
+    return MeterBindingAssignment.objects.select_related(
+        "meter__energy_type", "meter__line", "meter__line__parent"
+    ).order_by("sort", "id")
+
+
+def _binding_tree_queryset():
+    return MeterBindingWorkshop.objects.prefetch_related(
+        Prefetch(
+            "types",
+            queryset=MeterBindingType.objects.select_related("energy_type").order_by("sort", "id"),
+        ),
+        Prefetch(
+            "types__devices",
+            queryset=MeterBindingDevice.objects.prefetch_related(
+                Prefetch("assignments", queryset=_binding_assignment_queryset())
+            ).order_by("sort", "id"),
+        ),
+    ).order_by("sort", "id")
+
+
+def _binding_device_queryset():
+    return MeterBindingDevice.objects.select_related(
+        "type__workshop", "type__energy_type"
+    ).prefetch_related(
+        Prefetch("assignments", queryset=_binding_assignment_queryset())
+    )
+
+
+def _binding_name(body: dict, label: str, fallback: str = "") -> tuple[str, str | None]:
+    raw = body.get("name") if "name" in body else fallback
+    name = str(raw or "").strip()
+    if not name:
+        return "", f"{label}不能为空"
+    if len(name) > 64:
+        return "", f"{label}不能超过 64 个字"
+    return name, None
+
+
+def _binding_sort(body: dict, default: int = 0) -> int:
+    try:
+        return max(0, min(9999, int(body.get("sort", default) or 0)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _binding_body(request: HttpRequest) -> dict | JsonResponse:
+    try:
+        return _body(request)
+    except ValueError as exc:
+        return json_err(str(exc))
+
+
+def _binding_energy(body: dict) -> tuple[EnergyType | None, str | None]:
+    try:
+        return _resolve_energy_type(body.get("energy")), None
+    except EnergyType.DoesNotExist:
+        return None, "能源类型必须是 electric / water / steam 之一"
+
+
+@require_GET
+def admin_binding_tree(request: HttpRequest) -> JsonResponse:
+    """绑定树（左侧车间/类型/设备 + 右侧计量点池）。
+
+    三层节点都可以先建空壳再绑定表，因此树由三张独立表组成，不是扁平的
+    「一条绑定必须至少有一块表」。查询计量页时，只要某能源有「设备 + 启用表」，
+    就按这棵树出分类；没有绑定配置的能源仍用原始台账分类兜底。
+    """
+    return json_ok(
+        {
+            "workshops": [_binding_workshop_json(ws) for ws in _binding_tree_queryset()],
+            "options": _binding_options(),
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def admin_binding_workshops(request: HttpRequest) -> JsonResponse:
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    name, error = _binding_name(body, "车间名称")
+    if error:
+        return json_err(error)
+    if MeterBindingWorkshop.objects.filter(name=name).exists():
+        return json_err(f"车间已存在：{name}", status=409)
+    ws = MeterBindingWorkshop.objects.create(name=name, sort=_binding_sort(body))
+    return json_ok({"workshop": _binding_workshop_json(ws)})
+
+
+@csrf_exempt
+@require_http_methods(["PUT", "DELETE"])
+def admin_binding_workshop_detail(request: HttpRequest, pk: int) -> JsonResponse:
+    ws = MeterBindingWorkshop.objects.filter(pk=pk).first()
+    if ws is None:
+        return json_err(f"绑定车间不存在：{pk}", status=404, code="BINDING_WORKSHOP_NOT_FOUND")
+    if request.method == "DELETE":
+        ws.delete()
+        return json_ok({"deleted": pk})
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    name, error = _binding_name(body, "车间名称", fallback=ws.name)
+    if error:
+        return json_err(error)
+    if MeterBindingWorkshop.objects.filter(name=name).exclude(pk=ws.pk).exists():
+        return json_err(f"车间已存在：{name}", status=409)
+    ws.name = name
+    ws.sort = _binding_sort(body, ws.sort)
+    ws.save(update_fields=["name", "sort", "updated_at"])
+    return json_ok({"workshop": _binding_workshop_json(ws)})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def admin_binding_types(request: HttpRequest) -> JsonResponse:
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    workshop_id = body.get("workshopId") or body.get("workshop_id")
+    ws = MeterBindingWorkshop.objects.filter(pk=workshop_id).first()
+    if ws is None:
+        return json_err("车间不存在，无法新增类型")
+    energy, error = _binding_energy(body)
+    if error:
+        return json_err(error)
+    assert energy is not None
+    name, error = _binding_name(body, "类型名称")
+    if error:
+        return json_err(error)
+    if MeterBindingType.objects.filter(
+        workshop=ws, energy_type=energy, name=name
+    ).exists():
+        return json_err(f"该车间下已存在类型：{name}", status=409)
+    btype = MeterBindingType.objects.create(
+        workshop=ws, energy_type=energy, name=name, sort=_binding_sort(body)
+    )
+    return json_ok({"type": _binding_type_json(btype, ws)})
+
+
+@csrf_exempt
+@require_http_methods(["PUT", "DELETE"])
+def admin_binding_type_detail(request: HttpRequest, pk: int) -> JsonResponse:
+    btype = MeterBindingType.objects.select_related("workshop", "energy_type").filter(pk=pk).first()
+    if btype is None:
+        return json_err(f"绑定类型不存在：{pk}", status=404, code="BINDING_TYPE_NOT_FOUND")
+    if request.method == "DELETE":
+        btype.delete()
+        return json_ok({"deleted": pk})
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    raw_energy = body.get("energy")
+    if raw_energy not in (None, ""):
+        energy, error = _binding_energy(body)
+        if error:
+            return json_err(error)
+        if energy is not None and energy.id != btype.energy_type_id:
+            return json_err("类型能源不可修改；如需更换请删除后重建")
+    name, error = _binding_name(body, "类型名称", fallback=btype.name)
+    if error:
+        return json_err(error)
+    if MeterBindingType.objects.filter(
+        workshop=btype.workshop, energy_type_id=btype.energy_type_id, name=name
+    ).exclude(pk=btype.pk).exists():
+        return json_err(f"该车间下已存在类型：{name}", status=409)
+    btype.name = name
+    btype.sort = _binding_sort(body, btype.sort)
+    btype.save(update_fields=["name", "sort", "updated_at"])
+    return json_ok({"type": _binding_type_json(btype, btype.workshop)})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def admin_binding_devices(request: HttpRequest) -> JsonResponse:
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    type_id = body.get("typeId") or body.get("type_id")
+    btype = MeterBindingType.objects.select_related("workshop", "energy_type").filter(pk=type_id).first()
+    if btype is None:
+        return json_err("类型不存在，无法新增设备")
+    name, error = _binding_name(body, "设备名称")
+    if error:
+        return json_err(error)
+    if MeterBindingDevice.objects.filter(type=btype, name=name).exists():
+        return json_err(f"该类型下已存在设备：{name}", status=409)
+    device = MeterBindingDevice.objects.create(
+        type=btype, name=name, sort=_binding_sort(body)
+    )
+    return json_ok({"device": _binding_device_json(device, btype, btype.workshop)})
+
+
+@csrf_exempt
+@require_http_methods(["PUT", "DELETE"])
+def admin_binding_device_detail(request: HttpRequest, pk: int) -> JsonResponse:
+    device = _binding_device_queryset().filter(pk=pk).first()
+    if device is None:
+        return json_err(f"绑定设备不存在：{pk}", status=404, code="BINDING_DEVICE_NOT_FOUND")
+    if request.method == "DELETE":
+        device.delete()
+        return json_ok({"deleted": pk})
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    name, error = _binding_name(body, "设备名称", fallback=device.name)
+    if error:
+        return json_err(error)
+    if MeterBindingDevice.objects.filter(type_id=device.type_id, name=name).exclude(pk=device.pk).exists():
+        return json_err(f"该类型下已存在设备：{name}", status=409)
+    device.name = name
+    device.sort = _binding_sort(body, device.sort)
+    device.save(update_fields=["name", "sort", "updated_at"])
+    return json_ok({"device": _binding_device_json(device, device.type, device.type.workshop)})
+
+
+@csrf_exempt
+@require_http_methods(["PUT"])
+def admin_binding_device_meters(request: HttpRequest, pk: int) -> JsonResponse:
+    """替换选中设备绑定的计量点（右侧勾选保存）。
+
+    允许空数组 = 解绑全部；允许同一块表出现在多个设备中（共享辅机表现场存在），
+    计量页会按设备分别求和，并在绑定页提示「同时绑定于哪些设备」。
+    """
+    device = _binding_device_queryset().filter(pk=pk).first()
+    if device is None:
+        return json_err(f"绑定设备不存在：{pk}", status=404, code="BINDING_DEVICE_NOT_FOUND")
+    body = _binding_body(request)
+    if isinstance(body, JsonResponse):
+        return body
+    raw = body.get("meterCodes")
+    if raw is None:
+        raw = body.get("meter_codes")
+    if not isinstance(raw, list):
+        return json_err("meterCodes 必须是计量点编码数组")
+    codes: list[str] = []
+    for value in raw:
+        code = str(value or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+
+    meters = list(
+        EnergyMeter.objects.select_related("energy_type", "line", "line__parent")
+        .filter(code__in=codes)
+        .order_by("code")
+    )
+    found = {m.code for m in meters}
+    missing = [c for c in codes if c not in found]
+    if missing:
+        return json_err("计量点不存在：" + "、".join(missing))
+    wrong_energy = [
+        m.code for m in meters if m.energy_type_id != device.type.energy_type_id
+    ]
+    if wrong_energy:
+        return json_err(
+            f"计量点能源类型与设备类型不一致：{'、'.join(wrong_energy)}"
+        )
+
+    with transaction.atomic():
+        device.assignments.all().delete()
+        MeterBindingAssignment.objects.bulk_create(
+            [
+                MeterBindingAssignment(device=device, meter=m, sort=idx)
+                for idx, m in enumerate(meters)
+            ]
+        )
+    device = _binding_device_queryset().get(pk=pk)
+    return json_ok(
+        {
+            "device": _binding_device_json(device, device.type, device.type.workshop),
+            "saved": len(meters),
+        }
+    )
 
 
 # ── 网关读写 ──────────────────────────────────────────────────

@@ -221,9 +221,13 @@ export const energyApi = {
    * @param usageType   用能类型，如「生产线用电」
    * @param device      设备名
    * @param node        组织节点编码（产线 / 辅助单元 / 车间）
+   * @param binding     ★ v1.7.4 绑定设备 ID（按该设备勾选的表求和）
+   * @param bindingType ★ v1.7.4 绑定类型 ID（合并该类型下全部设备，去重）
+   * @param meter       ★ v1.7.4 单表查询：计量点编码
    *
-   * ⚠ usageType / device / node 任一给定即进入「焦点」通道，只返回一条序列
-   *   —— 用户已经在看具体设备，再叠一整套产线序列只会让图变成一锅粥。
+   * ⚠ usageType / device / node / binding / meter 任一给定即进入「焦点」通道，
+   *   只返回一条序列 —— 用户已经在看具体设备，再叠一整套产线序列只会让图变成一锅粥。
+   *   binding 优先于三级维度，meter 优先于设备合计。
    */
   async getRange(params: {
     from?: string;
@@ -237,6 +241,9 @@ export const energyApi = {
     usageType?: string;
     device?: string;
     node?: string;
+    binding?: number;
+    bindingType?: number;
+    meter?: string;
   }): Promise<UsageRangeResult> {
     if (!useApi('energy.range')) {
       const empty: UsageRangeResult = {
@@ -266,7 +273,10 @@ export const energyApi = {
         workshop: params.workshop,
         usage_type: params.usageType,
         device: params.device,
-        node: params.node
+        node: params.node,
+        binding: params.binding,
+        binding_type: params.bindingType,
+        meter: params.meter
       }
     });
   },
@@ -465,6 +475,108 @@ export const adminApi = {
     }
     return request<PageResult<MeterPoint>>('/api/admin/meters', { params: query as Record<string, string> });
   },
+
+  /* ── 计量绑定树（v1.7.4）────────────────────────────────── */
+  /** 左侧车间/类型/设备树 + 右侧计量点池 */
+  async getBindingTree(): Promise<MeterBindingTreeResult> {
+    if (!useApi('admin.meterBindings')) {
+      return delay(
+        {
+          workshops: [],
+          options: { energies: [], meters: [], workshops: [], usageTypes: [], deviceNames: [] }
+        },
+        120
+      );
+    }
+    return request<MeterBindingTreeResult>('/api/admin/meter-bindings/tree');
+  },
+
+  async createBindingWorkshop(
+    payload: MeterBindingWorkshopPayload
+  ): Promise<{ workshop: MeterBindingWorkshopNode }> {
+    return request<{ workshop: MeterBindingWorkshopNode }>('/api/admin/meter-binding-workshops', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async updateBindingWorkshop(
+    id: number,
+    payload: MeterBindingWorkshopPayload
+  ): Promise<{ workshop: MeterBindingWorkshopNode }> {
+    return request<{ workshop: MeterBindingWorkshopNode }>(
+      `/api/admin/meter-binding-workshops/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) }
+    );
+  },
+
+  async deleteBindingWorkshop(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/meter-binding-workshops/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async createBindingType(
+    payload: MeterBindingTypePayload
+  ): Promise<{ type: MeterBindingTypeNode }> {
+    return request<{ type: MeterBindingTypeNode }>('/api/admin/meter-binding-types', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async updateBindingType(
+    id: number,
+    payload: MeterBindingTypeUpdatePayload
+  ): Promise<{ type: MeterBindingTypeNode }> {
+    return request<{ type: MeterBindingTypeNode }>(`/api/admin/meter-binding-types/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async deleteBindingType(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/meter-binding-types/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async createBindingDevice(
+    payload: MeterBindingDevicePayload
+  ): Promise<{ device: MeterBindingDeviceNode }> {
+    return request<{ device: MeterBindingDeviceNode }>('/api/admin/meter-binding-devices', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async updateBindingDevice(
+    id: number,
+    payload: MeterBindingDeviceUpdatePayload
+  ): Promise<{ device: MeterBindingDeviceNode }> {
+    return request<{ device: MeterBindingDeviceNode }>(
+      `/api/admin/meter-binding-devices/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) }
+    );
+  },
+
+  async deleteBindingDevice(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/meter-binding-devices/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
+  /** 保存右侧勾选：替换该设备绑定的全部计量点（空数组 = 全部解绑） */
+  async setBindingDeviceMeters(
+    id: number,
+    meterCodes: string[]
+  ): Promise<{ device: MeterBindingDeviceNode; saved: number }> {
+    return request<{ device: MeterBindingDeviceNode; saved: number }>(
+      `/api/admin/meter-binding-devices/${id}/meters`,
+      { method: 'PUT', body: JSON.stringify({ meterCodes }) }
+    );
+  },
+
   async getGateways(): Promise<Gateway[]> {
     if (!useApi('admin.gateways')) return delay(mockGateways(), 140);
     return request<Gateway[]>('/api/admin/gateways');
@@ -660,22 +772,172 @@ export interface MeterCategoryDevice {
   address: string;
 }
 
+/**
+ * 绑定设备（v1.7.4）—— 一组计量点组成一个可查询的「设备」。
+ *
+ * 与 `MeterCategoryDevice` 的区别：后者是一块**物理表**，前者是绑定页
+ * 左侧配置的查询口径。查询时传 `binding`（设备 ID），后端按这组表求和。
+ */
+export interface MeterCategoryBinding {
+  id: number;
+  /** 设备名称，如「一线 / 冰水 / 高压」 */
+  name: string;
+  deviceName: string;
+  usageType: string;
+  energy: 'elec' | 'water' | 'steam';
+  unit: string;
+  meterCount: number;
+  meterCodes: string[];
+  meterNames: string[];
+  /** 该绑定的显示顺序（小在前） */
+  sort: number;
+  /** 恒为 true；保留字段用于前端区分「绑定」与「物理表」 */
+  bound: true;
+}
+
 export interface MeterCategoryType {
+  /** 绑定树模式下的类型 ID；原始模式为 null */
+  id: number | null;
   /** 用能类型，如「生产线用电」「辅机用电」 */
   usageType: string;
+  energy?: 'elec' | 'water' | 'steam';
+  energyName?: string;
+  unit?: string;
+  /**
+   * true = 该能源已切到绑定树模式：第三级只展示绑定设备/单块仪表，
+   * 不再按物理表的 node/device_name 生成「节点/设备」分组。
+   */
+  bindingDriven?: boolean;
+  /** 绑定树模式下的设备数（原始模式为 0） */
+  deviceCount?: number;
+  /** 已配置的绑定设备（可为空） */
+  bindings: MeterCategoryBinding[];
   devices: MeterCategoryDevice[];
 }
 
 export interface MeterCategoryWorkshop {
   workshop: string;
+  /** 绑定树车间为 BWS-<id>，原始模式为 production_line.line_code */
   workshopCode: string;
+  /** true = 该车间来自绑定树 */
+  bindingDriven?: boolean;
   types: MeterCategoryType[];
 }
 
 export interface MeterCategoryResult {
   tree: MeterCategoryWorkshop[];
-  /** 树里设备总数，用于「共 N 个计量点」的提示 */
+  /** 树里的物理计量点总数 */
   count: number;
+  /** 树里的绑定设备数 */
+  bindingCount?: number;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   计量绑定（后台配置，v1.7.4）
+   ══════════════════════════════════════════════════════════════ */
+
+export type MeterBindingEnergy = 'elec' | 'water' | 'steam';
+
+/** 绑定页可选的一块计量点（带车间 / 节点 / 分类，供表单分组与过滤） */
+export interface MeterBindingMeter {
+  id: number;
+  code: string;
+  name: string;
+  energy: MeterBindingEnergy;
+  energyName: string;
+  unit: string;
+  workshopCode: string;
+  workshopName: string;
+  nodeCode: string;
+  nodeName: string;
+  nodeType: 'line' | 'aux' | 'workshop' | string;
+  usageType: string;
+  deviceName: string;
+  enabled: boolean;
+}
+
+/** 绑定树 · 设备节点（左侧第三级；右侧勾选的计量点挂在这里） */
+export interface MeterBindingDeviceNode {
+  id: number;
+  name: string;
+  deviceName: string;
+  sort: number;
+  typeId: number;
+  typeName: string;
+  workshopId: number;
+  workshopName: string;
+  energy: MeterBindingEnergy;
+  energyName: string;
+  unit: string;
+  meterCodes: string[];
+  meterCount: number;
+  meters: MeterBindingMeter[];
+}
+
+/** 绑定树 · 类型节点（第二级） */
+export interface MeterBindingTypeNode {
+  id: number;
+  name: string;
+  usageType: string;
+  energy: MeterBindingEnergy;
+  energyName: string;
+  unit: string;
+  sort: number;
+  devices: MeterBindingDeviceNode[];
+  meterCount: number;
+}
+
+/** 绑定树 · 车间节点（第一级） */
+export interface MeterBindingWorkshopNode {
+  id: number;
+  name: string;
+  sort: number;
+  types: MeterBindingTypeNode[];
+  typeCount: number;
+  meterCount: number;
+}
+
+export interface MeterBindingOptions {
+  /** 真实组织车间（仅用于新建绑定车间时的名称建议） */
+  workshops: { code: string; name: string }[];
+  energies: { code: MeterBindingEnergy; name: string; unit: string }[];
+  /** 现有计量台账里的用能类型 / 设备名，仅作建议词 */
+  usageTypes: string[];
+  deviceNames: string[];
+  meters: MeterBindingMeter[];
+}
+
+export interface MeterBindingTreeResult {
+  workshops: MeterBindingWorkshopNode[];
+  options: MeterBindingOptions;
+}
+
+export interface MeterBindingWorkshopPayload {
+  name: string;
+  sort?: number;
+}
+
+export interface MeterBindingTypePayload {
+  workshopId: number;
+  energy: MeterBindingEnergy;
+  name: string;
+  sort?: number;
+}
+
+export interface MeterBindingTypeUpdatePayload {
+  name?: string;
+  sort?: number;
+}
+
+export interface MeterBindingDevicePayload {
+  typeId: number;
+  name: string;
+  sort?: number;
+}
+
+export interface MeterBindingDeviceUpdatePayload {
+  name?: string;
+  sort?: number;
 }
 
 export interface UsageRangeResult {
@@ -684,6 +946,12 @@ export interface UsageRangeResult {
   granularity: 'hour' | 'day' | 'month';
   scope: string;
   line?: string | null;
+  /** 本次查询命中的绑定设备 ID（v1.7.4） */
+  binding?: number;
+  /** 本次查询命中的绑定类型 ID（v1.7.4，「全部设备」） */
+  bindingType?: number;
+  /** 本次查询命中的单表编码（v1.7.4） */
+  meter?: string;
   labels: string[];
   series: UsageRangeSeries[];
   /** 每个时间桶的数据质量（车间序列才有，用于标出缺数段） */

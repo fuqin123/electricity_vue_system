@@ -1,6 +1,6 @@
 # 接口契约（API Contract）
 
-> 版本：v1.7.3 ｜ 最后更新：2026-11-02
+> 版本：v1.7.4 ｜ 最后更新：2026-11-11
 >
 > **本文件是前后端的唯一约定。** 前端已按本契约预留好取数层
 > （`frontend/packages/shared/src/api/index.ts`），
@@ -36,6 +36,8 @@
 | `GET /api/admin/readings` | ✅ v1.6.0 增补 | 原始累计读数；每行带「上一小时差值」`hourUsage` 与状态 |
 | `GET/PUT/DELETE /api/admin/standard-units` | ✅ v1.7.0 已实现 | 标准单耗（产线 + 瓶型容量，电/水/汽三列），支持筛选/新增/修改/删除 |
 | `GET/PUT /api/admin/energy-prices` | ✅ v1.7.0 已实现 | 能源单价（电价/水价/汽价），底层同 `system_param` |
+| `GET /api/energy/meter-categories` | ✅ v1.5.2 已实现；v1.7.4 增补绑定树 | 车间 → 用能类型 → 设备三级树；v1.7.4 起该能源配置绑定时按绑定树输出，未配置时按原始台账兜底 |
+| `GET /api/admin/meter-bindings/tree` + 绑定树 CRUD | ✅ v1.7.4 已实现 | 车间 / 类型 / 设备三层可编辑；右侧按设备勾选计量点，只影响查询口径 |
 | `/api/admin/*` 其余（系统管理、操作/登录日志、报表） | ⬜ 未实现 | 前端这些域暂走演示数据（`dataConfig.mockOnly`）；**告警已移出该清单，不再有演示数据** |
 
 > ⚠ v1.2.1 修复：admin 组接口曾误挂在 `/api/energy/admin/*` 下导致前端 404（B-404），
@@ -501,7 +503,7 @@
 | :--- | :--- |
 | `workshop` | 车间编码，如 `WS-CARB`（含该车间下的产线与辅助单元） |
 | `usage_type` | 用能类型，如 `生产线用电` |
-| `device` | 设备名，如 `冰水机和水塔` |
+| `device` | 设备名，如 `吹瓶机` / `冰水` / `高压` |
 | `node` | 组织节点编码（产线 `W103` / 辅助单元 `AUX-CARB-AIR`） |
 
 行为：
@@ -613,6 +615,136 @@
 ```
 
 未写 `data_type` 时按 `uint32` 登记（现场 13 块电表的既有口径，行为不变）。
+
+---
+
+## 〇·补九、v1.7.4 变更（计量绑定树 + 按设备查询）★ 计量页查询必读
+
+计量绑定改为 **左树右点位**：左侧 `车间 → 类型 → 设备` 可自由增删改，
+右侧给选中设备勾选现有计量点。绑定树是**查询口径配置**，不复制、不修改原始读数。
+
+### 1) 绑定树结构接口
+
+| 接口 | 说明 |
+| :--- | :--- |
+| `GET /api/admin/meter-bindings/tree` | 返回完整绑定树 + 右侧计量点池 / 能源 / 建议词 |
+| `POST /api/admin/meter-binding-workshops` | 新增车间 `{ name }` |
+| `PUT/DELETE /api/admin/meter-binding-workshops/{id}` | 改名 / 删除车间（级联类型、设备、绑定关系） |
+| `POST /api/admin/meter-binding-types` | 新增类型 `{ workshopId, energy, name }` |
+| `PUT/DELETE /api/admin/meter-binding-types/{id}` | 改名 / 删除类型（能源不可改） |
+| `POST /api/admin/meter-binding-devices` | 新增设备 `{ typeId, name }` |
+| `PUT/DELETE /api/admin/meter-binding-devices/{id}` | 改名 / 删除设备 |
+| `PUT /api/admin/meter-binding-devices/{id}/meters` | 保存右侧勾选 `{ meterCodes: string[] }` |
+
+树响应示例：
+
+```jsonc
+{
+  "workshops": [
+    {
+      "id": 1, "name": "碳水车间", "sort": 0, "typeCount": 2, "meterCount": 7,
+      "types": [
+        {
+          "id": 1, "name": "生产用电", "usageType": "生产用电",
+          "energy": "elec", "energyName": "电", "unit": "kWh", "sort": 0,
+          "meterCount": 5,
+          "devices": [
+            {
+              "id": 1, "name": "一线", "deviceName": "一线", "sort": 0,
+              "typeId": 1, "typeName": "生产用电",
+              "workshopId": 1, "workshopName": "碳水车间",
+              "energy": "elec", "energyName": "电", "unit": "kWh",
+              "meterCodes": ["E-A1-01", "E-A1-02"], "meterCount": 2,
+              "meters": [
+                { "id": 1, "code": "E-A1-01", "name": "一线生产线电表",
+                  "workshopCode": "WS-CARB", "workshopName": "碳水车间",
+                  "nodeCode": "W103", "nodeName": "一线", "nodeType": "line",
+                  "usageType": "生产线用电", "deviceName": "生产线", "enabled": true }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "options": {
+    "energies": [{ "code": "elec", "name": "电", "unit": "kWh" }],
+    "workshops": [{ "code": "WS-CARB", "name": "碳水车间" }],
+    "usageTypes": ["生产线用电", "辅机用电"],
+    "deviceNames": ["生产线", "吹瓶机", "冰水", "高压"],
+    "meters": [/* 全部计量点，字段同 devices[].meters */]
+  }
+}
+```
+
+规则：
+
+- 车间 / 类型 / 设备都可以先建空节点，再给设备勾选计量点；
+- 类型能源在创建后不可修改；重名车间、同车间同类型、同类型同设备返回 **409**；
+- 设备勾选接口允许空数组（= 解绑全部），允许同一块表出现在多个设备中；
+- 勾选的表必须与设备类型同能源，跨能源返回 **400**；
+- 删除节点只删绑定关系，`energy_meter` / `energy_raw` / `energy_hourly` 不受影响。
+
+### 2) `GET /api/energy/meter-categories` 的两种模式
+
+| 模式 | 条件 | 返回 |
+| :--- | :--- | :--- |
+| **绑定树模式** | 该能源存在「绑定设备 + 至少一块启用表」 | 完全按绑定树输出；`workshopCode` 为 `BWS-<绑定车间ID>`，`bindingDriven=true` |
+| **原始模式** | 该能源还没有任何可用绑定 | 按 `energy_meter.usage_type / device_name / 组织节点` 分组，`bindingDriven=false` |
+
+绑定树模式的类型节点：
+
+```jsonc
+{
+  "id": 1,
+  "usageType": "生产用电",
+  "energy": "elec",
+  "bindingDriven": true,
+  "deviceCount": 2,
+  "bindings": [{
+    "id": 1, "name": "一线", "deviceName": "一线",
+    "meterCount": 2, "meterCodes": ["E-A1-01", "E-A1-02"],
+    "meterNames": ["一线生产线电表", "一线吹瓶机电表"],
+    "sort": 0, "bound": true
+  }],
+  "devices": [/* 该类型下所有设备引用到的物理表，去重；供「单块仪表」查询 */]
+}
+```
+
+顶层仍返回 `count`（物理表去重数）与 `bindingCount`（绑定设备数）。
+两种模式**同一能源互斥**：不会把固定分类和自定义分类混在一张下拉里。
+
+### 3) `GET /api/energy/range` 新增/调整参数
+
+| 参数 | 取值 | 说明 |
+| :--- | :--- | :--- |
+| `binding` | 绑定设备 ID | 按该设备右侧勾选的一组表求和 |
+| `bindingType` | 绑定类型 ID | 合并该类型下所有设备的计量点（去重）后求和；用于第三级「全部设备」 |
+| `meter` | 计量点编码 | 只看这一块表 |
+| `workshop` | `BWS-<id>` 或真实车间编码 | 绑定查询传 `BWS-<id>`；原始模式仍传真实编码 |
+
+优先级：`meter` > `binding` > `bindingType` > 原始三级维度。
+`binding` / `bindingType` 与 `kind`、`workshop` 冲突时一律 **400**，不静默换口径。
+
+响应会回显 `binding` / `bindingType` / `meter`，序列名按绑定树拼接：
+
+```jsonc
+{
+  "binding": 1,
+  "labels": ["11-10 06", "11-10 07", "..."],
+  "series": [{
+    "key": "focus",
+    "name": "碳水车间 · 生产用电 · 一线",
+    "unit": "kWh",
+    "values": [null, 28.8, 85.9]
+  }],
+  "meterCount": 2,
+  "totals": { "kwh": null }
+}
+```
+
+⚠ `totals.kwh` 仍按严格口径：区间内有一个小时不成立即为 `null`，
+不会因为「大部分小时有数」就给一个偏小的合计。
 
 ---
 

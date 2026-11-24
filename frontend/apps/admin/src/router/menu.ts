@@ -50,7 +50,8 @@ export const menuTree: MenuNode[] = [
     icon: 'SetUp',
     children: [
       { path: '/energy-config/standard-unit', title: '标准单耗配置', icon: 'DataLine' },
-      { path: '/energy-config/price', title: '能源单价', icon: 'Tickets' }
+      { path: '/energy-config/price', title: '能源单价', icon: 'Tickets' },
+      { path: '/energy-config/meter-binding', title: '计量绑定', icon: 'Connection' }
     ]
   },
   {

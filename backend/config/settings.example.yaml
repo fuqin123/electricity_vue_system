@@ -183,7 +183,7 @@ gateways:
 # 字段说明（新增三个，供后台「车间 → 类型 → 设备」三级筛选）：
 #   · workshop     —— 冗余留档，实际归属由 `line` / `node` 决定
 #   · usage_type   —— 用能类型（生产线用电 / 辅机用电 / 瓶胚用电 / 调配用电）
-#   · device_name  —— 设备名（吹瓶机 / 冰水机和水塔 / 溶糖CIP …）
+#   · device_name  —— 设备名（吹瓶机 / 冰水 / 高压 / 溶糖CIP …）
 #   · line         —— 挂到产线（W103 / W101 / W102 / W301 / W104 / W105）
 #   · node         —— 挂到辅助计量单元（aux_nodes 段的 code）
 #
@@ -206,16 +206,16 @@ meters:
   - { code: E-A6-02, name: 六线吹瓶机电表,      kind: elec, scope: line, role: aux,  line: W105, usage_type: 生产线用电, device_name: 吹瓶机,  gateway: GW-TASHI, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
 
   # ══ 辅机用电（挂 aux 节点；现场「线别」列为设备组合名）══
-  - { code: E-AUX-10, name: 冰水泵及塔1电表,                        kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-14, name: 冰水泵及塔2+小冰水机电表,               kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-3-10, name: 4号高压机+3号吹瓶冰水机电表,          kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压机和冰水机, gateway: GW-PDB-3, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-4-7, name: 1号高压机+3台低压机+1号吹瓶冰水机电表, kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 空压机和冰水机, gateway: GW-PDB-4, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-3-6, name: 2号高压机+2号吹瓶冰水机电表,           kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压机和冰水机, gateway: GW-PDB-3, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-3-9, name: 3号高压机+5/6号吹瓶冰水机+2台瓶胚低压机电表, kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 空压机和冰水机, gateway: GW-PDB-3, slave: 9, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-T8, name: 5号高压机电表,                          kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压机,      gateway: GW-TASHI,   slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-16, name: 冰水主机/水泵1电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 16, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-17, name: 冰水主机/水泵2电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 17, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
-  - { code: E-AUX-18, name: 冰水主机/水泵3电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水机和水塔, gateway: GW-PDB-4,   slave: 18, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-10, name: 冰水泵及塔1电表,                        kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水, gateway: GW-PDB-4,   slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-14, name: 冰水泵及塔2+小冰水机电表,               kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水, gateway: GW-PDB-4,   slave: 14, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-3-10, name: 4号高压机+3号吹瓶冰水机电表,          kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压, gateway: GW-PDB-3, slave: 10, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-4-7, name: 1号高压机+3台低压机+1号吹瓶冰水机电表, kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压, gateway: GW-PDB-4, slave: 7,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-3-6, name: 2号高压机+2号吹瓶冰水机电表,           kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压, gateway: GW-PDB-3, slave: 6,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-3-9, name: 3号高压机+5/6号吹瓶冰水机+2台瓶胚低压机电表, kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压, gateway: GW-PDB-3, slave: 9, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-T8, name: 5号高压机电表,                          kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 高压,      gateway: GW-TASHI,   slave: 8,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-16, name: 冰水主机/水泵1电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水, gateway: GW-PDB-4,   slave: 16, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-17, name: 冰水主机/水泵2电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水, gateway: GW-PDB-4,   slave: 17, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
+  - { code: E-AUX-18, name: 冰水主机/水泵3电表,                     kind: elec, scope: line, role: aux, node: AUX-CARB-AIR, usage_type: 辅机用电, device_name: 冰水, gateway: GW-PDB-4,   slave: 18, register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000 }
 
   # ══ 瓶胚用电 ══
   - { code: E-PREFORM-1, name: 瓶胚1#电表,      kind: elec, scope: line, role: aux, node: AUX-CARB-PREFORM, usage_type: 瓶胚用电, device_name: 瓶胚机1,      gateway: GW-PDB2-T1, slave: 9,  register: 1000, registers: 2, scale: 0.1, unit: kWh, max_hourly: 5000, remark: 10.114.1.40 部分网络不通，正式环境正常 }

@@ -15,6 +15,7 @@
  *   注意第三级给的是**计量点**而不是产线，两者语义完全不同。
  */
 import { computed } from 'vue';
+import { useRouter } from 'vue-router';
 import { energyModel, int, type PageQuery, type PageResult } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import StatCard from '@/components/StatCard.vue';
@@ -45,10 +46,12 @@ const {
   usageType,
   node,
   typeOptions,
-  nodeOptions,
+  selectionGroups,
+  selectedMeters,
   selectionLabel
 } = useEnergyUsage(props.energy);
 
+const router = useRouter();
 const isSteam = computed(() => props.energy === 'steam');
 const QUICK = usageQuickSpans();
 
@@ -159,21 +162,23 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
           <el-option
             v-for="t in typeOptions"
             :key="t.usageType"
-            :label="`${t.usageType}（${t.devices.length}）`"
+            :label="`${t.usageType}（${t.deviceCount || t.devices.length}）`"
             :value="t.usageType"
           />
         </el-select>
-        <span class="query__label">仪表</span>
+        <span class="query__label">设备 / 仪表</span>
         <el-select
           v-model="node"
           size="small"
-          style="width: 220px"
+          style="width: 250px"
           clearable
           :disabled="!usageType"
-          :placeholder="usageType ? '全部仪表' : '请先选类型'"
+          :placeholder="usageType ? '全部设备 / 单表' : '请先选类型'"
           @change="load"
         >
-          <el-option v-for="n in nodeOptions" :key="n.code" :label="n.name" :value="n.code" />
+          <el-option-group v-for="g in selectionGroups" :key="g.label" :label="g.label">
+            <el-option v-for="n in g.items" :key="n.value" :label="n.label" :value="n.value" />
+          </el-option-group>
         </el-select>
         <el-button-group>
           <el-button v-for="q in QUICK" :key="q.label" size="small" @click="applyQuick(q.hours, q.gran)">
@@ -182,6 +187,13 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         </el-button-group>
         <el-button type="primary" size="small" :loading="loading" @click="load">查询</el-button>
         <span class="query__hint">{{ selectionLabel }}</span>
+        <el-button link type="primary" size="small" @click="router.push('/energy-config/meter-binding')">
+          管理绑定
+        </el-button>
+      </div>
+      <div v-if="selectedMeters.names.length" class="query__hint">
+        口径：{{ selectedMeters.names.slice(0, 4).join('、') }}
+        <template v-if="selectedMeters.names.length > 4"> 等 {{ selectedMeters.names.length }} 块表</template>
       </div>
     </el-card>
 

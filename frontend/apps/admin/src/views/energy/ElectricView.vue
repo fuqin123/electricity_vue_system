@@ -10,6 +10,7 @@
  * v1.5.2：筛选从「线别」改为 **车间 → 用能类型 → 设备** 三级联动 ——
  *   辅机 / 瓶胚 / 调配电表在接口表里没有「线别」，用旧维度根本选不出来。
  */
+import { useRouter } from 'vue-router';
 import { big, int, thresholds, type PageQuery, type PageResult } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
 import StatCard from '@/components/StatCard.vue';
@@ -37,11 +38,13 @@ const {
   usageType,
   node,
   typeOptions,
-  nodeOptions,
+  selectionGroups,
+  selectedMeters,
   focused,
   selectionLabel
 } = useEnergyUsage('electric');
 
+const router = useRouter();
 const QUICK = usageQuickSpans();
 
 function applyQuick(hours: number, gran: 'hour' | 'day' | 'month') {
@@ -138,7 +141,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
           <el-option
             v-for="t in typeOptions"
             :key="t.usageType"
-            :label="`${t.usageType}（${t.devices.length}）`"
+            :label="`${t.usageType}（${t.deviceCount || t.devices.length}）`"
             :value="t.usageType"
           />
         </el-select>
@@ -146,18 +149,19 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         <el-select
           v-model="node"
           size="small"
-          style="width: 220px"
+          style="width: 250px"
           clearable
           :disabled="!usageType"
-          :placeholder="usageType ? '全部设备' : '请先选类型'"
+          :placeholder="usageType ? '全部设备 / 单表' : '请先选类型'"
           @change="load"
         >
-          <el-option
-            v-for="n in nodeOptions"
-            :key="n.code"
-            :label="n.count > 1 ? `${n.name} · 整节点（${n.count} 块表）` : `${n.name} · 单表`"
-            :value="n.code"
-          />
+          <el-option-group
+            v-for="g in selectionGroups"
+            :key="g.label"
+            :label="g.label"
+          >
+            <el-option v-for="n in g.items" :key="n.value" :label="n.label" :value="n.value" />
+          </el-option-group>
         </el-select>
         <el-button-group>
           <el-button
@@ -179,6 +183,13 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         <span v-if="data?.meterCount !== undefined" class="query__hint-text">
           · 命中 {{ data.meterCount }} 个计量点
         </span>
+        <span v-if="selectedMeters.names.length" class="query__hint-text">
+          · 口径：{{ selectedMeters.names.slice(0, 4).join('、') }}
+          <template v-if="selectedMeters.names.length > 4"> 等 {{ selectedMeters.names.length }} 块表</template>
+        </span>
+        <el-button link type="primary" size="small" @click="router.push('/energy-config/meter-binding')">
+          管理绑定
+        </el-button>
       </div>
     </el-card>
 

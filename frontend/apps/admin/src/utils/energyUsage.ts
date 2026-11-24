@@ -16,7 +16,15 @@
  * 选择语义（三级联动，上级变则下级清空）：
  *   · 只选车间            → 该车间全部电表（车间合计）
  *   · 选到用能类型        → 该类型下的表合计
- *   · 选到具体设备/节点   → 单表 / 单节点（焦点通道）
+ *   · 选到具体设备/节点   → 绑定设备 / 设备分组 / 节点 / 单表（焦点通道）
+ *
+ * ── v1.7.4 第三级拆分 ─────────────────────────────────────────
+ * 该能源在「计量绑定」里配置了设备后，第三级完全按绑定树展示：
+ *   · 全部设备（该类型所有设备计量点去重合计）；
+ *   · 单个设备（右侧勾选的一组表）；
+ *   · 单块仪表（被该类型设备引用到的物理表）。
+ * 没有配置绑定的能源仍按原始台账兜底：多节点按产线，单节点按设备名。
+ * 这正是现场要求的「对应设备选择对应仪表的用量」：设备合计与单表都能选到。
  */
 import { computed, onMounted, ref, watch, type Ref } from 'vue';
 import { ElMessage } from 'element-plus';
@@ -24,6 +32,8 @@ import {
   energyApi,
   lastClosedHour,
   productionDayStart,
+  type MeterCategoryBinding,
+  type MeterCategoryDevice,
   type MeterCategoryWorkshop,
   type UsageRangeResult
 } from '@eep/shared';
@@ -85,6 +95,43 @@ export function closedHourText(): string {
   return fmt(closedHour());
 }
 
+export interface UsageSelectionOption {
+  /** 编码值：bindingType:<id> / binding:<id> / node:<code> / device:<name> / meter:<code> */
+  value: string;
+  name: string;
+  /** 下拉里显示的完整文案（含「绑定 N 块表」等说明） */
+  label: string;
+  /** 该选项包含的计量点数 */
+  count: number;
+  kind: 'binding' | 'bindingType' | 'node' | 'device' | 'meter';
+  /** 绑定设备由哪几块表组成（直接显示在提示里） */
+  detail?: string;
+}
+
+export interface UsageSelectionGroup {
+  label: string;
+  items: UsageSelectionOption[];
+}
+
+/** 第三级下拉值 → 后端查询参数。兼容旧值（没有前缀时按节点编码处理）。 */
+function selectionParams(value: string): {
+  binding?: number;
+  bindingType?: number;
+  node?: string;
+  device?: string;
+  meter?: string;
+} {
+  if (!value) return {};
+  if (value.startsWith('bindingType:')) {
+    return { bindingType: Number(value.slice('bindingType:'.length)) };
+  }
+  if (value.startsWith('binding:')) return { binding: Number(value.slice('binding:'.length)) };
+  if (value.startsWith('node:')) return { node: value.slice('node:'.length) };
+  if (value.startsWith('device:')) return { device: value.slice('device:'.length) };
+  if (value.startsWith('meter:')) return { meter: value.slice('meter:'.length) };
+  return { node: value };
+}
+
 export function useEnergyUsage(energy: UsageEnergy) {
   const meta = META[energy];
 
@@ -102,12 +149,14 @@ export function useEnergyUsage(energy: UsageEnergy) {
   /** ''=该车间全部；否则用能类型名（如「生产线用电」） */
   const usageType = ref('');
   /**
-   * ''=该类型全部；否则为组织节点编码。
+   * ''=该类型全部；否则是**编码后的选择值**：
+   *   bindingType:<id> 绑定类型全部设备（去重合计）
+   *   binding:<id>     绑定树里的单个设备
+   *   node:<code>      原始模式：组织节点（多产线时按节点看整条线）
+   *   device:<name>    原始模式：单节点下的设备分组
+   *   meter:<code>     单块仪表
    *
-   * ⚠ 这里存的是**节点**（A1 / AUX-CARB-AIR）而不是计量点编码：
-   *   一条产线常有多块表（生产线 / 吹瓶机 / 冰水机），按节点查才是
-   *   「看这条线用了多少电」；按单表查是「看这块表」。
-   *   两者在树里都存在，第三级下拉同时给出节点与单表两个选项组。
+   * 兼容旧值：没有前缀的字符串按节点编码处理（历史页面状态 / 手工链接）。
    */
   const node = ref('');
 
@@ -117,26 +166,182 @@ export function useEnergyUsage(energy: UsageEnergy) {
     return ws?.types ?? [];
   });
 
-  /** 当前选中类型下的设备列表 */
-  const deviceOptions = computed(() => {
-    const t = typeOptions.value.find((x) => x.usageType === usageType.value);
-    return t?.devices ?? [];
-  });
+  const activeType = computed(
+    () => typeOptions.value.find((x) => x.usageType === usageType.value) ?? null
+  );
+
+  /** 当前选中类型下的绑定设备 */
+  const bindings = computed<MeterCategoryBinding[]>(() => activeType.value?.bindings ?? []);
+
+  /** 当前选中类型下的物理计量点 */
+  const deviceOptions = computed<MeterCategoryDevice[]>(() => activeType.value?.devices ?? []);
 
   /**
-   * 第三级的节点选项：把设备按 nodeCode 去重。
+   * 第三级选项 —— v1.7.4 起分三组：
    *
-   * 一条产线（A1）下有多块电表时，选「一线（整条线 2 块表）」比逐块勾更常用，
-   * 所以节点作为独立选项排在设备之前。
+   *  绑定树模式（该能源有绑定配置）：
+   *    ① 全部设备 / 单个绑定设备；
+   *    ② 单块仪表（被该类型设备引用到的物理表）。
+   *  原始模式（该能源没有绑定配置）：
+   *    ① 按节点或 `deviceName` 生成的设备分组；
+   *    ② 单块仪表。
+   *
+   * ⚠ 第三级选项的 `value` 必须带前缀：同一字符串既可能是节点编码、也可能是
+   *   设备名或表编码，不带前缀就无法判断该传 `node` 还是 `device`（B-535 同族：
+   *   认不出的参数被静默忽略，界面看着有数，实际是另一个口径）。
    */
-  const nodeOptions = computed(() => {
-    const seen = new Map<string, { code: string; name: string; count: number }>();
-    for (const d of deviceOptions.value) {
-      const cur = seen.get(d.nodeCode);
-      if (cur) cur.count += 1;
-      else seen.set(d.nodeCode, { code: d.nodeCode, name: d.nodeName, count: 1 });
+  const selectionGroups = computed<UsageSelectionGroup[]>(() => {
+    const groups: UsageSelectionGroup[] = [];
+    const devices = deviceOptions.value;
+
+    // ── 绑定树模式 ──
+    // 该能源已经在绑定页配置了「设备 + 启用表」时，第三级只认绑定树：
+    // 设备合计、全部设备合计、单块仪表。不再混入按物理表台账生成的
+    // 节点/设备分组 —— 两套分类同时出现时，选哪个都像，口径却可能不同。
+    if (activeType.value?.bindingDriven) {
+      const items: UsageSelectionOption[] = [];
+      if (activeType.value.id != null && bindings.value.length) {
+        items.push({
+          value: `bindingType:${activeType.value.id}`,
+          name: '全部设备',
+          label: `全部设备 · ${devices.length} 块表`,
+          count: devices.length,
+          kind: 'bindingType',
+          detail: devices.map((d) => d.name).join('、')
+        });
+      }
+      for (const b of bindings.value) {
+        items.push({
+          value: `binding:${b.id}`,
+          name: b.deviceName,
+          label: `${b.deviceName} · 绑定 ${b.meterCount} 块表`,
+          count: b.meterCount,
+          kind: 'binding',
+          detail: b.meterNames?.join('、') ?? ''
+        });
+      }
+      if (items.length) groups.push({ label: '设备', items });
+      if (devices.length) {
+        groups.push({
+          label: '单块仪表',
+          items: devices.map((d) => ({
+            value: `meter:${d.code}`,
+            name: `${d.name} · ${d.code}`,
+            label: `${d.name} · ${d.code}`,
+            count: 1,
+            kind: 'meter'
+          }))
+        });
+      }
+      return groups;
     }
-    return [...seen.values()];
+
+    // ── 原始模式（该能源还没有绑定配置）──
+    if (bindings.value.length) {
+      groups.push({
+        label: '已绑定设备',
+        items: bindings.value.map((b) => ({
+          value: `binding:${b.id}`,
+          name: b.deviceName,
+          label: `${b.deviceName} · 绑定 ${b.meterCount} 块表`,
+          count: b.meterCount,
+          kind: 'binding',
+          detail: b.meterNames?.join('、') ?? ''
+        }))
+      });
+    }
+
+    if (devices.length) {
+      const nodes = new Map<string, { code: string; name: string; count: number }>();
+      for (const d of devices) {
+        const cur = nodes.get(d.nodeCode);
+        if (cur) cur.count += 1;
+        else nodes.set(d.nodeCode, { code: d.nodeCode, name: d.nodeName, count: 1 });
+      }
+
+      // 只有「单节点 + 每块表都有 device_name」才能按设备名分组：
+      // 后端 `device=` 过滤的是 `device_name` 字段，拿计量点名称兜底会筛不到表。
+      const canGroupByDevice = nodes.size === 1 && devices.every((d) => !!d.deviceName);
+      if (!canGroupByDevice) {
+        // 多节点 = 多条产线（或跨节点类型）：按节点看「整条线/整个单元」
+        groups.push({
+          label: '设备 / 节点（未绑定）',
+          items: [...nodes.values()].map((n) => ({
+            value: `node:${n.code}`,
+            name: n.name,
+            label: n.count > 1 ? `${n.name} · ${n.count} 块表` : n.name,
+            count: n.count,
+            kind: 'node'
+          }))
+        });
+      } else {
+        // 单节点 = 辅机 / 水 / 汽：按设备名分组（冰水、高压…）
+        const names = new Map<string, { name: string; count: number }>();
+        for (const d of devices) {
+          const key = d.deviceName;
+          const cur = names.get(key);
+          if (cur) cur.count += 1;
+          else names.set(key, { name: key, count: 1 });
+        }
+        groups.push({
+          label: '设备（未绑定）',
+          items: [...names.values()].map((n) => ({
+            value: `device:${n.name}`,
+            name: n.name,
+            label: n.count > 1 ? `${n.name} · ${n.count} 块表` : n.name,
+            count: n.count,
+            kind: 'device'
+          }))
+        });
+      }
+
+      groups.push({
+        label: '单块仪表',
+        items: devices.map((d) => ({
+          value: `meter:${d.code}`,
+          name: `${d.name} · ${d.code}`,
+          label: `${d.name} · ${d.code}`,
+          count: 1,
+          kind: 'meter'
+        }))
+      });
+    }
+
+    return groups;
+  });
+
+  /** 扁平选项 —— 用于按 value 反查名称、生成选中提示 */
+  const nodeOptions = computed(() => selectionGroups.value.flatMap((g) => g.items));
+
+  /** 当前选中的选项 */
+  const selectedOption = computed(
+    () => nodeOptions.value.find((x) => x.value === node.value) ?? null
+  );
+
+  /** 当前选择实际包含的计量点 —— 让「这个设备由哪几块表组成」直接可见 */
+  const selectedMeters = computed<{ names: string[]; codes: string[] }>(() => {
+    const opt = selectedOption.value;
+    if (!opt) return { names: [], codes: [] };
+    if (opt.kind === 'binding') {
+      const b = bindings.value.find((x) => `binding:${x.id}` === opt.value);
+      return { names: b?.meterNames ?? [], codes: b?.meterCodes ?? [] };
+    }
+    if (opt.kind === 'bindingType') {
+      return {
+        names: deviceOptions.value.map((d) => d.name),
+        codes: deviceOptions.value.map((d) => d.code)
+      };
+    }
+    if (opt.kind === 'meter') {
+      const d = deviceOptions.value.find((x) => `meter:${x.code}` === opt.value);
+      return d ? { names: [d.name], codes: [d.code] } : { names: [], codes: [] };
+    }
+    const matched = deviceOptions.value.filter((d) =>
+      opt.kind === 'node'
+        ? d.nodeCode === opt.value.slice('node:'.length)
+        : (d.deviceName || d.name) === opt.value.slice('device:'.length)
+    );
+    return { names: matched.map((d) => d.name), codes: matched.map((d) => d.code) };
   });
 
   /** 载入分类树；只拉本页能源类型，避免电页出现水表 */
@@ -157,13 +362,24 @@ export function useEnergyUsage(energy: UsageEnergy) {
 
   // 上级变化时清空下级 —— 否则会拿「A1 线的用能类型」去查另一个车间，
   // 后端筛出空集，界面看起来像「这个车间没有数据」。
-  watch(workshop, () => {
-    usageType.value = '';
-    node.value = '';
-  });
-  watch(usageType, () => {
-    node.value = '';
-  });
+  // flush: 'sync' 必须保留：视图里的 @change="load" 会在 v-model 更新后立刻执行，
+  // 若清空下级是异步的，load 会拿「新车间 + 旧类型/旧设备」去查 —— 后端筛出空集，
+  // 界面看起来像「这个车间没有数据」。
+  watch(
+    workshop,
+    () => {
+      usageType.value = '';
+      node.value = '';
+    },
+    { flush: 'sync' }
+  );
+  watch(
+    usageType,
+    () => {
+      node.value = '';
+    },
+    { flush: 'sync' }
+  );
 
   /** 是否处于「焦点」通道：选了类型或节点就是看具体设备，只出一条序列 */
   const focused = computed(() => !!(usageType.value || node.value));
@@ -177,8 +393,18 @@ export function useEnergyUsage(energy: UsageEnergy) {
     const parts = [ws?.workshop ?? '全部车间'];
     if (usageType.value) parts.push(usageType.value);
     if (node.value) {
-      const n = nodeOptions.value.find((x) => x.code === node.value);
-      parts.push(n ? (n.count > 1 ? `${n.name}（${n.count} 块表）` : n.name) : node.value);
+      const opt = selectedOption.value;
+      if (!opt) {
+        parts.push(node.value);
+      } else if (opt.kind === 'binding') {
+        parts.push(`${opt.name}（绑定 ${opt.count} 块表）`);
+      } else if (opt.kind === 'bindingType') {
+        parts.push(`${opt.name}（${opt.count} 块表）`);
+      } else if (opt.count > 1) {
+        parts.push(`${opt.name}（${opt.count} 块表）`);
+      } else {
+        parts.push(opt.name);
+      }
     }
     return parts.join(' · ');
   });
@@ -199,7 +425,13 @@ export function useEnergyUsage(energy: UsageEnergy) {
         kind: meta.kind,
         workshop: workshop.value || undefined,
         usageType: usageType.value || undefined,
-        node: node.value || undefined
+        // 绑定树模式下，第三级不选具体设备 = 看该类型全部设备；
+        // 选中设备时由 selectionParams 覆盖为 binding。
+        bindingType:
+          !node.value && activeType.value?.bindingDriven && activeType.value.id != null
+            ? activeType.value.id
+            : undefined,
+        ...selectionParams(node.value)
       });
     } catch (e) {
       ElMessage.error((e as Error).message);
@@ -360,7 +592,10 @@ export function useEnergyUsage(energy: UsageEnergy) {
     node,
     typeOptions,
     deviceOptions,
+    selectionGroups,
     nodeOptions,
+    selectedOption,
+    selectedMeters,
     focused,
     selectionLabel,
     loadTree

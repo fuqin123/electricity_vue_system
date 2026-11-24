@@ -515,6 +515,130 @@ class EnergyMeter(models.Model):
         super().save(*args, **kwargs)
 
 
+class MeterBindingWorkshop(models.Model):
+    """计量绑定树 · 车间节点（v1.7.4）。
+
+    绑定树是**查询口径的配置**，不替代 `production_line`：
+      · 车间 / 类型 / 设备三层都可以由现场自由新增、改名、删除；
+      · 节点可以先建好（不绑定表），再到右侧勾选计量点；
+      · 删除节点只删绑定关系，不删任何计量点或原始读数。
+
+    为什么不直接复用 `production_line`：绑定树允许「车间」只是一个查询分组
+    （例如把几条线并成「A 区」），而 `production_line` 是采集台账的归属，
+    两者混用会让「改个查询分组名」变成「改组织架构」。
+    """
+
+    name = models.CharField("车间名称", max_length=64, unique=True)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "energy_meter_binding_workshop"
+        ordering = ["sort", "id"]
+        verbose_name = "计量绑定车间"
+        verbose_name_plural = "计量绑定车间"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class MeterBindingType(models.Model):
+    """计量绑定树 · 用能类型节点。
+
+    能源类型挂在**类型**上而不是车间上：同一个车间既有电类型（生产用电 /
+    辅机用电），也可能有水和汽类型。电 / 水 / 汽计量页按能源筛选类型。
+    """
+
+    workshop = models.ForeignKey(
+        MeterBindingWorkshop, on_delete=models.CASCADE, related_name="types",
+        verbose_name="车间",
+    )
+    energy_type = models.ForeignKey(
+        EnergyType, on_delete=models.PROTECT, related_name="binding_types",
+        verbose_name="能源类型",
+    )
+    name = models.CharField("类型名称", max_length=64)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "energy_meter_binding_type"
+        ordering = ["sort", "id"]
+        verbose_name = "计量绑定类型"
+        verbose_name_plural = "计量绑定类型"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("workshop", "energy_type", "name"), name="uk_binding_type"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.workshop_id}/{self.energy_type_id}/{self.name}"
+
+
+class MeterBindingDevice(models.Model):
+    """计量绑定树 · 设备节点 —— 右侧勾选的计量点最终挂在这里。
+
+    一个设备可以绑定多块表（如「一线」= 生产线表 + 吹瓶机表）；
+    同一块表也允许出现在多个设备中（现场存在共享辅机表），界面会提示
+    「同时绑定于哪些设备」，避免无意识地重复计量。
+    """
+
+    type = models.ForeignKey(
+        MeterBindingType, on_delete=models.CASCADE, related_name="devices",
+        verbose_name="类型",
+    )
+    name = models.CharField("设备名称", max_length=64)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "energy_meter_binding_device"
+        ordering = ["sort", "id"]
+        verbose_name = "计量绑定设备"
+        verbose_name_plural = "计量绑定设备"
+        constraints = [
+            models.UniqueConstraint(fields=("type", "name"), name="uk_binding_device"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.type_id}/{self.name}"
+
+
+class MeterBindingAssignment(models.Model):
+    """设备 ↔ 计量点的绑定关系（多对多 + 顺序）。
+
+    只存关系，不存用量、不复制读数。设备/类型/车间删除时关系级联删除，
+    `EnergyMeter` 本身不受影响。同一设备内不允许重复绑定同一块表。
+    """
+
+    device = models.ForeignKey(
+        MeterBindingDevice, on_delete=models.CASCADE, related_name="assignments",
+        verbose_name="绑定设备",
+    )
+    meter = models.ForeignKey(
+        EnergyMeter, on_delete=models.CASCADE, related_name="binding_assignments",
+        verbose_name="计量点",
+    )
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "energy_meter_binding_assignment"
+        ordering = ["sort", "id"]
+        verbose_name = "绑定设备计量点"
+        verbose_name_plural = "绑定设备计量点"
+        constraints = [
+            models.UniqueConstraint(fields=("device", "meter"), name="uk_binding_device_meter"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.device_id}→{self.meter_id}"
+
+
 class EnergyRaw(models.Model):
     """原始数据表：**累计读数**（如 6,312,639.3 kWh），不是用量。
 
