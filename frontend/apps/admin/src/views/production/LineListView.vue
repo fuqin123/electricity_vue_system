@@ -12,7 +12,15 @@ import { notImplemented } from '@/utils/pending';
 
 const status = ref('');
 
-const extraQuery = computed(() => (status.value ? { status: status.value } : {}));
+/**
+ * v1.7.5：产线主数据只展示真实产线（nodeType=line）。
+ * 组织节点表里还有车间与辅机 / 瓶胚 / 调配节点，它们没有产量，
+ * 混在本页会让人误以为「多了几条产线」；计量点的所属产线下拉仍取全部节点。
+ */
+const extraQuery = computed(() => ({
+  nodeType: 'line',
+  ...(status.value ? { status: status.value } : {})
+}));
 
 const columns: TableColumn[] = [
   { prop: 'code', label: '产线编号', width: 100, formatter: (r) => String(r.code) },

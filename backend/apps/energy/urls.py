@@ -30,6 +30,8 @@ energy_urlpatterns = [
     path("range", api.usage_range, name="energy-range"),
     path("dashboard", api.dashboard, name="energy-dashboard"),
     path("production", api.production, name="energy-production"),
+    # 视频监控配置（大屏启动时读取；不含 RTSP 账号信息）
+    path("video-config", api.energy_video_config, name="energy-video-config"),
 ]
 
 #: 后台配置组：原始三元组 (route, view, name)，用于挂到两个前缀
@@ -42,6 +44,8 @@ _ADMIN_ROUTES = [
     ("alarms", api.admin_alarms, "admin-alarms"),
     ("alarms/<int:pk>/ack", api.admin_alarm_ack, "admin-alarm-ack"),
     ("params", api.admin_params, "admin-params"),
+    # 视频监控配置（v1.7.5）：网关 IP / 端口 + 各产线 RTSP 源
+    ("video-config", api.admin_video_config, "admin-video-config"),
     ("params/<int:pk>", api.admin_param_detail, "admin-param-detail"),
     ("standard-units", api.admin_standard_units, "admin-standard-units"),
     ("energy-prices", api.admin_energy_prices, "admin-energy-prices"),

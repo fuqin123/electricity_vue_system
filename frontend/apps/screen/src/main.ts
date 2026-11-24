@@ -1,5 +1,6 @@
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
+import { applyVideoConfig, energyApi } from '@eep/shared';
 import App from './App.vue';
 import router from './router';
 import './styles/app.scss';
@@ -30,4 +31,16 @@ if (!import.meta.env.PROD) {
   });
 }
 
-app.mount('#app');
+/**
+ * v1.7.5：视频网关 / RTSP 通道由管理后台维护，大屏启动时先拉一次再挂载。
+ * SDK 内部已兜底（不可达时退回内置默认值），这里不再阻塞出错。
+ */
+(async () => {
+  // 最多等 3 秒：网关配置接口慢不能拖住整块大屏，超时就按内置默认值启动
+  const cfg = await Promise.race([
+    energyApi.getVideoConfig(),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000))
+  ]);
+  applyVideoConfig(cfg);
+  app.mount('#app');
+})();

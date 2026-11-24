@@ -41,6 +41,8 @@ from apps.energy.models import (
     ProductionLine,
     StandardUnitConsumption,
     SystemParam,
+    VideoChannel,
+    VideoGatewayConfig,
 )
 from apps.energy.services import alerts
 from apps.energy.services import business_day as B
@@ -4230,3 +4232,92 @@ class MeterBindingTests(TestCase):
         self.assertFalse(types["生产线用电"]["bindingDriven"])
         self.assertIn("TB-E1", [d["code"] for d in types["生产线用电"]["devices"]])
         self.assertEqual(data["bindingCount"], 0)
+
+
+class VideoConfigTests(TestCase):
+    """v1.7.5：视频监控网关 / RTSP 源由后台维护。
+
+    现场必须能在前端直接改网关 IP、端口和每路摄像头的 RTSP 地址；
+    大屏读取的公开接口**不能**把带账号密码的 RTSP 地址下发出去。
+    """
+
+    def _put(self, payload):
+        return Client().put(
+            "/api/admin/video-config",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+    def test_升级后自带默认通道(self):
+        """迁移 0022 必须按旧静态配置回填，避免升级后大屏突然没画面。"""
+        res = Client().get("/api/admin/video-config")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["gateway"]["host"], "10.113.1.61")
+        self.assertEqual(data["gateway"]["apiPort"], 1984)
+        self.assertEqual(data["gateway"]["base"], "http://10.113.1.61:1984")
+        self.assertEqual(len(data["channels"]), 6)
+        self.assertTrue(next(c for c in data["channels"] if c["lineCode"] == "W103")["enabled"])
+
+    def test_保存网关与RTSP源并且大屏接口隐藏RTSP(self):
+        res = self._put(
+            {
+                "gateway": {"host": "10.9.9.9", "apiPort": 1888, "webrtcPort": 8666, "enabled": True},
+                "channels": [
+                    {
+                        "lineCode": "W103",
+                        "lineName": "一线",
+                        "channel": "CH01",
+                        "stream": "line1",
+                        "rtsp": "rtsp://admin:pwd@10.1.1.1:554/Streaming/Channels/102",
+                        "resolution": "1920×1080",
+                        "fps": 25,
+                        "codec": "H.264",
+                        "enabled": True,
+                    }
+                ],
+            }
+        )
+        self.assertEqual(res.status_code, 200)
+        cfg = VideoGatewayConfig.get_solo()
+        self.assertEqual(cfg.host, "10.9.9.9")
+        self.assertEqual(cfg.api_port, 1888)
+        self.assertEqual(cfg.webrtc_port, 8666)
+        ch = VideoChannel.objects.get(line_code="W103")
+        self.assertEqual(ch.stream, "line1")
+        self.assertIn("admin:pwd", ch.rtsp)
+
+        public = Client().get("/api/energy/video-config")
+        self.assertEqual(public.status_code, 200)
+        body = public.json()
+        w103 = next(c for c in body["channels"] if c["lineCode"] == "W103")
+        self.assertNotIn("rtsp", w103)
+        self.assertEqual(body["gateway"]["base"], "http://10.9.9.9:1888")
+
+    def test_端口越界与非法RTSP返回400(self):
+        bad_port = self._put({"gateway": {"host": "1.2.3.4", "apiPort": 70000}})
+        self.assertEqual(bad_port.status_code, 400)
+        bad_rtsp = self._put(
+            {"gateway": {"host": "1.2.3.4"}, "channels": [{"lineCode": "W103", "rtsp": "http://x"}]}
+        )
+        self.assertEqual(bad_rtsp.status_code, 400)
+        self.assertIn("rtsp://", bad_rtsp.json()["detail"])
+
+    def test_产线主数据按nodeType只返回真实产线(self):
+        """产线主数据页只展示有产量的 1—6 线；辅机节点仍留给计量点归属下拉。"""
+        ws = ProductionLine.default_workshop()
+        ProductionLine.objects.create(
+            line_code="LINE-T1", line_name="测试产线", node_type=ProductionLine.NODE_LINE, parent=ws
+        )
+        ProductionLine.objects.create(
+            line_code="AUX-T1", line_name="测试辅机", node_type=ProductionLine.NODE_AUX, parent=ws
+        )
+        res = Client().get("/api/admin/lines", {"nodeType": "line", "pageSize": 200})
+        self.assertEqual(res.status_code, 200)
+        rows = res.json()["list"]
+        self.assertEqual([r["code"] for r in rows], ["LINE-T1"])
+        self.assertTrue(all(r["nodeType"] == ProductionLine.NODE_LINE for r in rows))
+        self.assertNotIn("AUX-T1", [r["code"] for r in rows])
+
+        all_nodes = Client().get("/api/admin/lines", {"pageSize": 200}).json()["list"]
+        self.assertIn("AUX-T1", [r["code"] for r in all_nodes])

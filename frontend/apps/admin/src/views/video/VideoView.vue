@@ -5,34 +5,65 @@
  * ⚠ 浏览器无法直接播放 `rtsp://`，必须由流媒体网关转协议。
  *   本项目采用 **go2rtc**（现场已在 `E:\能源产效管理平台\go2rtc_win64` 验证通过）。
  *
- * 本页承担三件事：
- *   ① 展示网关配置与协议优先级（只读，改配置在 shared/config.ts）
- *   ② 连接自检 —— 真实请求 go2rtc 的 /api/streams，核对通道流名是否存在
- *   ③ 通道列表 + 实时预览（iframe 载入 go2rtc 内置播放页，与大屏同一链路）
+ * 本页承担四件事：
+ *   ① 维护网关 IP / 端口（v1.7.5 起落库，不再改前端源码）
+ *   ② 维护各产线摄像头的 RTSP 源与 go2rtc 流名称
+ *   ③ 连接自检 —— 真实请求 go2rtc 的 /api/streams，核对通道流名是否存在
+ *   ④ 通道列表 + 实时预览（iframe 载入 go2rtc 内置播放页，与大屏同一链路）
  */
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
+import { ElMessage } from 'element-plus';
 import {
+  adminApi,
+  applyVideoConfig,
   go2rtcSnapshotUrl,
   go2rtcStreamsUrl,
   go2rtcUrl,
   linesConfig,
-  videoConfig,
-  type VideoChannel
+  type VideoChannelPayload,
+  type VideoConfigPayload
 } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
-import { notImplemented } from '@/utils/pending';
 
 interface Row {
   lineId: string;
   lineName: string;
-  ch: VideoChannel | undefined;
+  ch: VideoChannelPayload;
 }
 
-const rows: Row[] = linesConfig.map((l) => ({
-  lineId: l.id,
-  lineName: l.name,
-  ch: videoConfig.channels[l.id]
-}));
+function blankChannel(lineCode: string, lineName: string): VideoChannelPayload {
+  return {
+    lineCode,
+    lineName,
+    channel: '',
+    stream: '',
+    rtsp: '',
+    resolution: '1920×1080',
+    fps: 25,
+    codec: 'H.264',
+    enabled: false
+  };
+}
+
+const config = ref<VideoConfigPayload>({
+  enabled: true,
+  gateway: { host: '', apiPort: 1984, webrtcPort: 8555 },
+  channels: linesConfig.map((l) => blankChannel(l.id, l.name))
+});
+
+/** 固定按六条产线展示；后端缺哪条就用空通道补齐，保证现场可直接录入 */
+const rows = computed<Row[]>(() =>
+  linesConfig.map((l) => ({
+    lineId: l.id,
+    lineName: l.name,
+    ch: config.value.channels.find((c) => c.lineCode === l.id) ?? blankChannel(l.id, l.name)
+  }))
+);
+
+const gatewayBase = computed(() => {
+  const g = config.value.gateway;
+  return g.host ? `http://${g.host}:${g.apiPort}` : '';
+});
 
 /* ── 网关连接自检 ───────────────────────────────────────── */
 const testing = ref(false);
@@ -61,8 +92,8 @@ async function checkGateway() {
   }
 }
 
-/** 校验前端配置的流名是否真的存在于网关上 —— 这是最常见的一类配置错误 */
-function streamStatus(ch: VideoChannel | undefined): { text: string; type: 'success' | 'danger' | 'info' } {
+/** 校验配置的流名是否真的存在于网关上 —— 这是最常见的一类配置错误 */
+function streamStatus(ch: VideoChannelPayload | undefined): { text: string; type: 'success' | 'danger' | 'info' } {
   if (!ch) return { text: '未配置', type: 'info' };
   if (ch.enabled === false) return { text: '已停用', type: 'info' };
   if (gatewayOk.value === null) return { text: '未检测', type: 'info' };
@@ -73,12 +104,13 @@ function streamStatus(ch: VideoChannel | undefined): { text: string; type: 'succ
 }
 
 /** 只对有摄像头的通道做预览，避免 6 个空 iframe 反复重连 */
-const previewRows = ref<Row[]>([]);
 const showPreview = ref(false);
+const previewRows = computed<Row[]>(() =>
+  showPreview.value ? rows.value.filter((r) => r.ch.enabled !== false && r.ch.stream) : []
+);
 
 function togglePreview() {
   showPreview.value = !showPreview.value;
-  previewRows.value = showPreview.value ? rows.filter((r) => r.ch && r.ch.enabled !== false) : [];
 }
 
 /** 打开网关抓图（新窗口），用于快速确认摄像头画面是否正常 */
@@ -86,7 +118,55 @@ function openSnapshot(stream: string) {
   window.open(go2rtcSnapshotUrl(stream), '_blank', 'noopener');
 }
 
-onMounted(() => {
+/* ── 读写配置（v1.7.5）───────────────────────────────────── */
+const loading = ref(false);
+const saving = ref(false);
+
+async function loadConfig() {
+  loading.value = true;
+  try {
+    const cfg = await adminApi.getVideoConfig();
+    config.value = {
+      ...cfg,
+      channels: linesConfig.map(
+        (l) => cfg.channels.find((c) => c.lineCode === l.id) ?? blankChannel(l.id, l.name)
+      )
+    };
+    applyVideoConfig(config.value);
+  } catch (e) {
+    ElMessage.error(`读取视频配置失败：${(e as Error).message}`);
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function saveConfig() {
+  saving.value = true;
+  try {
+    const payload: VideoConfigPayload = {
+      ...config.value,
+      gateway: { ...config.value.gateway, enabled: config.value.enabled }
+    };
+    const saved = await adminApi.saveVideoConfig(payload);
+    config.value = {
+      ...saved,
+      channels: linesConfig.map(
+        (l) => saved.channels.find((c) => c.lineCode === l.id) ?? blankChannel(l.id, l.name)
+      )
+    };
+    // 让抓图 / 预览立即使用新网关地址，无需刷新页面
+    applyVideoConfig(config.value);
+    ElMessage.success('视频监控配置已保存');
+    void checkGateway();
+  } catch (e) {
+    ElMessage.error(`保存失败：${(e as Error).message}`);
+  } finally {
+    saving.value = false;
+  }
+}
+
+onMounted(async () => {
+  await loadConfig();
   void checkGateway();
 });
 </script>
@@ -98,8 +178,11 @@ onMounted(() => {
         <el-button :loading="testing" @click="checkGateway">
           <el-icon><Refresh /></el-icon>&nbsp;检测网关
         </el-button>
-        <el-button type="primary" :disabled="!previewRows.length && showPreview" @click="togglePreview">
+        <el-button :disabled="!previewRows.length && showPreview" @click="togglePreview">
           <el-icon><VideoCamera /></el-icon>&nbsp;{{ showPreview ? '关闭预览' : '打开预览' }}
+        </el-button>
+        <el-button type="primary" :loading="saving" @click="saveConfig">
+          <el-icon><Check /></el-icon>&nbsp;保存配置
         </el-button>
       </template>
     </PageHeader>
@@ -110,7 +193,7 @@ onMounted(() => {
       show-icon
       class="mb-16"
       title="链路说明：浏览器不能直接播放 rtsp://"
-      description="视频源是 RTSP，必须由 go2rtc 转成浏览器认识的协议。本页预览走 MSE（低延迟，直接载入 go2rtc 内置播放页）；大屏默认走 HLS → MJPEG，因为大屏是 transform: scale() 缩放舞台，跨域 iframe 内的视频在缩放祖先下可能不显示，且 iframe 类协议无法校验「到底有没有画面」。大屏上按 V 键可循环切换链路用于现场排查。改地址或通道请编辑 frontend/packages/shared/src/config.ts 的 videoConfig。"
+      description="视频源是 RTSP，必须由 go2rtc 转成浏览器认识的协议。本页可直接维护网关 IP / 端口与各产线摄像头的 RTSP 源，保存后落库；大屏刷新后按新配置取流。本页预览走 MSE（低延迟，直接载入 go2rtc 内置播放页）；大屏默认走 HLS → MJPEG，因为大屏是 transform: scale() 缩放舞台，跨域 iframe 内的视频在缩放祖先下可能不显示，且 iframe 类协议无法校验「到底有没有画面」。大屏上按 V 键可循环切换链路用于现场排查。"
     />
 
     <!-- ── 网关配置与自检 ───────────────────────────────── -->
@@ -122,28 +205,43 @@ onMounted(() => {
         <el-tag v-else type="info" size="small">未检测</el-tag>
       </div>
 
-      <el-descriptions :column="3" border size="small">
-        <el-descriptions-item label="网关类型">
-          <el-tag size="small" :type="videoConfig.provider === 'go2rtc' ? 'success' : 'info'">
-            {{ videoConfig.provider === 'go2rtc' ? 'go2rtc' : videoConfig.provider }}
-          </el-tag>
-        </el-descriptions-item>
-        <el-descriptions-item label="服务地址">
-          <span class="t-mono">{{ videoConfig.go2rtc.base || '未配置' }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="API / 播放页端口">
-          <span class="t-mono">{{ videoConfig.go2rtc.apiPort }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="WebRTC 端口">
-          <span class="t-mono">{{ videoConfig.go2rtc.webrtcPort }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="大屏协议优先级">
-          <span class="t-mono">{{ videoConfig.prefer.join(' → ') }}</span>
-        </el-descriptions-item>
-        <el-descriptions-item label="已接入摄像头">
-          <span class="t-mono">{{ rows.filter((r) => r.ch && r.ch.enabled !== false).length }} / {{ rows.length }} 路</span>
-        </el-descriptions-item>
-      </el-descriptions>
+      <el-form :model="config" label-width="120px" class="gateway-form">
+        <el-row :gutter="16">
+          <el-col :span="8">
+            <el-form-item label="网关 IP / 主机">
+              <el-input v-model="config.gateway.host" placeholder="如 10.113.1.61" clearable />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="API 端口">
+              <el-input-number v-model="config.gateway.apiPort" :min="1" :max="65535" controls-position="right" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="WebRTC 端口">
+              <el-input-number v-model="config.gateway.webrtcPort" :min="1" :max="65535" controls-position="right" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="启用视频">
+              <el-switch v-model="config.enabled" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="16">
+            <el-form-item label="服务地址">
+              <span class="t-mono">{{ gatewayBase || '未配置' }}</span>
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+
+      <el-alert
+        type="info"
+        :closable="false"
+        class="mb-12"
+        title="修改后请点右上角「保存配置」；大屏刷新页面后生效"
+        description="网关 IP / 端口对应 go2rtc 的 api.listen；WebRTC 端口对应 webrtc.listen。RTSP 源填各产线摄像头的原始地址（可含账号密码），仅后台可见，不会下发给大屏。"
+      />
 
       <el-alert
         v-if="gatewayOk !== null"
@@ -189,24 +287,25 @@ onMounted(() => {
 
       <el-table :data="rows" size="default">
         <el-table-column prop="lineId" label="产线" width="80" />
-        <el-table-column prop="lineName" label="产线名称" width="140" />
+        <el-table-column prop="lineName" label="产线名称" width="110" />
         <el-table-column label="通道号" width="100">
-          <template #default="{ row }"><span class="t-mono">{{ row.ch?.channel ?? '--' }}</span></template>
-        </el-table-column>
-        <el-table-column label="流名称（stream）" width="150">
-          <template #default="{ row }"><span class="t-mono">{{ row.ch?.stream ?? '--' }}</span></template>
-        </el-table-column>
-        <el-table-column label="RTSP 源（留档）" min-width="260" show-overflow-tooltip>
           <template #default="{ row }">
-            <span class="t-mono t-subtle">{{ row.ch?.rtsp || '未配置' }}</span>
+            <el-input v-model="row.ch.channel" size="small" placeholder="CH01" />
           </template>
         </el-table-column>
-        <el-table-column label="分辨率" width="120">
-          <template #default="{ row }"><span class="t-mono">{{ row.ch?.resolution ?? '--' }}</span></template>
-        </el-table-column>
-        <el-table-column label="码流" width="140">
+        <el-table-column label="流名称（stream）" width="150">
           <template #default="{ row }">
-            <span class="t-mono">{{ row.ch?.codec ?? '--' }} / {{ row.ch?.fps ?? '--' }}fps</span>
+            <el-input v-model="row.ch.stream" size="small" placeholder="go2rtc 流名" />
+          </template>
+        </el-table-column>
+        <el-table-column label="RTSP 源" min-width="300">
+          <template #default="{ row }">
+            <el-input v-model="row.ch.rtsp" size="small" placeholder="rtsp://user:pass@ip:554/..." />
+          </template>
+        </el-table-column>
+        <el-table-column label="启用" width="80">
+          <template #default="{ row }">
+            <el-switch v-model="row.ch.enabled" size="small" />
           </template>
         </el-table-column>
         <el-table-column label="配置校验" width="110">
@@ -214,15 +313,12 @@ onMounted(() => {
             <el-tag :type="streamStatus(row.ch).type" size="small">{{ streamStatus(row.ch).text }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column label="操作" width="90" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" :disabled="!row.ch" @click="notImplemented(`通道 ${row.ch?.channel} 配置编辑`)">
-              编辑
-            </el-button>
             <el-button
               link
               type="primary"
-              :disabled="!row.ch || row.ch.enabled === false"
+              :disabled="!row.ch.stream || row.ch.enabled === false"
               @click="openSnapshot(row.ch.stream)"
             >
               抓图
@@ -263,9 +359,9 @@ onMounted(() => {
         <el-descriptions-item label="⑤ 新增产线摄像头">
           先在 <span class="t-mono">go2rtc.yaml</span> 的 <span class="t-mono">streams</span> 下加一行
           （如 <span class="t-mono">a2: rtsp://...</span>），重启网关；
-          再把 <span class="t-mono">config.ts → videoConfig.channels.W101</span> 的
-          <span class="t-mono">stream</span> 改为 <span class="t-mono">a2</span>、
-          <span class="t-mono">enabled</span> 置为 <span class="t-mono">true</span>
+          再到本页「通道列表」填该产线的
+          <span class="t-mono">RTSP 源</span> 与 <span class="t-mono">流名称（stream）</span>，
+          打开 <span class="t-mono">启用</span> 并保存
         </el-descriptions-item>
       </el-descriptions>
     </div>
@@ -274,8 +370,13 @@ onMounted(() => {
 
 <style scoped lang="scss">
 .mb-16 { margin-bottom: 16px; }
+.mb-12 { margin-bottom: 12px; }
 .mt-12 { margin-top: 12px; }
 .card + .card { margin-top: 16px; }
+
+.gateway-form {
+  :deep(.el-form-item) { margin-bottom: 8px; }
+}
 
 .preview-grid {
   display: grid;

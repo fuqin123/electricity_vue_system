@@ -74,6 +74,37 @@ export interface CustomEndpoints {
   webrtc: string;
 }
 
+/** 后端「视频监控配置」接口的网关部分（v1.7.5） */
+export interface VideoGatewayPayload {
+  host: string;
+  apiPort: number;
+  webrtcPort: number;
+  /** 仅 PUT 时携带；GET 的启用状态在顶层 enabled */
+  enabled?: boolean;
+  /** 由后端按 host + apiPort 拼好，前端直接用 */
+  base?: string;
+}
+
+/** 后端「视频监控配置」接口的通道部分（大屏接口不含 rtsp） */
+export interface VideoChannelPayload {
+  lineCode: string;
+  lineName: string;
+  channel: string;
+  stream: string;
+  rtsp?: string;
+  resolution: string;
+  fps: number | null;
+  codec: string;
+  enabled: boolean;
+}
+
+/** 后端「视频监控配置」接口结构（v1.7.5 起由管理后台维护） */
+export interface VideoConfigPayload {
+  enabled: boolean;
+  gateway: VideoGatewayPayload;
+  channels: VideoChannelPayload[];
+}
+
 /** 视频监控总配置 */
 export interface VideoConfig {
   enabled: boolean;
@@ -278,6 +309,68 @@ export const videoConfig: VideoConfig = {
     W105: { flv: '', hls: '', webrtc: '' }
   }
 };
+
+/**
+ * 把后端下发的视频配置应用到运行时单例（v1.7.5）。
+ *
+ * 页面启动时调用一次即可：`videoConfig` 是普通对象，组件初始化时读到的是
+ * 已应用的值；网关 / 通道变更本来就要刷新页面才生效，不需要响应式。
+ */
+export function applyVideoConfig(remote?: VideoConfigPayload | null): void {
+  if (!remote) return;
+  if (typeof remote.enabled === 'boolean') videoConfig.enabled = remote.enabled;
+
+  const g = remote.gateway;
+  if (g) {
+    const apiPort = Number(g.apiPort) || videoConfig.go2rtc.apiPort;
+    videoConfig.go2rtc.enabled = Boolean(g.host);
+    videoConfig.go2rtc.apiPort = apiPort;
+    videoConfig.go2rtc.webrtcPort = Number(g.webrtcPort) || videoConfig.go2rtc.webrtcPort;
+    videoConfig.go2rtc.base = g.host ? `http://${g.host}:${apiPort}` : '';
+  }
+
+  if (Array.isArray(remote.channels)) {
+    for (const ch of remote.channels) {
+      videoConfig.channels[ch.lineCode] = {
+        channel: ch.channel,
+        stream: ch.stream,
+        rtsp: ch.rtsp ?? '',
+        resolution: ch.resolution,
+        fps: ch.fps ?? 0,
+        codec: ch.codec,
+        enabled: ch.enabled !== false
+      };
+    }
+  }
+}
+
+/** 内置默认值 → 与后端接口同结构（mock 模式 / 接口不可达时兜底） */
+export function localVideoConfigPayload(): VideoConfigPayload {
+  const names: Record<string, string> = {};
+  linesConfig.forEach((l) => {
+    names[l.id] = l.name;
+  });
+  return {
+    enabled: videoConfig.enabled,
+    gateway: {
+      host: videoConfig.go2rtc.base.replace(/^https?:\/\//, '').replace(/:\d+$/, ''),
+      apiPort: videoConfig.go2rtc.apiPort,
+      webrtcPort: videoConfig.go2rtc.webrtcPort,
+      base: videoConfig.go2rtc.base
+    },
+    channels: Object.entries(videoConfig.channels).map(([lineCode, ch]) => ({
+      lineCode,
+      lineName: names[lineCode] ?? lineCode,
+      channel: ch.channel,
+      stream: ch.stream,
+      rtsp: ch.rtsp,
+      resolution: ch.resolution,
+      fps: ch.fps,
+      codec: ch.codec,
+      enabled: ch.enabled !== false
+    }))
+  };
+}
 
 /**
  * 按协议拼出 go2rtc 的播放地址

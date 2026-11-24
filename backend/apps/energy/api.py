@@ -82,6 +82,8 @@ from .models import (
     ProductionLine,
     StandardUnitConsumption,
     SystemParam,
+    VideoChannel,
+    VideoGatewayConfig,
 )
 from .services import business_day as B
 from .services import standards as STD
@@ -1930,9 +1932,15 @@ def admin_alarm_ack(request: HttpRequest, pk: int) -> JsonResponse:
 
 @require_GET
 def admin_lines(request: HttpRequest) -> JsonResponse:
+    # v1.7.5：`?nodeType=line` 只看真实产线（产线主数据页）；
+    # 不传返回全部组织节点 —— 计量点的「所属产线」下拉仍需要车间 / 辅机节点（B-541）。
+    qs = ProductionLine.objects.select_related("parent").order_by("sort", "line_code")
+    node_type = str(request.GET.get("nodeType", "") or "").strip()
+    if node_type:
+        qs = qs.filter(node_type=node_type)
     rows = []
     # select_related("parent")：line_json 要读父节点名称，不预取会对每一行各查一次
-    for ln in ProductionLine.objects.select_related("parent").order_by("sort", "line_code"):
+    for ln in qs:
         cnt = ln.meters.filter(energy_type__type_code=EnergyType.ELECTRIC, enabled=True).count()
         rows.append(line_json(ln, meter_count=cnt))
     return json_ok(_paged(request, rows))
@@ -2975,3 +2983,125 @@ def _try_read(
     finally:
         collector.close()
     return {"durationMs": int((time.monotonic() - t0) * 1000), "items": items}
+
+
+# ── 视频监控配置（v1.7.5）─────────────────────────────────────
+
+
+def _video_channel_json(ch: VideoChannel, *, include_rtsp: bool) -> dict:
+    data = {
+        "lineCode": ch.line_code,
+        "lineName": ch.line_name,
+        "channel": ch.channel,
+        "stream": ch.stream,
+        "resolution": ch.resolution,
+        "fps": ch.fps,
+        "codec": ch.codec,
+        "enabled": ch.enabled,
+    }
+    if include_rtsp:
+        # RTSP 地址可能带摄像头账号密码，只给后台配置页；大屏不需要也不该拿到
+        data["rtsp"] = ch.rtsp
+    return data
+
+
+def _video_config_json(cfg: VideoGatewayConfig, *, include_rtsp: bool) -> dict:
+    return {
+        "enabled": cfg.enabled and bool(cfg.host),
+        "gateway": {
+            "host": cfg.host,
+            "apiPort": cfg.api_port,
+            "webrtcPort": cfg.webrtc_port,
+            "base": cfg.base,
+        },
+        "channels": [
+            _video_channel_json(ch, include_rtsp=include_rtsp)
+            for ch in VideoChannel.objects.all()
+        ],
+    }
+
+
+def _video_port(raw, *, label: str, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        port = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}必须是整数") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{label}必须在 1—65535 之间")
+    return port
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def admin_video_config(request: HttpRequest) -> JsonResponse:
+    """视频监控配置（后台「视频监控」页）。
+
+    GET  返回网关 IP / 端口与全部通道（含 RTSP 源）；
+    PUT  保存同样结构，管理员无需改前端源码即可换网关或摄像头。
+    """
+    cfg = VideoGatewayConfig.get_solo()
+
+    if request.method == "GET":
+        return json_ok(_video_config_json(cfg, include_rtsp=True))
+
+    try:
+        data = _body(request)
+        gateway = data.get("gateway") or {}
+        if not isinstance(gateway, dict):
+            raise ValueError("gateway 必须是 JSON 对象")
+        channels = data.get("channels") or []
+        if not isinstance(channels, list):
+            raise ValueError("channels 必须是数组")
+
+        with transaction.atomic():
+            cfg.host = str(gateway.get("host") or "").strip()
+            if len(cfg.host) > 120:
+                raise ValueError("网关地址过长（最多 120 个字符）")
+            cfg.api_port = _video_port(gateway.get("apiPort"), label="网关端口", default=1984)
+            cfg.webrtc_port = _video_port(gateway.get("webrtcPort"), label="WebRTC 端口", default=8555)
+            cfg.enabled = bool(gateway.get("enabled", True))
+            cfg.updated_by = str(data.get("updatedBy") or "admin")[:32]
+            cfg.save()
+
+            for idx, raw in enumerate(channels):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"第 {idx + 1} 个通道格式不正确")
+                line_code = str(raw.get("lineCode") or "").strip().upper()
+                if not line_code:
+                    raise ValueError(f"第 {idx + 1} 个通道缺少 lineCode")
+                rtsp = str(raw.get("rtsp") or "").strip()
+                if rtsp and not rtsp.lower().startswith("rtsp://"):
+                    raise ValueError(f"{line_code} 的 RTSP 地址必须以 rtsp:// 开头")
+                if len(rtsp) > 255:
+                    raise ValueError(f"{line_code} 的 RTSP 地址过长（最多 255 个字符）")
+                fps_raw = raw.get("fps")
+                try:
+                    fps = int(fps_raw) if fps_raw not in (None, "") else None
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{line_code} 的帧率必须是整数") from exc
+                VideoChannel.objects.update_or_create(
+                    line_code=line_code,
+                    defaults={
+                        "line_name": str(raw.get("lineName") or "")[:32],
+                        "channel": str(raw.get("channel") or "")[:16],
+                        "stream": str(raw.get("stream") or "")[:64],
+                        "rtsp": rtsp,
+                        "resolution": str(raw.get("resolution") or "")[:32],
+                        "fps": fps,
+                        "codec": str(raw.get("codec") or "")[:16],
+                        "enabled": bool(raw.get("enabled", False)),
+                        "sort": idx,
+                    },
+                )
+    except ValueError as exc:
+        return json_err(str(exc))
+
+    return json_ok(_video_config_json(VideoGatewayConfig.get_solo(), include_rtsp=True))
+
+
+@require_GET
+def energy_video_config(request: HttpRequest) -> JsonResponse:
+    """大屏启动时读取的视频配置（不含 RTSP 账号信息）。"""
+    return json_ok(_video_config_json(VideoGatewayConfig.get_solo(), include_rtsp=False))

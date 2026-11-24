@@ -24,7 +24,7 @@
  *   把演示数据当真实数据展示比白屏更危险（现场会据此判断生产情况）。
  */
 
-import { dataConfig } from '../config';
+import { dataConfig, localVideoConfigPayload, type VideoConfigPayload } from '../config';
 import {
   mockAdminOverview,
   mockCollectLogs,
@@ -363,6 +363,18 @@ export const energyApi = {
     if (!useApi('energy.periodSummary')) return delay([] as Record<string, unknown>[], 80);
     const res = await request<{ items: Record<string, unknown>[] }>('/api/energy/period-summary', { params });
     return res.items ?? [];
+  },
+
+  /** 视频监控配置（v1.7.5，大屏启动时应用；不含 RTSP 账号信息） */
+  async getVideoConfig(): Promise<VideoConfigPayload> {
+    if (dataConfig.mode === 'mock') return delay(localVideoConfigPayload(), 80);
+    try {
+      return await request<VideoConfigPayload>('/api/energy/video-config');
+    } catch (e) {
+      // 网关配置读不到不该让大屏白屏：退回内置默认值，并在控制台留痕
+      console.error('[视频配置接口不可达] 已退回内置默认值：', e);
+      return localVideoConfigPayload();
+    }
   }
 };
 
@@ -445,6 +457,18 @@ export const adminApi = {
     return request<{ saved: number; items: EnergyPriceRow[] }>('/api/admin/energy-prices', {
       method: 'PUT',
       body: JSON.stringify({ items })
+    });
+  },
+  /** 视频监控配置（v1.7.5）：网关 IP / 端口 + 各产线 RTSP 源 */
+  async getVideoConfig(): Promise<VideoConfigPayload> {
+    if (!useApi('admin.videoConfig')) return delay(localVideoConfigPayload(), 80);
+    return request<VideoConfigPayload>('/api/admin/video-config');
+  },
+  async saveVideoConfig(payload: VideoConfigPayload): Promise<VideoConfigPayload> {
+    if (!useApi('admin.videoConfig')) return delay(localVideoConfigPayload(), 120);
+    return request<VideoConfigPayload>('/api/admin/video-config', {
+      method: 'PUT',
+      body: JSON.stringify(payload)
     });
   },
   async getDicts(query: PageQuery = { page: 1, pageSize: 50 }): Promise<PageResult<DictItem>> {

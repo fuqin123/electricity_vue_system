@@ -1185,3 +1185,69 @@ class EnergyAlarm(models.Model):
 
     def __str__(self) -> str:
         return f"[{self.level}] {self.source} {self.content}"
+
+
+# ── 视频监控配置（v1.7.5）─────────────────────────────────────
+
+
+class VideoGatewayConfig(models.Model):
+    """视频转流网关（go2rtc）配置 —— 单例，pk 固定为 1。
+
+    v1.7.5 之前网关地址写死在前端 `shared/config.ts`，现场换网关 IP/端口
+    必须改源码重新发版。现在由后台「视频监控」页直接维护，大屏启动时读取。
+
+    ⚠ RTSP 源不在这里，见 `VideoChannel.rtsp`：一个网关会挂多路摄像头。
+    """
+
+    host = models.CharField("网关 IP / 主机名", max_length=120, blank=True, default="")
+    api_port = models.PositiveIntegerField("API / 播放页端口", default=1984)
+    webrtc_port = models.PositiveIntegerField("WebRTC 端口", default=8555)
+    enabled = models.BooleanField("启用视频模块", default=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+    updated_by = models.CharField("更新人", max_length=32, blank=True, default="")
+
+    class Meta:
+        db_table = "video_gateway_config"
+        verbose_name = "视频网关配置"
+        verbose_name_plural = "视频网关配置"
+
+    def __str__(self) -> str:
+        return self.base or "视频网关未配置"
+
+    @property
+    def base(self) -> str:
+        """前端拼播放地址用的基地址；未填 IP 时为空串（大屏显示「未配置」）。"""
+        return f"http://{self.host}:{self.api_port}" if self.host else ""
+
+    @classmethod
+    def get_solo(cls) -> "VideoGatewayConfig":
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class VideoChannel(models.Model):
+    """视频通道 —— 一条产线对应一路摄像头（RTSP 源 + go2rtc 流名）。
+
+    `stream` 必须与网关 `go2rtc.yaml` 中 `streams:` 下的 key 一致；
+    `rtsp` 只留档 / 展示，浏览器不能直接播放。
+    """
+
+    line_code = models.CharField("产线编码", max_length=16, unique=True)
+    line_name = models.CharField("产线名称", max_length=32, blank=True, default="")
+    channel = models.CharField("通道号", max_length=16, blank=True, default="")
+    stream = models.CharField("网关流名称", max_length=64, blank=True, default="")
+    rtsp = models.CharField("RTSP 源地址", max_length=255, blank=True, default="")
+    resolution = models.CharField("分辨率", max_length=32, blank=True, default="")
+    fps = models.PositiveIntegerField("帧率", null=True, blank=True)
+    codec = models.CharField("编码", max_length=16, blank=True, default="")
+    enabled = models.BooleanField("启用", default=False)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+
+    class Meta:
+        db_table = "video_channel"
+        ordering = ["sort", "line_code"]
+        verbose_name = "视频通道"
+        verbose_name_plural = "视频通道"
+
+    def __str__(self) -> str:
+        return f"{self.line_code} {self.channel} {self.stream}"
