@@ -404,51 +404,59 @@ function exportCsv() {
 
       <!--
         v-if 只是给「本区间无可显示时段」一个明确空态。
+        ⚠ 空态必须等**首次查询结束**再判断：`seriesKeys` 在接口返回前恒为空，
+          若和表格一起直接用 `v-else`，进页面会先闪一句「没有可显示时段」，
+          几秒后数据回来又突然变成表格 —— 现场会以为查询条件错了（v1.7.6 修复）。
         ⚠ 这里曾经排查过一次「动态列全部不渲染」，真因不在 el-table：
         是上方 ChartPanel 的 mounted 里 setOption 抛了 `yAxis "0" not found`
         （图表工厂把 yAxisIndex 算错了），**mounted 钩子抛异常会中断整棵子树挂载**，
         于是同页后面的表格一列都注册不上。症状在下游，病因在上游 —— 见 docs/02 B-521。
       -->
-      <el-table
-        v-if="seriesKeys.length"
-        v-loading="loading"
-        :data="rows"
-        size="small"
-        height="380"
-        border
-      >
-        <el-table-column prop="label" label="时间" min-width="120" />
-        <el-table-column
-          v-for="(key, idx) in seriesKeys"
-          :key="key"
-          :label="tableSeries[idx].name"
-          min-width="120"
-          align="right"
+      <div v-loading="loading" class="usage-table">
+        <el-table
+          v-if="seriesKeys.length"
+          :data="rows"
+          size="small"
+          height="380"
+          border
         >
-          <template #default="{ row }">
-            <span :class="{ 'is-missing': row.values[idx] === null }">{{ fmtCell(row.values[idx], 1) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="用水(t)" min-width="110" align="right">
-          <template #default="{ row }">
-            <span :class="{ 'is-missing': row.water === null }">{{ fmtCell(row.water, 2) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="用汽(t)" min-width="110" align="right">
-          <template #default="{ row }">
-            <span :class="{ 'is-missing': row.steam === null }">{{ fmtCell(row.steam, 2) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="数据质量" min-width="110">
-          <template #default="{ row }">
-            <el-tag v-if="row.quality === 'ok'" type="success" size="small">完整</el-tag>
-            <el-tag v-else-if="row.quality === 'partial'" type="warning" size="small">部分缺数</el-tag>
-            <el-tag v-else-if="row.quality" type="info" size="small">缺数</el-tag>
-            <span v-else>—</span>
-          </template>
-        </el-table-column>
-      </el-table>
-      <el-empty v-else description="本区间没有可显示的时段，换一段时间或放宽筛选再查" :image-size="72" />
+          <el-table-column prop="label" label="时间" min-width="120" />
+          <el-table-column
+            v-for="(key, idx) in seriesKeys"
+            :key="key"
+            :label="tableSeries[idx].name"
+            min-width="120"
+            align="right"
+          >
+            <template #default="{ row }">
+              <span :class="{ 'is-missing': row.values[idx] === null }">{{ fmtCell(row.values[idx], 1) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="用水(t)" min-width="110" align="right">
+            <template #default="{ row }">
+              <span :class="{ 'is-missing': row.water === null }">{{ fmtCell(row.water, 2) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="用汽(t)" min-width="110" align="right">
+            <template #default="{ row }">
+              <span :class="{ 'is-missing': row.steam === null }">{{ fmtCell(row.steam, 2) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="数据质量" min-width="110">
+            <template #default="{ row }">
+              <el-tag v-if="row.quality === 'ok'" type="success" size="small">完整</el-tag>
+              <el-tag v-else-if="row.quality === 'partial'" type="warning" size="small">部分缺数</el-tag>
+              <el-tag v-else-if="row.quality" type="info" size="small">缺数</el-tag>
+              <span v-else>—</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty
+          v-else-if="!loading"
+          description="本区间没有可显示的时段，换一段时间或放宽筛选再查"
+          :image-size="72"
+        />
+      </div>
     </el-card>
   </div>
 </template>
@@ -483,5 +491,9 @@ function exportCsv() {
 }
 .is-missing {
   color: var(--el-text-color-placeholder);
+}
+/* 首屏加载时保住高度，避免空态/表格切换导致整页跳动 */
+.usage-table {
+  min-height: 380px;
 }
 </style>

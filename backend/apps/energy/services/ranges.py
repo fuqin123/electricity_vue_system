@@ -141,6 +141,23 @@ def _line_meters(line: ProductionLine) -> list[EnergyMeter]:
     ]
 
 
+def _binding_workshop_id(workshop: str | None) -> int | None:
+    """`BWS-<id>`（绑定树虚拟车间编码）→ 绑定车间主键；真实车间编码返回 None。
+
+    绑定树车间的编码只存在于分类树里，`production_line` 没有对应行；
+    若把它当真实编码去查 `line__line_code`，结果必然是 0 个计量点。
+    """
+    if not workshop:
+        return None
+    code = str(workshop).strip().upper()
+    if not code.startswith("BWS-"):
+        return None
+    try:
+        return int(code[len("BWS-"):])
+    except ValueError:
+        return None
+
+
 def meters_of(
     *,
     kind: str | None = None,
@@ -166,19 +183,31 @@ def meters_of(
     qs = EnergyMeter.objects.select_related("line", "line__parent", "energy_type")
     if kind:
         qs = qs.filter(energy_type__type_code=_type_code(kind))
-    if node_code:
-        qs = qs.filter(line__line_code=node_code)
-    elif workshop:
-        # 车间维度：匹配「挂在本车间下的节点」或「车间节点自己」（总表）
-        qs = qs.filter(
-            Q(line__line_code=workshop)
-            | Q(line__parent__line_code=workshop)
-        )
-    if usage_type:
-        qs = qs.filter(usage_type=usage_type)
-    if device:
+
+    binding_ws_id = _binding_workshop_id(workshop)
+    if binding_ws_id is not None:
+        # 绑定树车间：计量点不按 production_line 归属，而是挂在「设备 → 类型」下。
+        # 只选车间（没选类型/设备）时也必须能取到该车间全部已绑定表。
+        qs = qs.filter(binding_assignments__device__type__workshop_id=binding_ws_id)
+        if usage_type:
+            qs = qs.filter(binding_assignments__device__type__name=usage_type)
+        if device:
+            qs = qs.filter(binding_assignments__device__name=device)
+    else:
+        if node_code:
+            qs = qs.filter(line__line_code=node_code)
+        elif workshop:
+            # 车间维度：匹配「挂在本车间下的节点」或「车间节点自己」（总表）
+            qs = qs.filter(
+                Q(line__line_code=workshop)
+                | Q(line__parent__line_code=workshop)
+            )
+        if usage_type:
+            qs = qs.filter(usage_type=usage_type)
+    if device and binding_ws_id is None:
         qs = qs.filter(device_name=device)
-    return list(qs.filter(enabled=True).order_by("code"))
+    # 同一块表可能被同类型下多个设备勾选，按表去重后再返回
+    return list(qs.filter(enabled=True).distinct().order_by("code"))
 
 
 def _type_code(kind: str) -> str:
@@ -210,6 +239,18 @@ def _workshop_meters(workshop: str | None = None) -> list[EnergyMeter]:
       此前该参数被静默忽略 —— 界面上写着「碳水车间」，算的却是全厂数字。
       只有一个车间时两者恰好相等，所以一直没暴露；第二个车间一接入就会错。
     """
+    binding_ws_id = _binding_workshop_id(workshop)
+    if binding_ws_id is not None:
+        # 绑定树车间：车间合计 = 该车间所有设备勾选的电表（按表去重）。
+        # ⚠ v1.7.6 修复：此前直接把 BWS-<id> 当 production_line 编码查，
+        #   结果恒为 0 个计量点，界面显示「命中 0 个计量点」且区间合计为空。
+        qs = EnergyMeter.objects.filter(
+            energy_type__type_code=EnergyType.ELECTRIC,
+            enabled=True,
+            binding_assignments__device__type__workshop_id=binding_ws_id,
+        ).distinct()
+        return list(qs.order_by("code"))
+
     qs = EnergyMeter.objects.filter(
         energy_type__type_code=EnergyType.ELECTRIC,
         enabled=True,

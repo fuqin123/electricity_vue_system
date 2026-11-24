@@ -4069,6 +4069,54 @@ class MeterBindingTests(TestCase):
         self.assertEqual(cleared.status_code, 200)
         self.assertEqual(cleared.json()["device"]["meterCount"], 0)
 
+    def test_只选绑定车间时合计取该车间全部已绑定电表(self):
+        """v1.7.6：只选车间、不选类型/设备时，不能把 BWS-<id> 当产线编码查。
+
+        现场现象：车间已在「计量绑定」里绑好电表，但电计量页只选车间时
+        显示「命中 0 个计量点」，区间合计为空。根因是 `_workshop_meters()`
+        把虚拟车间编码 `BWS-1` 直接拿去匹配 `production_line.line_code`。
+        """
+        ws_id, _type_id, device1 = self._tree_fixture(device_name="一线")
+        self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device1}/meters",
+            {"meterCodes": [self.m1.code, self.m2.code]},
+        )
+        device2 = self._api(
+            "post",
+            "/api/admin/meter-binding-devices",
+            {"typeId": _type_id, "name": "辅机"},
+        ).json()["device"]["id"]
+        self._api(
+            "put",
+            f"/api/admin/meter-binding-devices/{device2}/meters",
+            {"meterCodes": [self.m_aux.code]},
+        )
+
+        res = self._api(
+            "get",
+            "/api/energy/range",
+            {
+                "date": self.day.isoformat(),
+                "granularity": "hour",
+                "scope": "workshop",
+                "kind": "elec",
+                "workshop": f"BWS-{ws_id}",
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.content)
+        body = res.json()
+        self.assertEqual(body["meterCount"], 3)
+        self.assertEqual(body["series"][0]["key"], "workshop")
+        self.assertEqual(body["series"][0]["values"][8], 35.0)
+        self.assertEqual(body["totals"]["kwh"], 840.0)
+
+        # 直接调 ranges 的唯一取数入口，锁住 workshop 级筛选也能命中绑定表
+        codes = sorted(
+            m.code for m in ranges.meters_of(kind="elec", workshop=f"BWS-{ws_id}")
+        )
+        self.assertEqual(codes, ["TB-AUX-E1", "TB-E1", "TB-E2"])
+
     def test_按设备按类型按单表查询用量(self):
         ws_id, type_id, device1 = self._tree_fixture(device_name="一线")
         self._api(
