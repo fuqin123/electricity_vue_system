@@ -131,13 +131,23 @@ def next_run_at(now: datetime | None = None) -> datetime:
 
 
 def nearest_slot(moment: datetime) -> datetime:
-    """离指定时刻最近的整点边界（手工采集 / 非常驻调用使用）。
+    """手工采集归属的采样槽 —— **只能落在已经开始采样的槽**。
 
-    `--if-due` 必须用 `due_slot()`（它知道补采窗口）；只有「现在就要读一轮、
-    不属于任何补采」的场景才用本函数，避免把手工读数归到上一槽。
+    `--if-due` 必须用 `due_slot()`（它知道补采窗口）；「现在就要读一轮、
+    不属于任何补采」的场景用本函数。
+
+    ⚠ v1.8.6 修复（B-561）：旧实现取「最近的整点」，14:40 会返回 15:00。
+    结果这条 14:40 的读数被写成 15:00 槽的边界读数，计划任务 15:10 再查询时
+    发现「15:00 槽已采全」直接跳过 —— 现场看到的就是「该在 15:10 读的表没有读数」。
+    边界读数必须发生在边界**之后**，所以：
+      · 本槽采样时刻（B + offset）已到 → 归本槽；
+      · 还没到 → 上一槽（它的补采窗口仍开放，见 `due_slot`）。
+    绝不返回未来槽。
     """
     b = hour_start(moment)
-    return b if (moment - b) <= (b + timedelta(hours=1) - moment) else b + timedelta(hours=1)
+    if moment >= slot_ready_at(b):
+        return b
+    return b - timedelta(hours=1)
 
 
 def describe() -> str:

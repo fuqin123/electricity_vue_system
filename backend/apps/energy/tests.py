@@ -431,14 +431,20 @@ class SlotTests(TestCase):
             slots.due_slot(datetime(2026, 9, 22, 16, 1, 0)), datetime(2026, 9, 22, 16, 0, 0)
         )
 
-    def test_手工采集归属到最近的整点(self):
+    def test_手工采集只能归属到已经开始采样的槽(self):
         from apps.energy.services import slots
 
+        # 15:29：15:00 槽已开始（默认 offset 60 秒）→ 15:00
         self.assertEqual(
             slots.nearest_slot(datetime(2026, 9, 22, 15, 29, 0)), datetime(2026, 9, 22, 15, 0, 0)
         )
+        # 15:31 仍在 15:00 槽，不能提前占用 16:00 槽（B-561）
         self.assertEqual(
-            slots.nearest_slot(datetime(2026, 9, 22, 15, 31, 0)), datetime(2026, 9, 22, 16, 0, 0)
+            slots.nearest_slot(datetime(2026, 9, 22, 15, 31, 0)), datetime(2026, 9, 22, 15, 0, 0)
+        )
+        # 15:00:30 还没到 15:00 槽的采样时刻 → 上一槽
+        self.assertEqual(
+            slots.nearest_slot(datetime(2026, 9, 22, 15, 0, 30)), datetime(2026, 9, 22, 14, 0, 0)
         )
 
     def test_下一次运行时刻(self):
