@@ -190,10 +190,10 @@ function deltaStatus(row: PlcReadingRow): { label: string; type: 'success' | 'in
       empty-text="所选时间内没有 PLC 原始读数"
     >
       <template #col-value="{ row }">
-        <span class="mono">{{ valueText(row.value) }}</span>
+        <span>{{ valueText(row.value) }}</span>
       </template>
       <template #col-delta="{ row }">
-        <span class="mono">{{ deltaText(row) }}</span>
+        <span>{{ deltaText(row) }}</span>
         <el-tag v-if="deltaStatus(row)" size="small" :type="deltaStatus(row)!.type" class="ml-6">
           {{ deltaStatus(row)!.label }}
         </el-tag>
@@ -217,8 +217,5 @@ function deltaStatus(row: PlcReadingRow): { label: string; type: 'success' | 'in
 .query-label {
   font-size: 13px;
   color: var(--el-text-color-regular);
-}
-.mono {
-  font-family: monospace;
 }
 </style>
