@@ -35,6 +35,13 @@ const {
   data,
   load,
   rows,
+  outputs,
+  outputUnit,
+  unitValues,
+  unitName,
+  showUsage,
+  showOutput,
+  showUnit,
   totals,
   missingBuckets,
   emptyHint,
@@ -73,12 +80,25 @@ const totalT = computed(() => {
  * 列宽一律 min-width：全用固定 width 时 el-table 不会把剩余空间分给任何列，
  * 右侧就空出一大片（B-520 的「字段头分布不均」）。
  */
-const columns: TableColumn<UsageRow>[] = [
-  { prop: 'label', label: '时间', minWidth: 140, mono: true },
-  { prop: 'usageText', label: `本时段用量（${meta.unit}）`, minWidth: 160, mono: true },
-  { prop: 'deltaText', label: '较上一时段', minWidth: 130, mono: true },
-  { prop: 'quality', label: '数据质量', minWidth: 130, slot: 'col-quality' }
-];
+const columns = computed<TableColumn<UsageRow>[]>(() => {
+  const list: TableColumn<UsageRow>[] = [
+    { prop: 'label', label: '时间', minWidth: 140, mono: true }
+  ];
+  if (showUsage.value) {
+    list.push({ prop: 'usageText', label: `本时段用量（${meta.unit}）`, minWidth: 160, mono: true });
+  }
+  if (showOutput.value) {
+    list.push({ prop: 'outputText', label: `产量（${outputUnit.value}）`, minWidth: 130, mono: true });
+  }
+  if (showUnit.value) {
+    list.push({ prop: 'unitText', label: `单耗（${unitName.value || `${meta.unit}/标箱`}）`, minWidth: 160, mono: true });
+  }
+  list.push(
+    { prop: 'deltaText', label: '较上一时段', minWidth: 130, mono: true },
+    { prop: 'quality', label: '数据质量', minWidth: 130, slot: 'col-quality' }
+  );
+  return list;
+});
 
 function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
   const page = Math.max(1, query.page ?? 1);
@@ -166,7 +186,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
             :value="t.usageType"
           />
         </el-select>
-        <span class="query__label">设备 / 仪表</span>
+        <span class="query__label">设备</span>
         <el-select
           v-model="node"
           size="small"
@@ -180,20 +200,27 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
             <el-option v-for="n in g.items" :key="n.value" :label="n.label" :value="n.value" />
           </el-option-group>
         </el-select>
+        <span class="query__label">显示</span>
+        <el-checkbox v-model="showUsage" size="small" @change="load">用量</el-checkbox>
+        <el-checkbox v-model="showOutput" size="small" @change="load">产量</el-checkbox>
+        <el-checkbox v-model="showUnit" size="small" @change="load">单耗</el-checkbox>
         <el-button-group>
           <el-button v-for="q in QUICK" :key="q.label" size="small" @click="applyQuick(q.hours, q.gran)">
             {{ q.label }}
           </el-button>
         </el-button-group>
         <el-button type="primary" size="small" :loading="loading" @click="load">查询</el-button>
-        <span class="query__hint">{{ selectionLabel }}</span>
+      </div>
+      <!-- 与电计量页统一：以下方一行展示当前口径与绑定入口 -->
+      <div class="query__hint-row">
+        <el-tag size="small" type="info" effect="plain">{{ selectionLabel }}</el-tag>
+        <span class="query__hint">
+          {{ selectedMeters.names.length ? `口径：${selectedMeters.names.slice(0, 4).join('、')}` : '车间总表口径' }}
+          <template v-if="selectedMeters.names.length > 4"> 等 {{ selectedMeters.names.length }} 块表</template>
+        </span>
         <el-button link type="primary" size="small" @click="router.push('/energy-config/meter-binding')">
           管理绑定
         </el-button>
-      </div>
-      <div v-if="selectedMeters.names.length" class="query__hint">
-        口径：{{ selectedMeters.names.slice(0, 4).join('、') }}
-        <template v-if="selectedMeters.names.length > 4"> 等 {{ selectedMeters.names.length }} 块表</template>
       </div>
     </el-card>
 
@@ -221,6 +248,22 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         :color="missingBuckets > 0 ? '#bd7e00' : '#2a814b'"
         :loading="loading"
         foot="缺数显示 --，不补 0"
+      />
+      <StatCard
+        label="区间产量"
+        :value="outputs.some((v) => v !== null) ? int(outputs.reduce<number>((a, v) => a + (v ?? 0), 0)) : '--'"
+        :unit="outputUnit"
+        color="#2a814b"
+        :loading="loading"
+        foot="水/汽按整个车间的产量计算"
+      />
+      <StatCard
+        label="区间单耗"
+        :value="unitValues.some((v) => v !== null) ? (unitValues.filter((v) => v !== null).pop() as number).toFixed(3) : '--'"
+        :unit="unitName || `${meta.unit}/标箱`"
+        color="#bd7e00"
+        :loading="loading"
+        foot="累计单耗 = 区间用量 ÷ 区间产量"
       />
       <StatCard
         :label="`模型基准${isSteam ? '汽耗' : '水耗'}强度`"
@@ -279,5 +322,12 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
 .query__hint {
   font-size: 12px;
   color: var(--el-text-color-placeholder);
+}
+.query__hint-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
 }
 </style>

@@ -191,6 +191,7 @@ function blankPoint() {
     startOffset: 0,
     bitOffset: null as number | null,
     dataType: 'uint32' as PlcPoint['dataType'],
+    role: 'counter' as PlcPoint['role'],
     counterMode: 'cumulative' as PlcPoint['counterMode'],
     scale: 1,
     unit: '瓶',
@@ -224,6 +225,7 @@ function openPointEdit(p: PlcPoint) {
     startOffset: p.startOffset,
     bitOffset: p.bitOffset,
     dataType: p.dataType,
+    role: p.role,
     counterMode: p.counterMode,
     scale: p.scale,
     unit: p.unit,
@@ -388,6 +390,13 @@ onMounted(loadDevices);
         <el-table-column label="类型" width="130">
           <template #default="{ row }">{{ row.dataTypeLabel }}</template>
         </el-table-column>
+        <el-table-column label="用途" width="150">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.role === 'bottle' || row.role === 'case' ? 'success' : 'info'">
+              {{ row.roleLabel }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="计数方式" width="110">
           <template #default="{ row }">
             {{ row.counterMode === 'cumulative' ? '累计值' : '瞬时值' }}
@@ -498,6 +507,14 @@ onMounted(loadDevices);
         </el-form-item>
         <el-form-item v-if="pointForm.dataType === 'bool'" label="位偏移">
           <el-input-number v-model="pointForm.bitOffset" :min="0" :max="7" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="点位用途">
+          <el-select v-model="pointForm.role" style="width: 100%">
+            <el-option label="普通计数（沿用瓶数）" value="counter" />
+            <el-option label="01 电眼 · 瓶数" value="bottle" />
+            <el-option label="02 电眼 · 箱数" value="case" />
+            <el-option label="产品规格 ml（当前选择）" value="spec" />
+          </el-select>
         </el-form-item>
         <el-form-item label="计数方式">
           <el-radio-group v-model="pointForm.counterMode">

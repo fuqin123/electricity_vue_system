@@ -566,6 +566,8 @@ export interface EnergyUsageSeries {
   data: (number | null)[];
   /** 该能源在当前口径下根本没有数据（如选单线时的水/汽） */
   emptyHint?: string;
+  /** 图表形态：用量/单耗用线，产量用柱（v1.8.1） */
+  type?: 'line' | 'bar';
 }
 
 export function energyUsageOption(
@@ -628,16 +630,17 @@ export function energyUsageOption(
     ],
     series: shown.map((s, i) => ({
       name: `${s.name}（${s.unit}）`,
-      type: "line" as const,
+      type: s.type ?? "line",
       yAxisIndex: i,
       data: s.data,
       connectNulls: false,
-      smooth: true,
+      smooth: s.type === "bar" ? false : true,
       symbol: "circle" as const,
       symbolSize: 5,
+      barMaxWidth: 22,
       lineStyle: { width: 2.2, color: s.color },
-      itemStyle: { color: s.color, borderColor: "#ffffff", borderWidth: 1.5 },
-      areaStyle: { color: s.color, opacity: 0.1 },
+      itemStyle: { color: s.color, borderColor: "#ffffff", borderWidth: 1.5, opacity: s.type === "bar" ? 0.75 : 1 },
+      areaStyle: s.type === "bar" ? undefined : { color: s.color, opacity: 0.1 },
     })),
   } as EChartsOption;
 }

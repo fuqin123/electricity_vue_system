@@ -12,6 +12,7 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import {
   adminApi,
+  type StandardCaseRule,
   type StandardUnitLineOption,
   type StandardUnitOptions,
   type StandardUnitRow
@@ -166,7 +167,99 @@ async function remove(row: StandardUnitRow) {
   }
 }
 
-onMounted(load);
+/* ── 标箱换算规则（v1.8.1）──────────────────────────────── */
+const caseRules = ref<StandardCaseRule[]>([]);
+const caseLoading = ref(false);
+const caseSaving = ref(false);
+const caseDialog = reactive({
+  visible: false,
+  editingId: null as number | null,
+  inCount: 12,
+  ml: 500,
+  factor: 1,
+  remark: ''
+});
+
+function loadCaseRules() {
+  caseLoading.value = true;
+  adminApi
+    .getStandardCaseRules()
+    .then((rows) => {
+      caseRules.value = rows;
+    })
+    .catch((e: Error) => ElMessage.error(e.message))
+    .finally(() => {
+      caseLoading.value = false;
+    });
+}
+
+function openCaseAdd() {
+  Object.assign(caseDialog, { visible: true, editingId: null, inCount: 12, ml: 500, factor: 1, remark: '' });
+}
+
+function openCaseEdit(row: StandardCaseRule) {
+  Object.assign(caseDialog, {
+    visible: true,
+    editingId: row.id,
+    inCount: row.inCount,
+    ml: row.ml,
+    factor: row.factor,
+    remark: row.remark
+  });
+}
+
+async function saveCaseRule() {
+  if (!caseDialog.inCount || !caseDialog.ml || !caseDialog.factor) {
+    ElMessage.warning('入数、ml、设定值都必须大于 0');
+    return;
+  }
+  caseSaving.value = true;
+  try {
+    const payload = {
+      inCount: caseDialog.inCount,
+      ml: caseDialog.ml,
+      factor: caseDialog.factor,
+      remark: caseDialog.remark
+    };
+    if (caseDialog.editingId) {
+      await adminApi.updateStandardCaseRule(caseDialog.editingId, payload);
+      ElMessage.success('标箱换算规则已保存');
+    } else {
+      await adminApi.createStandardCaseRule(payload);
+      ElMessage.success('标箱换算规则已新增');
+    }
+    caseDialog.visible = false;
+    loadCaseRules();
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  } finally {
+    caseSaving.value = false;
+  }
+}
+
+async function removeCaseRule(row: StandardCaseRule) {
+  try {
+    await ElMessageBox.confirm(
+      `删除「${row.inCount}入 / ${row.ml}ml → ${row.factor}」的标箱换算规则？`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    );
+  } catch {
+    return;
+  }
+  try {
+    await adminApi.deleteStandardCaseRule(row.id);
+    ElMessage.success('已删除');
+    loadCaseRules();
+  } catch (e) {
+    ElMessage.error((e as Error).message);
+  }
+}
+
+onMounted(() => {
+  load();
+  loadCaseRules();
+});
 </script>
 
 <template>
@@ -250,6 +343,65 @@ onMounted(load);
       </el-table>
     </el-card>
 
+    <!-- 标箱换算（v1.8.1）：01 电眼瓶数 / 02 电眼箱数 → 标箱 -->
+    <el-card shadow="never" class="mt-16">
+      <template #header>
+        <div class="card-head">
+          <div>
+            <b>标箱换算</b>
+            <span class="card-head__note">
+              标箱数 = 箱数 × 设定值（四舍五入）；实际入数 = 01 电眼瓶数 ÷ 02 电眼箱数
+            </span>
+          </div>
+          <el-button size="small" type="primary" @click="openCaseAdd">新增规则</el-button>
+        </div>
+      </template>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="mb-12"
+        title="示例：12 入（瓶/箱）+ 330ml → 设定值 1.25，标箱数 = 箱数 × 1.25"
+        description="PLC 会读取现场选择的 ml 数；未配置对应规则时按 1.0 计，并在产量记录里标记「未命中规则」。"
+      />
+      <el-table v-loading="caseLoading" :data="caseRules" border stripe empty-text="暂无标箱换算规则">
+        <el-table-column prop="inCount" label="入数（瓶/箱）" width="140" align="right" />
+        <el-table-column prop="ml" label="ml 数" width="120" align="right" />
+        <el-table-column prop="factor" label="设定值" width="140" align="right" />
+        <el-table-column label="说明" min-width="200">
+          <template #default="{ row }">{{ row.remark || '—' }}</template>
+        </el-table-column>
+        <el-table-column prop="updatedAt" label="更新时间" width="170" />
+        <el-table-column label="操作" width="130" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" @click="openCaseEdit(row)">修改</el-button>
+            <el-button link type="danger" @click="removeCaseRule(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-dialog v-model="caseDialog.visible" :title="caseDialog.editingId ? '修改标箱换算' : '新增标箱换算'" width="460px">
+      <el-form label-width="120px">
+        <el-form-item label="入数（瓶/箱）" required>
+          <el-input-number v-model="caseDialog.inCount" :min="1" :max="999" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="ml 数" required>
+          <el-input-number v-model="caseDialog.ml" :min="1" :max="100000" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="设定值" required>
+          <el-input-number v-model="caseDialog.factor" :min="0.0001" :step="0.05" :precision="4" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="说明">
+          <el-input v-model="caseDialog.remark" maxlength="200" show-word-limit placeholder="可选" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="caseDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="caseSaving" @click="saveCaseRule">保存</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog
       v-model="dialog.visible"
       :title="dialog.adding ? '新增标准单耗' : '修改标准单耗'"
@@ -310,6 +462,23 @@ onMounted(load);
 <style scoped>
 .mb-16 {
   margin-bottom: 16px;
+}
+.mb-12 {
+  margin-bottom: 12px;
+}
+.mt-16 {
+  margin-top: 16px;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.card-head__note {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 .filters {
   display: flex;

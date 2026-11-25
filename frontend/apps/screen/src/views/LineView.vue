@@ -140,9 +140,9 @@ const kpiCards = computed<KpiCard[]>(() => {
   const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
   const hRef = hOut ?? 0;
   const hDelta = hRef ? ((hRef - hPlan) / hPlan) * 100 : null;
-  const yq = big(l.year.output, '瓶');
+  const yq = big(l.year.output, '标箱');
   const yk = big(l.year.kwh, 'kWh');
-  const mq = big(l.month.output, '瓶');
+  const mq = big(l.month.output, '标箱');
   const mk = big(l.month.kwh, 'kWh');
   const dk = big(l.today.kwh, 'kWh');
   const hk = big(h?.kwh ?? 0, 'kWh');
@@ -170,7 +170,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       tag: '日',
       color: '#a78bfa',
       label: '本生产日累计产量',
-      value: big(l.today.output, '瓶'),
+      value: big(l.today.output, '标箱'),
       delta: prodOn ? rise(l.today.output, l.yesterday.output) : null,
       sub: `完成率 ${rateText} · 用电 ${dk.v}${dk.u}`
     },
@@ -183,7 +183,7 @@ const kpiCards = computed<KpiCard[]>(() => {
         : h?.partial
           ? '当前小时（进行中）'
           : '当前小时产量',
-      value: { v: int(hOut), u: '瓶' },
+      value: { v: int(hOut), u: '标箱' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
     }

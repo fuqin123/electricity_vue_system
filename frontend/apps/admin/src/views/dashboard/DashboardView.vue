@@ -283,7 +283,7 @@ const costNote = computed(() => {
       <StatCard
         label="区间累计产量"
         :value="big(t?.output ?? null, '').v"
-        :unit="big(t?.output ?? null, '瓶').u"
+        :unit="big(t?.output ?? null, '标箱').u"
         color="#86909c"
         :loading="loading"
         :foot="dash && !dash.productionAvailable ? '产量数据源未接入，统一显示 --' : '来自 MES / 计数器报工'"

@@ -1365,6 +1365,19 @@ class PlcPoint(models.Model):
         DT_BOOL: 1,
     }
 
+    # v1.8.1：同一个 PLC 设备上可能同时挂三类点——
+    #   01 电眼（瓶数）/ 02 电眼（箱数）/ 产品规格（ml，由现场人员选择）。
+    ROLE_COUNTER = "counter"
+    ROLE_BOTTLE = "bottle"
+    ROLE_CASE = "case"
+    ROLE_SPEC = "spec"
+    ROLE_CHOICES = [
+        (ROLE_COUNTER, "普通计数（沿用瓶数口径）"),
+        (ROLE_BOTTLE, "01 电眼 · 瓶数"),
+        (ROLE_CASE, "02 电眼 · 箱数"),
+        (ROLE_SPEC, "产品规格（ml，当前选择）"),
+    ]
+
     MODE_CUMULATIVE = "cumulative"
     MODE_INSTANT = "instant"
     COUNTER_MODE_CHOICES = [
@@ -1384,6 +1397,10 @@ class PlcPoint(models.Model):
         "位偏移", null=True, blank=True, help_text="仅 bool 使用，0—7"
     )
     data_type = models.CharField("数据类型", max_length=12, choices=DATA_TYPE_CHOICES, default=DT_UINT32)
+    role = models.CharField(
+        "点位用途", max_length=12, choices=ROLE_CHOICES, default=ROLE_COUNTER,
+        help_text="01 瓶数 / 02 箱数 / 产品规格 ml；标箱产量需要瓶数 + 箱数（+ 可选 ml）",
+    )
     counter_mode = models.CharField(
         "计数方式", max_length=12, choices=COUNTER_MODE_CHOICES, default=MODE_CUMULATIVE
     )
@@ -1539,6 +1556,102 @@ class ProductionBindingDevice(models.Model):
 
     def __str__(self) -> str:
         return f"{self.type_id}/{self.name}"
+
+
+class StandardCaseRule(models.Model):
+    """标箱换算规则（v1.8.1）：`(入数, ml) → 设定值`。
+
+    现场示例：12 入（瓶/箱）+ 330ml → 设定值 1.25，标箱数 = 箱数 × 1.25（取整）。
+    由「能源配置管理 → 标准单耗配置 → 标箱换算」维护。
+    """
+
+    in_count = models.PositiveSmallIntegerField("入数（瓶/箱）")
+    ml = models.PositiveIntegerField("ml 数")
+    factor = models.DecimalField("设定值", max_digits=8, decimal_places=4, default=1)
+    remark = models.CharField("说明", max_length=200, blank=True, default="")
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "standard_case_rule"
+        ordering = ["ml", "in_count"]
+        verbose_name = "标箱换算规则"
+        verbose_name_plural = "标箱换算规则"
+        constraints = [
+            models.UniqueConstraint(fields=("in_count", "ml"), name="uk_standard_case_in_ml"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.in_count}入/{self.ml}ml×{self.factor}"
+
+
+class ProductionCounterHourly(models.Model):
+    """计数参量表（v1.8.1）—— 与「标箱产量」分表存放。
+
+    记录每条产线每个小时的 01 电眼瓶数、02 电眼箱数、由两者得到的实际入数，
+    以及 PLC 上选择的 ml 与匹配到的设定值。原始读数仍在 `plc_reading`。
+    """
+
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.CASCADE, related_name="production_counters", verbose_name="产线"
+    )
+    stat_date = models.DateField("日期")
+    stat_hour = models.PositiveSmallIntegerField("小时")
+    bottles = models.DecimalField("瓶数", max_digits=18, decimal_places=1, default=0)
+    cases = models.DecimalField("箱数", max_digits=18, decimal_places=1, default=0)
+    in_count = models.PositiveSmallIntegerField("实际入数", null=True, blank=True)
+    ml = models.PositiveIntegerField("ml 数", null=True, blank=True)
+    factor = models.DecimalField("设定值", max_digits=8, decimal_places=4, null=True, blank=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "production_counter_hourly"
+        ordering = ["stat_date", "stat_hour"]
+        verbose_name = "小时计数参数"
+        verbose_name_plural = "小时计数参数"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("line", "stat_date", "stat_hour"), name="uk_production_counter_hourly"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.line_id} {self.stat_date} {self.stat_hour}时 瓶{self.bottles}/箱{self.cases}"
+
+
+class ProductionCaseHourly(models.Model):
+    """标箱产量表（v1.8.1）—— 页面显示的正式产量。
+
+    与 `production_counter_hourly` 分开：计数参量用于核对与换算，标箱产量用于
+    产量、单耗、达成率。`production_hourly.output` 保留为兼容字段，PLC 标箱
+    配置生效时会同步写为标箱数。
+    """
+
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.CASCADE, related_name="production_cases", verbose_name="产线"
+    )
+    stat_date = models.DateField("日期")
+    stat_hour = models.PositiveSmallIntegerField("小时")
+    standard_cases = models.DecimalField("标箱数", max_digits=18, decimal_places=1, default=0)
+    in_count = models.PositiveSmallIntegerField("实际入数", null=True, blank=True)
+    ml = models.PositiveIntegerField("ml 数", null=True, blank=True)
+    factor = models.DecimalField("设定值", max_digits=8, decimal_places=4, null=True, blank=True)
+    rule_matched = models.BooleanField("命中换算规则", default=False)
+    note = models.CharField("说明", max_length=200, blank=True, default="")
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "production_case_hourly"
+        ordering = ["stat_date", "stat_hour"]
+        verbose_name = "小时标箱产量"
+        verbose_name_plural = "小时标箱产量"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("line", "stat_date", "stat_hour"), name="uk_production_case_hourly"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.line_id} {self.stat_date} {self.stat_hour}时={self.standard_cases}标箱"
 
 
 class ProductionBindingAssignment(models.Model):

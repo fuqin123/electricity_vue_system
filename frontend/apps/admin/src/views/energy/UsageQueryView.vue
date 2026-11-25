@@ -339,7 +339,7 @@ function exportCsv() {
       <StatCard
         label="区间产量合计"
         :value="data?.productionAvailable ? fmtCell(data.totals.output, 0) : '--'"
-        unit="瓶"
+        unit="标箱"
         color="#86909c"
         :loading="loading"
         :foot="data?.productionAvailable ? '' : '产量数据源未接入（预留接口）'"

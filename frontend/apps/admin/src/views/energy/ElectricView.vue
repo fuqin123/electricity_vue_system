@@ -10,6 +10,7 @@
  * v1.5.2：筛选从「线别」改为 **车间 → 用能类型 → 设备** 三级联动 ——
  *   辅机 / 瓶胚 / 调配电表在接口表里没有「线别」，用旧维度根本选不出来。
  */
+import { computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { big, int, thresholds, type PageQuery, type PageResult } from '@eep/shared';
 import PageHeader from '@/components/PageHeader.vue';
@@ -27,6 +28,13 @@ const {
   data,
   load,
   rows,
+  outputs,
+  outputUnit,
+  unitValues,
+  unitName,
+  showUsage,
+  showOutput,
+  showUnit,
   totals,
   missingBuckets,
   coverageHint,
@@ -58,12 +66,25 @@ function applyQuick(hours: number, gran: 'hour' | 'day' | 'month') {
  * 列宽一律用 min-width 而不是 width：
  * 全固定宽度时 el-table 不会把剩余空间分给任何列，右侧就空出一大片（B-520）。
  */
-const columns: TableColumn<UsageRow>[] = [
-  { prop: 'label', label: '时间', minWidth: 130, mono: true },
-  { prop: 'usageText', label: '用电量（kWh）', minWidth: 140, mono: true },
-  { prop: 'deltaText', label: '较上一时段', minWidth: 120, mono: true },
-  { prop: 'quality', label: '数据质量', minWidth: 120, slot: 'col-quality' }
-];
+const columns = computed<TableColumn<UsageRow>[]>(() => {
+  const list: TableColumn<UsageRow>[] = [
+    { prop: 'label', label: '时间', minWidth: 130, mono: true }
+  ];
+  if (showUsage.value) {
+    list.push({ prop: 'usageText', label: '用电量（kWh）', minWidth: 140, mono: true });
+  }
+  if (showOutput.value) {
+    list.push({ prop: 'outputText', label: `产量（${outputUnit.value}）`, minWidth: 130, mono: true });
+  }
+  if (showUnit.value) {
+    list.push({ prop: 'unitText', label: `单耗（${unitName.value || 'kWh/标箱'}）`, minWidth: 150, mono: true });
+  }
+  list.push(
+    { prop: 'deltaText', label: '较上一时段', minWidth: 120, mono: true },
+    { prop: 'quality', label: '数据质量', minWidth: 120, slot: 'col-quality' }
+  );
+  return list;
+});
 
 function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
   const page = Math.max(1, query.page ?? 1);
@@ -163,6 +184,10 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
             <el-option v-for="n in g.items" :key="n.value" :label="n.label" :value="n.value" />
           </el-option-group>
         </el-select>
+        <span class="query__label">显示</span>
+        <el-checkbox v-model="showUsage" size="small" @change="load">用量</el-checkbox>
+        <el-checkbox v-model="showOutput" size="small" @change="load">产量</el-checkbox>
+        <el-checkbox v-model="showUnit" size="small" @change="load">单耗</el-checkbox>
         <el-button-group>
           <el-button
             v-for="q in QUICK"
@@ -227,6 +252,22 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
         :color="missingBuckets > 0 ? '#bd7e00' : '#2a814b'"
         :loading="loading"
         foot="缺数显示 --，不补 0（补 0 会被读成「这一小时没用电」）"
+      />
+      <StatCard
+        label="区间产量"
+        :value="outputs.some((v) => v !== null) ? int(outputs.reduce<number>((a, v) => a + (v ?? 0), 0)) : '--'"
+        :unit="outputUnit"
+        color="#2a814b"
+        :loading="loading"
+        foot="标箱优先；选中产线时取该线产量，其他口径取车间产量"
+      />
+      <StatCard
+        label="区间单耗"
+        :value="unitValues.some((v) => v !== null) ? (unitValues.filter((v) => v !== null).pop() as number).toFixed(3) : '--'"
+        :unit="unitName || 'kWh/标箱'"
+        color="#bd7e00"
+        :loading="loading"
+        foot="累计单耗 = 区间用电 ÷ 区间产量"
       />
       <StatCard
         label="单位电耗告警线"

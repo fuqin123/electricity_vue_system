@@ -46,6 +46,9 @@ from apps.energy.models import (
     ProductionBindingDevice,
     ProductionBindingType,
     ProductionBindingWorkshop,
+    ProductionCaseHourly,
+    ProductionCounterHourly,
+    StandardCaseRule,
     StandardUnitConsumption,
     SystemParam,
     VideoChannel,
@@ -4497,6 +4500,9 @@ class PlcProductionTests(TestCase):
             line_code="W801", line_name="产量一线", node_type=ProductionLine.NODE_LINE,
             parent=cls.ws, rated=24000, product="测试产品 500ml",
         )
+        cls.gw = EnergyGateway.objects.create(
+            code="GW-PLC-T", name="PLC 测试网关", kind=EnergyGateway.KIND_MODBUS, host="127.0.0.1", port=9
+        )
         cls.device = PlcDevice.objects.create(
             code="PLC-T1", name="测试 PLC", mode=PlcDevice.MODE_SIMULATED, host="127.0.0.1",
         )
@@ -4548,6 +4554,120 @@ class PlcProductionTests(TestCase):
         row = ProductionHourly.objects.get(line=self.line, stat_date=t2.date(), stat_hour=10)
         self.assertEqual(row.output, Decimal("100.000"))
         self.assertEqual(row.source, ProductionHourly.SOURCE_PLC)
+
+    def test_瓶数箱数加ml按规则换算标箱并分表存放(self):
+        self.point.enabled = False
+        self.point.save(update_fields=["enabled"])
+        bottle = PlcPoint.objects.create(
+            code="P-BOTTLE", name="01电眼瓶数", device=self.device, role=PlcPoint.ROLE_BOTTLE,
+            sim_base=0, sim_rate=1200, unit="瓶",
+        )
+        case = PlcPoint.objects.create(
+            code="P-CASE", name="02电眼箱数", device=self.device, role=PlcPoint.ROLE_CASE,
+            sim_base=0, sim_rate=100, unit="箱",
+        )
+        spec = PlcPoint.objects.create(
+            code="P-ML", name="规格ml", device=self.device, role=PlcPoint.ROLE_SPEC,
+            sim_base=330, sim_rate=0, unit="ml",
+        )
+        for p in (bottle, case, spec):
+            ProductionBindingAssignment.objects.create(device=self.b_device, point=p)
+        StandardCaseRule.objects.create(in_count=12, ml=330, factor=Decimal("1.25"))
+
+        t1 = datetime(2026, 11, 20, 10, 0, 0)
+        plc_service.collect_device(self.device, now=t1, force_simulated=True)
+        plc_service.collect_device(self.device, now=t1 + timedelta(hours=1), force_simulated=True)
+
+        counter = ProductionCounterHourly.objects.get(
+            line=self.line, stat_date=t1.date(), stat_hour=10
+        )
+        self.assertEqual(counter.bottles, Decimal("1200.0"))
+        self.assertEqual(counter.cases, Decimal("100.0"))
+        self.assertEqual(counter.in_count, 12)
+        self.assertEqual(counter.ml, 330)
+        self.assertEqual(counter.factor, Decimal("1.2500"))
+
+        case_row = ProductionCaseHourly.objects.get(
+            line=self.line, stat_date=t1.date(), stat_hour=10
+        )
+        self.assertEqual(case_row.standard_cases, Decimal("125.0"))
+        self.assertTrue(case_row.rule_matched)
+        self.assertEqual(
+            ProductionHourly.objects.get(line=self.line, stat_date=t1.date(), stat_hour=10).output,
+            Decimal("125.0"),
+            "页面显示产量取标箱数",
+        )
+
+    def test_未配置标箱规则时按1倍兜底(self):
+        self.point.enabled = False
+        self.point.save(update_fields=["enabled"])
+        bottle = PlcPoint.objects.create(
+            code="P-B2", name="01电眼瓶数", device=self.device, role=PlcPoint.ROLE_BOTTLE,
+            sim_base=0, sim_rate=600, unit="瓶",
+        )
+        case = PlcPoint.objects.create(
+            code="P-C2", name="02电眼箱数", device=self.device, role=PlcPoint.ROLE_CASE,
+            sim_base=0, sim_rate=50, unit="箱",
+        )
+        for p in (bottle, case):
+            ProductionBindingAssignment.objects.create(device=self.b_device, point=p)
+        t1 = datetime(2026, 11, 20, 10, 0, 0)
+        plc_service.collect_device(self.device, now=t1, force_simulated=True)
+        plc_service.collect_device(self.device, now=t1 + timedelta(hours=1), force_simulated=True)
+        case_row = ProductionCaseHourly.objects.get(
+            line=self.line, stat_date=t1.date(), stat_hour=10
+        )
+        self.assertEqual(case_row.standard_cases, Decimal("50.0"))
+        self.assertFalse(case_row.rule_matched)
+
+    def test_标箱规则接口CRUD(self):
+        created = self._api(
+            "post", "/api/admin/standard-case-rules/create",
+            {"inCount": 12, "ml": 330, "factor": 1.25, "remark": "测试"},
+        )
+        self.assertEqual(created.status_code, 200, created.content)
+        rule = created.json()["rule"]
+        self.assertEqual(rule["factor"], 1.25)
+        rows = self._api("get", "/api/admin/standard-case-rules")
+        self.assertEqual(rows.status_code, 200)
+        self.assertTrue(any(r["ml"] == 330 for r in rows.json()))
+        updated = self._api(
+            "put", f"/api/admin/standard-case-rules/{rule['id']}",
+            {"inCount": 12, "ml": 330, "factor": 1.3},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["rule"]["factor"], 1.3)
+        deleted = self._api("delete", f"/api/admin/standard-case-rules/{rule['id']}")
+        self.assertEqual(deleted.status_code, 200)
+
+    def test_用量区间返回产量与单耗序列(self):
+        case_row, _ = ProductionCaseHourly.objects.get_or_create(
+            line=self.line, stat_date=datetime(2026, 11, 20).date(), stat_hour=8,
+            defaults={"standard_cases": Decimal("10"), "in_count": 12, "ml": 330, "factor": Decimal("1.25")},
+        )
+        # 同小时放一条电表用量，验证单耗 = 用量 ÷ 标箱
+        meter = EnergyMeter.objects.create(
+            code="E-CASE-UT", name="标箱单耗测试表", energy_type=etype(),
+            scope=EnergyMeter.SCOPE_LINE, line=self.line, gateway=self.gw,
+            slave=20, register=1000,
+        )
+        EnergyHourly.objects.create(
+            meter=meter, line=self.line, energy_type=meter.energy_type,
+            stat_date=datetime(2026, 11, 20).date(), stat_hour=8,
+            consumption=Decimal("25"), quality=EnergyHourly.Q_OK,
+        )
+        res = self._api(
+            "get", "/api/energy/range",
+            {
+                "date": "2026-11-20", "granularity": "hour", "scope": "line",
+                "line": self.line.line_code, "kind": "elec", "workshop": f"BWS-{self.b_ws.id}",
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.content)
+        body = res.json()
+        self.assertEqual(body["production"]["unit"], "标箱")
+        self.assertIn(10.0, [v for v in body["production"]["values"] if v is not None])
+        self.assertTrue(body["unitConsumption"]["unit"].endswith("/标箱"))
 
     def test_同一点位被同产线多个设备勾选只计一次(self):
         device2 = ProductionBindingDevice.objects.create(

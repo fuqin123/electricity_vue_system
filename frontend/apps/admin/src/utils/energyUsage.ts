@@ -49,6 +49,9 @@ export interface UsageRow {
   deltaText: string;
   deltaColor: string;
   quality: string;
+  /** v1.8.1：产量（标箱优先）与单耗 */
+  outputText: string;
+  unitText: string;
 }
 
 const META: Record<UsageEnergy, { name: string; unit: string; color: string; perLine: boolean; emptyHint: string; kind: 'elec' | 'water' | 'steam' }> = {
@@ -139,6 +142,10 @@ export function useEnergyUsage(energy: UsageEnergy) {
   const granularity = ref<UsageGranularity>('hour');
   const loading = ref(false);
   const data = ref<UsageRangeResult | null>(null);
+  /** v1.8.1：图表 / 明细显示哪些指标 */
+  const showUsage = ref(true);
+  const showOutput = ref(true);
+  const showUnit = ref(true);
 
   // ── 三级筛选状态（车间 → 用能类型 → 设备）──────────────────
   /** 分类树；只含本能源类型（电页不会看到水表） */
@@ -463,19 +470,29 @@ export function useEnergyUsage(energy: UsageEnergy) {
    * 明细行：时间 / 用量 / 较上一时段 / 数据质量。
    * 缺数一律 `--`，且**不参与环比** —— 拿缺数格当 0 去比会凭空造出一个 -100%。
    */
+  /** v1.8.1：产量序列（标箱优先） */
+  const outputs = computed<(number | null)[]>(() => data.value?.production?.values ?? []);
+  const outputUnit = computed(() => data.value?.production?.unit ?? '标箱');
+  const unitValues = computed<(number | null)[]>(() => data.value?.unitConsumption?.values ?? []);
+  const unitName = computed(() => data.value?.unitConsumption?.unit ?? '');
+
   const rows = computed<UsageRow[]>(() => {
     const d = data.value;
     if (!d) return [];
     const list: UsageRow[] = values.value.map((v, i) => {
       const prev = i > 0 ? values.value[i - 1] : null;
       const delta = v !== null && prev !== null && prev > 0 ? ((v - prev) / prev) * 100 : null;
+      const out = outputs.value[i] ?? null;
+      const unit = unitValues.value[i] ?? null;
       return {
         id: i,
         label: d.labels[i],
         usageText: v === null || v === undefined ? '--' : String(v),
         deltaText: delta === null ? '--' : `${delta > 0 ? '+' : ''}${delta.toFixed(1)}%`,
         deltaColor: delta === null ? '#86909c' : delta > 0 ? '#d7312a' : '#2a814b',
-        quality: d.quality?.[i] ?? ''
+        quality: d.quality?.[i] ?? '',
+        outputText: out === null ? '--' : String(Math.round(out)),
+        unitText: unit === null ? '--' : unit.toFixed(3)
       };
     });
     return list.reverse(); // 最新在上
@@ -547,9 +564,38 @@ export function useEnergyUsage(energy: UsageEnergy) {
     // 焦点通道下后端已给出精确的序列名（含车间/类型/节点），优先用它，
     // 否则「车间用电」这种笼统名字会让人以为看的是全车间。
     const seriesName = focused.value ? (d.series[0]?.name ?? selectionLabel.value) : `车间${meta.name}`;
-    const series: EnergyUsageSeries[] = [
-      { key: energy, name: seriesName, unit: meta.unit, color: meta.color, data: values.value, emptyHint: meta.emptyHint }
-    ];
+    const series: EnergyUsageSeries[] = [];
+    if (showUsage.value) {
+      series.push({
+        key: energy,
+        name: seriesName,
+        unit: meta.unit,
+        color: meta.color,
+        data: values.value,
+        emptyHint: meta.emptyHint
+      });
+    }
+    if (showOutput.value) {
+      series.push({
+        key: 'output',
+        name: `产量 · ${d.production?.scope === 'line' ? '所选产线' : '车间合计'}`,
+        unit: outputUnit.value,
+        color: '#2a814b',
+        data: outputs.value,
+        type: 'bar',
+        emptyHint: '本期没有产量数据（PLC / 标箱产量未接入）'
+      });
+    }
+    if (showUnit.value) {
+      series.push({
+        key: 'unit',
+        name: '单耗',
+        unit: unitName.value || `${meta.unit}/${outputUnit.value}`,
+        color: '#bd7e00',
+        data: unitValues.value,
+        emptyHint: '产量为 0 或未接入，单耗无法计算'
+      });
+    }
     return energyUsageOption(d.labels, series, { labelInterval: d.labels.length > 24 ? 2 : 'auto' });
   });
 
@@ -566,7 +612,8 @@ export function useEnergyUsage(energy: UsageEnergy) {
     workshop: workshop.value,
     usageType: usageType.value,
     node: node.value,
-    gran: granularity.value
+    gran: granularity.value,
+    metrics: `${showUsage.value ? 1 : 0}${showOutput.value ? 1 : 0}${showUnit.value ? 1 : 0}`
   }));
 
   return {
@@ -578,6 +625,13 @@ export function useEnergyUsage(energy: UsageEnergy) {
     load,
     rows,
     values,
+    outputs,
+    outputUnit,
+    unitValues,
+    unitName,
+    showUsage,
+    showOutput,
+    showUnit,
     totals,
     missingBuckets,
     emptyHint,

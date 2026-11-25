@@ -655,6 +655,7 @@ export type PlcMode = 'snap7' | 'simulated';
 export type PlcArea = 'DB' | 'M' | 'I' | 'Q';
 export type PlcDataType = 'uint16' | 'int16' | 'uint32' | 'int32' | 'float32' | 'bool';
 export type PlcCounterMode = 'cumulative' | 'instant';
+export type PlcPointRole = 'counter' | 'bottle' | 'case' | 'spec';
 
 export interface PlcDevice {
   id: number;
@@ -692,6 +693,8 @@ export interface PlcPoint {
   bitOffset: number | null;
   dataType: PlcDataType;
   dataTypeLabel: string;
+  role: PlcPointRole;
+  roleLabel: string;
   address: string;
   counterMode: PlcCounterMode;
   scale: number;
@@ -738,7 +741,18 @@ export interface ProductionBindingPoint {
   address: string;
   unit: string;
   counterMode: PlcCounterMode;
+  role?: PlcPointRole;
   enabled: boolean;
+}
+
+/** 标箱换算规则（v1.8.1）：(入数, ml) → 设定值 */
+export interface StandardCaseRule {
+  id: number;
+  inCount: number;
+  ml: number;
+  factor: number;
+  remark: string;
+  updatedAt: string;
 }
 
 export interface ProductionBindingDeviceNode {

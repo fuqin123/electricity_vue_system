@@ -17,9 +17,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import struct
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
 
@@ -27,7 +28,11 @@ from ..models import (
     PlcDevice,
     PlcPoint,
     PlcReading,
+    ProductionCaseHourly,
+    ProductionCounterHourly,
     ProductionHourly,
+    ProductionLine,
+    StandardCaseRule,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,6 +164,29 @@ def _hour_bucket(now: datetime) -> tuple[object, int]:
     return anchor.date(), anchor.hour
 
 
+def _round_cases(value: Decimal) -> Decimal:
+    """标箱数取整：现场口径是四舍五入，不用银行家舍入。"""
+    return value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+
+
+def _line_ml(line_id: int) -> int | None:
+    """PLC 没有规格点时，退而解析产线当前产品名里的 ml（如「冰红茶 500ml」）。"""
+    product = (
+        ProductionLine.objects.filter(pk=line_id).values_list("product", flat=True).first() or ""
+    )
+    matched = re.search(r"(\d+)\s*ml", product, re.I)
+    return int(matched.group(1)) if matched else None
+
+
+def _case_factor(in_count: int | None, ml: int | None) -> tuple[Decimal, bool]:
+    """按 (入数, ml) 查标箱换算规则；未配置时按 1.0 兜底并明确标记未命中。"""
+    if in_count and ml:
+        rule = StandardCaseRule.objects.filter(in_count=in_count, ml=ml).first()
+        if rule is not None:
+            return Decimal(rule.factor), True
+    return Decimal("1"), False
+
+
 def collect_device(
     device: PlcDevice,
     *,
@@ -175,9 +203,15 @@ def collect_device(
     if not results:
         return {"ok": False, "points": 0, "failed": 0, "written": 0, "lines": [], "error": "没有启用的点位"}
 
-    line_totals: dict[int, Decimal] = {}
+    # 每线累计：瓶数 / 箱数 / 普通计数 / PLC 当前 ml
+    line_roles: dict[int, dict[str, object]] = {}
     failed = 0
     notes: list[str] = []
+
+    def bucket(line_id: int) -> dict[str, object]:
+        return line_roles.setdefault(
+            line_id, {"bottle": Decimal(0), "case": Decimal(0), "counter": Decimal(0), "ml": None}
+        )
 
     with transaction.atomic():
         for item in results:
@@ -214,8 +248,6 @@ def collect_device(
             point.save(update_fields=["last_value", "last_at", "last_ok", "last_error", "updated_at"])
             PlcReading.objects.create(point=point, collect_time=now, value=value, ok=True)
 
-            if delta <= 0:
-                continue
             seen_lines: set[int] = set()
             for assignment in point.production_assignments.select_related("device").all():
                 bound = assignment.device
@@ -226,27 +258,106 @@ def collect_device(
                 if bound.line_id in seen_lines:
                     continue
                 seen_lines.add(bound.line_id)
-                line_totals[bound.line_id] = line_totals.get(bound.line_id, Decimal(0)) + delta
+                slot = bucket(bound.line_id)
+                if point.role == PlcPoint.ROLE_SPEC:
+                    # 规格点是「当前选择」，不是增量：取最新值作为本小时的 ml
+                    slot["ml"] = int(value)
+                    continue
+                if delta <= 0:
+                    continue
+                if point.role == PlcPoint.ROLE_BOTTLE:
+                    slot["bottle"] = Decimal(slot["bottle"]) + delta
+                elif point.role == PlcPoint.ROLE_CASE:
+                    slot["case"] = Decimal(slot["case"]) + delta
+                else:
+                    slot["counter"] = Decimal(slot["counter"]) + delta
 
         written = 0
-        for line_id, total in line_totals.items():
+        for line_id, slot in line_roles.items():
+            bottle = Decimal(slot["bottle"])
+            cases = Decimal(slot["case"])
+            counter = Decimal(slot["counter"])
+            spec_ml = slot["ml"]
+            if bottle > 0 and cases <= 0:
+                # 只有 01 电眼（瓶数）时无法换算标箱，沿用旧的瓶数口径
+                counter += bottle
+                bottle = Decimal(0)
+            if bottle <= 0 and cases <= 0:
+                if counter <= 0:
+                    continue
+                row, created = ProductionHourly.objects.get_or_create(
+                    line_id=line_id,
+                    stat_date=stat_date,
+                    stat_hour=stat_hour,
+                    defaults={
+                        "output": counter,
+                        "quality": ProductionHourly.Q_OK,
+                        "source": ProductionHourly.SOURCE_PLC,
+                        "note": f"PLC {device.code} {now:%H:%M}",
+                    },
+                )
+                if not created:
+                    row.output = (row.output or Decimal(0)) + counter
+                    row.quality = ProductionHourly.Q_OK
+                    row.source = ProductionHourly.SOURCE_PLC
+                    row.note = f"PLC {device.code} {now:%H:%M}"
+                    row.save(update_fields=["output", "quality", "source", "note", "updated_at"])
+                written += 1
+                continue
+
+            # 01/02 电眼都有：先累计计数参量，再按 (入数, ml) 换算标箱
+            counter_row, created = ProductionCounterHourly.objects.get_or_create(
+                line_id=line_id, stat_date=stat_date, stat_hour=stat_hour,
+                defaults={"bottles": Decimal(0), "cases": Decimal(0)},
+            )
+            counter_row.bottles = (counter_row.bottles or Decimal(0)) + bottle
+            counter_row.cases = (counter_row.cases or Decimal(0)) + cases
+            if spec_ml is not None:
+                counter_row.ml = int(spec_ml)
+            if counter_row.cases > 0:
+                counter_row.in_count = int(
+                    (counter_row.bottles / counter_row.cases).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP
+                    )
+                )
+            ml = counter_row.ml or _line_ml(line_id)
+            factor, matched = _case_factor(counter_row.in_count, ml)
+            counter_row.ml = ml
+            counter_row.factor = factor
+            counter_row.save()
+
+            standard_cases = _round_cases(counter_row.cases * factor)
+            ProductionCaseHourly.objects.update_or_create(
+                line_id=line_id, stat_date=stat_date, stat_hour=stat_hour,
+                defaults={
+                    "standard_cases": standard_cases,
+                    "in_count": counter_row.in_count,
+                    "ml": ml,
+                    "factor": factor,
+                    "rule_matched": matched,
+                    "note": "" if matched else "未配置该入数/ml 的标箱换算，按 1.0 计",
+                },
+            )
+            # 页面显示的产量统一取标箱数（覆盖写，避免重复累加）
             row, created = ProductionHourly.objects.get_or_create(
                 line_id=line_id,
                 stat_date=stat_date,
                 stat_hour=stat_hour,
                 defaults={
-                    "output": total,
+                    "output": standard_cases,
                     "quality": ProductionHourly.Q_OK,
                     "source": ProductionHourly.SOURCE_PLC,
-                    "note": f"PLC {device.code} {now:%H:%M}",
+                    "note": f"PLC {device.code} 标箱",
                 },
             )
             if not created:
-                row.output = (row.output or Decimal(0)) + total
+                row.output = standard_cases
                 row.quality = ProductionHourly.Q_OK
                 row.source = ProductionHourly.SOURCE_PLC
-                row.note = f"PLC {device.code} {now:%H:%M}"
+                row.note = f"PLC {device.code} 标箱"
                 row.save(update_fields=["output", "quality", "source", "note", "updated_at"])
+            if not matched:
+                notes.append(f"{line_id} 未配置 {counter_row.in_count}入/{ml}ml 的标箱换算")
             written += 1
 
     ok = failed == 0
@@ -266,7 +377,7 @@ def collect_device(
         "points": len(results),
         "failed": failed,
         "written": written,
-        "lines": list(line_totals.keys()),
+        "lines": list(line_roles.keys()),
         "error": error,
     }
 

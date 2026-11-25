@@ -27,6 +27,7 @@ from .models import (
     ProductionBindingType,
     ProductionBindingWorkshop,
     ProductionLine,
+    StandardCaseRule,
 )
 from .services import plc as PLC
 
@@ -79,6 +80,8 @@ def _plc_point_json(point: PlcPoint) -> dict:
         "bitOffset": point.bit_offset,
         "dataType": point.data_type,
         "dataTypeLabel": point.get_data_type_display(),
+        "role": point.role,
+        "roleLabel": point.get_role_display(),
         "address": point.address,
         "counterMode": point.counter_mode,
         "scale": float(point.scale),
@@ -342,6 +345,11 @@ def _apply_point_fields(point: PlcPoint, data: dict) -> None:
         point.data_type = data_type
     if point.data_type == PlcPoint.DT_BOOL and point.bit_offset is None:
         point.bit_offset = 0
+    if "role" in data:
+        role = str(data.get("role") or "").strip()
+        if role not in dict(PlcPoint.ROLE_CHOICES):
+            raise ValueError("点位用途不在支持范围内")
+        point.role = role
     if "counterMode" in data or "counter_mode" in data:
         raw = data.get("counterMode") if "counterMode" in data else data.get("counter_mode")
         mode = str(raw or "").strip()
@@ -725,3 +733,90 @@ def admin_prod_binding_device_points(request: HttpRequest, pk: int) -> JsonRespo
             "saved": len(points),
         }
     )
+
+
+# ══════════════════════════════════════════════════════════════
+#  标箱换算规则（v1.8.1）：(入数, ml) → 设定值
+# ══════════════════════════════════════════════════════════════
+
+
+def _case_rule_json(rule: StandardCaseRule) -> dict:
+    return {
+        "id": rule.id,
+        "inCount": rule.in_count,
+        "ml": rule.ml,
+        "factor": float(rule.factor),
+        "remark": rule.remark,
+        "updatedAt": _fmt(rule.updated_at),
+    }
+
+
+def _case_rule_values(data: dict) -> dict:
+    try:
+        in_count = int(data.get("inCount") or data.get("in_count") or 0)
+        ml = int(data.get("ml") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("入数和 ml 必须是整数") from exc
+    if not 1 <= in_count <= 999:
+        raise ValueError("入数必须在 1—999 之间")
+    if not 1 <= ml <= 100000:
+        raise ValueError("ml 数必须在 1—100000 之间")
+    raw_factor = data.get("factor", 1)
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        factor = Decimal(str(raw_factor if raw_factor not in (None, "") else 1))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("设定值必须是数字") from exc
+    if factor <= 0:
+        raise ValueError("设定值必须大于 0")
+    return {
+        "in_count": in_count,
+        "ml": ml,
+        "factor": factor,
+        "remark": str(data.get("remark") or "")[:200],
+    }
+
+
+@require_GET
+def admin_standard_case_rules(request: HttpRequest) -> JsonResponse:
+    rows = [_case_rule_json(r) for r in StandardCaseRule.objects.order_by("ml", "in_count")]
+    return json_ok(rows)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def admin_standard_case_rule_create(request: HttpRequest) -> JsonResponse:
+    try:
+        values = _case_rule_values(_body(request))
+        if StandardCaseRule.objects.filter(in_count=values["in_count"], ml=values["ml"]).exists():
+            return json_err("该入数 + ml 的规则已存在", status=409)
+        rule = StandardCaseRule.objects.create(**values)
+    except ValueError as exc:
+        return json_err(str(exc))
+    return json_ok({"rule": _case_rule_json(rule)})
+
+
+@csrf_exempt
+@require_http_methods(["PUT", "DELETE"])
+def admin_standard_case_rule_detail(request: HttpRequest, pk: int) -> JsonResponse:
+    rule = StandardCaseRule.objects.filter(pk=pk).first()
+    if rule is None:
+        return json_err(f"标箱换算规则不存在：{pk}", status=404)
+    if request.method == "DELETE":
+        rule.delete()
+        return json_ok({"deleted": pk})
+    try:
+        values = _case_rule_values(_body(request))
+        if (
+            StandardCaseRule.objects.filter(in_count=values["in_count"], ml=values["ml"])
+            .exclude(pk=rule.pk)
+            .exists()
+        ):
+            return json_err("该入数 + ml 的规则已存在", status=409)
+        for key, value in values.items():
+            setattr(rule, key, value)
+        rule.save()
+    except ValueError as exc:
+        return json_err(str(exc))
+    return json_ok({"rule": _case_rule_json(rule)})

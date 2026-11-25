@@ -188,7 +188,7 @@ export const dataConfig = {
    *
    * 真实接口接入后置为 true 即可恢复产量口径判定，**不需要改渲染代码**。
    */
-  productionEnabled: false,
+  productionEnabled: true,
 
   /** 产量未接入时界面上统一引用的说明文案 */
   productionNote:

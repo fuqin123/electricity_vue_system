@@ -87,9 +87,9 @@ const kpiCards = computed<KpiCard[]>(() => {
   const hRef = hOut ?? 0;
   const hDelta = hRef ? ((hRef - hPlan) / hPlan) * 100 : null;
   const rate = w.today.plan > 0 && w.today.output !== null ? (w.today.output / w.today.plan) * 100 : null;
-  const yq = big(w.year.output, '瓶');
+  const yq = big(w.year.output, '标箱');
   const yk = big(w.year.kwh, 'kWh');
-  const mq = big(w.month.output, '瓶');
+  const mq = big(w.month.output, '标箱');
   const mk = big(w.month.kwh, 'kWh');
   const hk = big(h?.kwh ?? 0, 'kWh');
   /** 产量未接入时，达成率无意义 —— 显示 `--`，不要显示 0% */
@@ -115,7 +115,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       tag: '日',
       color: '#a78bfa',
       label: '本生产日累计产量',
-      value: big(w.today.output, '瓶'),
+      value: big(w.today.output, '标箱'),
       delta: prodOn ? rise(w.today.output, w.yesterday.output) : null,
       sub: `完成率 ${rateText} · 用电 ${big(w.today.kwh, 'kWh').v}${big(w.today.kwh, 'kWh').u}`
     },
@@ -124,7 +124,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#f06fcb',
       // 查历史整日时第 23 小时早已结算，不能写「当前小时」（B-522）
       label: w.dayClosed ? `${pad2(h?.clock ?? 0)} 时段产量` : h?.partial ? '当前小时（进行中）' : '当前小时产量',
-      value: { v: int(hOut), u: '瓶' },
+      value: { v: int(hOut), u: '标箱' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
     }

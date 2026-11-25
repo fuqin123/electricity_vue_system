@@ -37,6 +37,7 @@ from ..models import (
     MeterBindingDevice,
     MeterBindingType,
     PeriodSummary,
+    ProductionCaseHourly,
     ProductionHourly,
     ProductionLine,
 )
@@ -139,6 +140,125 @@ def _line_meters(line: ProductionLine) -> list[EnergyMeter]:
         for m in line.meters.all()
         if m.energy_type.type_code == EnergyType.ELECTRIC and m.enabled
     ]
+
+
+def _workshop_production_lines(workshop: str | None) -> list[ProductionLine]:
+    """产量侧「整个车间」的真实产线集合。
+
+    绑定树车间 `BWS-<id>` 只是查询分组，没有组织树可循 —— 当前现场只有一个
+    生产车间，按全部启用产线处理；真实车间编码则按 parent 过滤。
+    """
+    qs = ProductionLine.active_lines_qs().order_by("sort", "line_code")
+    code = str(workshop or "").strip().upper()
+    if code and not code.startswith("BWS-"):
+        qs = qs.filter(Q(line_code=code) | Q(parent__line_code=code))
+    return list(qs)
+
+
+def _production_lines_for(
+    workshop: str | None,
+    line_code: str | None,
+    focus_meters: list[EnergyMeter],
+    *,
+    focused: bool,
+) -> list[ProductionLine]:
+    """本次用量对应的产量分母产线。
+
+    · scope=line / 选中真实产线 → 该线；
+    · 选中辅机 / 类型 / 设备（非单线）→ 整个车间；
+    · 水 / 汽（没有分线计量）→ 整个车间。
+    """
+    if line_code:
+        return _lines_scope(line_code)
+    if focused:
+        line_ids = {
+            m.line_id
+            for m in focus_meters
+            if m.line_id and m.line and m.line.is_line
+        }
+        if len(line_ids) == 1:
+            return list(ProductionLine.objects.filter(pk__in=line_ids))
+    return _workshop_production_lines(workshop)
+
+
+def _case_hour_map(lines: list[ProductionLine], buckets: list[tuple[date_cls, int]]) -> dict:
+    if not lines or not buckets:
+        return {}
+    dates = sorted({d for d, _h in buckets})
+    rows = (
+        ProductionCaseHourly.objects.filter(line__in=lines, stat_date__in=dates)
+        .values("stat_date", "stat_hour")
+        .annotate(t=Sum("standard_cases"))
+    )
+    return {(r["stat_date"], r["stat_hour"]): r["t"] for r in rows}
+
+
+def _production_hour_series(
+    lines: list[ProductionLine], buckets: list[tuple[date_cls, int]]
+) -> tuple[list[float | None], str]:
+    """小时产量：优先标箱表，没有标箱数据时退回 `production_hourly`（瓶）。"""
+    if not lines or not buckets:
+        return [None for _ in buckets], "标箱"
+    case_map = _case_hour_map(lines, buckets)
+    if case_map:
+        return [
+            _round(case_map[b]) if b in case_map else None
+            for b in buckets
+        ], "标箱"
+    return _output_hour_series(lines, buckets), "瓶"
+
+
+def _production_day_series(
+    lines: list[ProductionLine], days: list[date_cls]
+) -> tuple[list[float | None], str]:
+    if not lines or not days:
+        return [None for _ in days], "标箱"
+    rows = (
+        ProductionCaseHourly.objects.filter(line__in=lines, stat_date__in=days)
+        .values("stat_date")
+        .annotate(t=Sum("standard_cases"))
+    )
+    got = {r["stat_date"]: r["t"] for r in rows}
+    if got:
+        return [_round(got[d]) if d in got else None for d in days], "标箱"
+    return _output_day_series(lines, days), "瓶"
+
+
+def _production_month_series(
+    lines: list[ProductionLine], keys: list[str]
+) -> tuple[list[float | None], str]:
+    if not lines or not keys:
+        return [None for _ in keys], "标箱"
+    wanted = set(keys)
+    rows = ProductionCaseHourly.objects.filter(line__in=lines).values_list(
+        "stat_date", "standard_cases"
+    )
+    by_month: dict[str, Decimal] = {}
+    for stat_date, value in rows:
+        key = stat_date.strftime("%Y-%m")
+        if key in wanted and value is not None:
+            by_month[key] = by_month.get(key, Decimal(0)) + Decimal(value)
+    if by_month:
+        return [_round(by_month.get(k)) if k in by_month else None for k in keys], "标箱"
+    # 没有标箱数据：退回瓶数汇总
+    out: list[float | None] = []
+    for key in keys:
+        start, end = B.period_window(PeriodSummary.DIM_MONTH, key)
+        out.append(_round(S.production_total(lines, start, end), 0))
+    return out, "瓶"
+
+
+def _unit_consumption(
+    usage: list[float | None], production: list[float | None], usage_unit: str, production_unit: str
+) -> tuple[list[float | None], str]:
+    """单耗 = 用量 ÷ 产量（按 1 个产量单位）。产量缺 / ≤0 → None。"""
+    values: list[float | None] = []
+    for u, o in zip(usage, production):
+        if u is None or o is None or o <= 0:
+            values.append(None)
+        else:
+            values.append(round(u / o, 3))
+    return values, f"{usage_unit}/{production_unit}"
 
 
 def _binding_workshop_id(workshop: str | None) -> int | None:
@@ -726,6 +846,9 @@ def usage_range(
         else:
             base_name = _focus_name(workshop, usage_type, device, node_code, kind)
 
+        primary_code = _type_code(kind) if kind else EnergyType.ELECTRIC
+        primary_vals: list[float | None] | None = None
+        primary_unit = "kWh"
         for code, gm in groups.items():
             # 单位按能源类型定，不看「排序后的第一块表」
             unit = unit_of(gm)
@@ -759,6 +882,34 @@ def usage_range(
                 util["water"] = vals
             elif code == EnergyType.STEAM:
                 util["steam"] = vals
+            if code == primary_code and primary_vals is None:
+                primary_vals = vals
+                primary_unit = unit
+
+        if primary_vals is None and series:
+            primary_vals = series[0]["values"]
+            primary_unit = series[0]["unit"]
+
+        # ── 产量 / 单耗（v1.8.1）──
+        prod_lines = _production_lines_for(workshop, None, focus_meters, focused=True)
+        if granularity == "hour":
+            prod_values, prod_unit = _production_hour_series(prod_lines, buckets)
+        elif granularity == "month":
+            prod_values, prod_unit = _production_month_series(prod_lines, klist)
+        else:
+            prod_values, prod_unit = _production_day_series(
+                prod_lines, [datetime.strptime(k, "%Y-%m-%d").date() for k in klist]
+            )
+        unit_values, unit_name = _unit_consumption(
+            primary_vals or [None] * len(prod_values), prod_values, primary_unit, prod_unit
+        )
+        production = {
+            "values": prod_values,
+            "unit": prod_unit,
+            "scope": "line" if len(prod_lines) == 1 else "workshop",
+            "line": prod_lines[0].line_code if len(prod_lines) == 1 else None,
+        }
+        unit_consumption = {"values": unit_values, "unit": unit_name}
 
         # 电量合计只按电表算 —— 把水/汽的 m³ 累加进 kWh 是量纲错误
         win_start, win_end = _query_window(
@@ -776,11 +927,12 @@ def usage_range(
             if elec_meters
             else None
         )
-        out_total = Decimal(0)
-        prod_real = False
+        prod_real = any(v is not None for v in prod_values)
+        out_total = Decimal(str(sum(v for v in prod_values if v is not None))) if prod_real else Decimal(0)
         payload = _range_payload(
             start, end, granularity, scope, line_code, labels, series, quality_series,
             util, kwh_total, out_total, prod_real, focus_meters, win_start, win_end,
+            production=production, unit_consumption=unit_consumption,
         )
         # 回显查询命中的绑定设备 / 绑定类型 / 单表，便于前端确认「查的是哪一组表」
         if binding_device is not None:
@@ -792,6 +944,7 @@ def usage_range(
         return payload
 
     hour_buckets: list[tuple[date_cls, int]] | None = None
+    regular_usage: list[float | None] | None = None
     if granularity == "hour":
         # closed_only：只到最后一个已结算整点 —— 正在走的这一小时算不出用量（见 _hour_labels）
         buckets = _hour_labels(hour_start, hour_end, now, start_at=start_at, end_at=end_at, closed_only=True)
@@ -801,24 +954,15 @@ def usage_range(
         if want_workshop:
             # 只算一次：既要值也要质量，重复计算会白白多扫一遍库
             wmat = _hour_matrix(_workshop_meters(workshop), buckets)
-            series.append(
-                {
-                    "key": "workshop",
-                    "name": "车间合计",
-                    "unit": "kWh",
-                    "values": [round_kwh(wmat[b][0]) for b in buckets],
-                }
-            )
+            vals = [round_kwh(wmat[b][0]) for b in buckets]
+            series.append({"key": "workshop", "name": "车间合计", "unit": "kWh", "values": vals})
+            regular_usage = vals
         for ln in target_lines:
             mat = _hour_matrix(_line_meters(ln), buckets)
-            series.append(
-                {
-                    "key": ln.line_code,
-                    "name": ln.line_name,
-                    "unit": "kWh",
-                    "values": [round_kwh(mat[b][0]) for b in buckets],
-                }
-            )
+            vals = [round_kwh(mat[b][0]) for b in buckets]
+            series.append({"key": ln.line_code, "name": ln.line_name, "unit": "kWh", "values": vals})
+            if line_code and ln.line_code == line_code.upper():
+                regular_usage = vals
         if wmat is not None:
             quality_series = [wmat[b][1] for b in buckets]
         util = {
@@ -843,6 +987,7 @@ def usage_range(
                 start_dt, end_dt = B.period_window(dim, k)
                 vals.append(round_kwh(_range_total_kwh(_workshop_meters(workshop), start_dt, end_dt)))
             series.append({"key": "workshop", "name": "车间合计", "unit": "kWh", "values": vals})
+            regular_usage = vals
             quality_series = [rows[k].quality if k in rows else "computed" for k in klist]
 
         for ln in target_lines:
@@ -855,6 +1000,8 @@ def usage_range(
                 start_dt, end_dt = B.period_window(dim, k)
                 vals.append(round_kwh(_range_total_kwh(_line_meters(ln), start_dt, end_dt)))
             series.append({"key": ln.line_code, "name": ln.line_name, "unit": "kWh", "values": vals})
+            if line_code and ln.line_code == line_code.upper():
+                regular_usage = vals
 
         util = {
             "water": _utility_series(EnergyType.WATER, dim, start, end, now, keys),
@@ -876,16 +1023,40 @@ def usage_range(
         granularity, start, end, klist=klist, hour_buckets=hour_buckets
     )
     kwh_total = _range_total_kwh(meters, win_start, win_end, buckets=hour_buckets)
-    out_total = _range_output(all_lines, win_start, win_end)
-    prod_real = (
-        ProductionHourly.objects.filter(B.hour_q(win_start, win_end), line__in=all_lines)
-        .exclude(source__in=DEMO_SOURCES)
-        .exists()
+
+    # ── 产量 / 单耗（v1.8.1）──
+    # scope=line 用该线产量；车间合计 / 全部序列 / 水汽都用整个车间产量。
+    prod_lines = _lines_scope(line_code) if (scope == "line" and line_code) else _workshop_production_lines(workshop)
+    if granularity == "hour":
+        prod_values, prod_unit = _production_hour_series(prod_lines, buckets)
+    elif granularity == "month":
+        prod_values, prod_unit = _production_month_series(prod_lines, klist)
+    else:
+        prod_values, prod_unit = _production_day_series(
+            prod_lines, [datetime.strptime(k, "%Y-%m-%d").date() for k in klist]
+        )
+    usage_values = regular_usage
+    if usage_values is None and series:
+        usage_values = series[0]["values"]
+    unit_values, unit_name = _unit_consumption(
+        usage_values or [None] * len(prod_values), prod_values, "kWh", prod_unit
+    )
+    production = {
+        "values": prod_values,
+        "unit": prod_unit,
+        "scope": "line" if (scope == "line" and line_code) else "workshop",
+        "line": line_code.upper() if (scope == "line" and line_code) else None,
+    }
+    unit_consumption = {"values": unit_values, "unit": unit_name}
+    prod_real = any(v is not None for v in prod_values)
+    out_total = (
+        Decimal(str(sum(v for v in prod_values if v is not None))) if prod_real else Decimal(0)
     )
 
     return _range_payload(
         start, end, granularity, scope, line_code, labels, series, quality_series,
         util, kwh_total, out_total, prod_real, meters, win_start, win_end,
+        production=production, unit_consumption=unit_consumption,
     )
 
 
@@ -951,6 +1122,7 @@ def _meter_coverage(meters: list[EnergyMeter], start: datetime, end: datetime) -
 def _range_payload(
     start, end, granularity, scope, line_code, labels, series, quality_series,
     util, kwh_total, out_total, prod_real, meters, window_start, window_end,
+    *, production: dict | None = None, unit_consumption: dict | None = None,
 ) -> dict:
     """统一的返回体组装 —— 两条取数通道（焦点 / 常规）共用，避免结构漂移。"""
     return {
@@ -970,6 +1142,9 @@ def _range_payload(
             "steamT": _sum_optional(util.get("steam") or []),
         },
         "productionAvailable": prod_real,
+        # v1.8.1：产量（标箱优先）与单耗序列，供电/水/汽计量页与用量查询共用
+        "production": production or {"values": [], "unit": "标箱", "scope": "workshop", "line": None},
+        "unitConsumption": unit_consumption or {"values": [], "unit": ""},
         "bucketCount": len(labels),
         "meterCount": len(meters),
         # 生产日口径：日 / 月桶标签仍是开始日期，实际窗口是 06:00—次日 06:00

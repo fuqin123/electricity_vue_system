@@ -83,6 +83,10 @@ _ADMIN_ROUTES = [
     ("production-binding-devices", production_api.admin_prod_binding_devices, "admin-prod-binding-devices"),
     ("production-binding-devices/<int:pk>", production_api.admin_prod_binding_device_detail, "admin-prod-binding-device-detail"),
     ("production-binding-devices/<int:pk>/points", production_api.admin_prod_binding_device_points, "admin-prod-binding-device-points"),
+    # 标箱换算规则（v1.8.1）：(入数, ml) → 设定值
+    ("standard-case-rules", production_api.admin_standard_case_rules, "admin-standard-case-rules"),
+    ("standard-case-rules/create", production_api.admin_standard_case_rule_create, "admin-standard-case-rule-create"),
+    ("standard-case-rules/<int:pk>", production_api.admin_standard_case_rule_detail, "admin-standard-case-rule-detail"),
 ]
 
 #: 后台配置组（挂在 /api/admin/ 下）

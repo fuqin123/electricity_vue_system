@@ -65,6 +65,7 @@ import type {
   ProductionBindingTreeResult,
   ProductionBindingTypeNode,
   ProductionBindingWorkshopNode,
+  StandardCaseRule,
   EnergyPriceRow,
   ReportTemplate,
   StandardUnitOptions,
@@ -751,6 +752,40 @@ export const adminApi = {
     });
   },
 
+  /** 标箱换算规则（v1.8.1）：(入数, ml) → 设定值 */
+  async getStandardCaseRules(): Promise<StandardCaseRule[]> {
+    if (!useApi('admin.productionBindings')) return delay([], 100);
+    return request<StandardCaseRule[]>('/api/admin/standard-case-rules');
+  },
+
+  async createStandardCaseRule(payload: {
+    inCount: number;
+    ml: number;
+    factor: number;
+    remark?: string;
+  }): Promise<{ rule: StandardCaseRule }> {
+    return request<{ rule: StandardCaseRule }>('/api/admin/standard-case-rules/create', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async updateStandardCaseRule(
+    id: number,
+    payload: { inCount: number; ml: number; factor: number; remark?: string }
+  ): Promise<{ rule: StandardCaseRule }> {
+    return request<{ rule: StandardCaseRule }>(`/api/admin/standard-case-rules/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async deleteStandardCaseRule(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/standard-case-rules/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
   async setProductionBindingDevicePoints(
     id: number,
     pointCodes: string[]
@@ -1171,6 +1206,18 @@ export interface UsageRangeResult {
   /** 实际生效的区间端点（精确到小时文本），比 from/to 更准 */
   fromHour?: string;
   toHour?: string;
+  /** v1.8.1：产量序列（标箱优先；没有标箱数据时退回瓶数） */
+  production?: {
+    values: (number | null)[];
+    unit: string;
+    scope: 'line' | 'workshop';
+    line: string | null;
+  };
+  /** v1.8.1：单耗 = 用量 ÷ 产量（每个产量单位） */
+  unitConsumption?: {
+    values: (number | null)[];
+    unit: string;
+  };
 }
 
 /**
