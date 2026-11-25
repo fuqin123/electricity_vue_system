@@ -433,6 +433,8 @@ def _prod_point_json(point: PlcPoint) -> dict:
         "deviceName": point.device.name if point.device_id else "",
         "address": point.address,
         "unit": point.unit,
+        "role": point.role,
+        "roleLabel": point.get_role_display(),
         "counterMode": point.counter_mode,
         "enabled": point.enabled,
     }

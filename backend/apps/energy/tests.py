@@ -4572,11 +4572,13 @@ class PlcProductionTests(TestCase):
         )
         for p in (bottle, case, spec):
             ProductionBindingAssignment.objects.create(device=self.b_device, point=p)
-        StandardCaseRule.objects.create(in_count=12, ml=330, factor=Decimal("1.25"))
 
         t1 = datetime(2026, 11, 20, 10, 0, 0)
+        t2 = t1 + timedelta(hours=1)
+        spec_ml = int(plc_service.simulated_value(spec, t2))
+        StandardCaseRule.objects.create(in_count=12, ml=spec_ml, factor=Decimal("1.25"))
         plc_service.collect_device(self.device, now=t1, force_simulated=True)
-        plc_service.collect_device(self.device, now=t1 + timedelta(hours=1), force_simulated=True)
+        plc_service.collect_device(self.device, now=t2, force_simulated=True)
 
         counter = ProductionCounterHourly.objects.get(
             line=self.line, stat_date=t1.date(), stat_hour=10
@@ -4584,7 +4586,7 @@ class PlcProductionTests(TestCase):
         self.assertEqual(counter.bottles, Decimal("1200.0"))
         self.assertEqual(counter.cases, Decimal("100.0"))
         self.assertEqual(counter.in_count, 12)
-        self.assertEqual(counter.ml, 330)
+        self.assertEqual(counter.ml, spec_ml)
         self.assertEqual(counter.factor, Decimal("1.2500"))
 
         case_row = ProductionCaseHourly.objects.get(
@@ -4597,6 +4599,25 @@ class PlcProductionTests(TestCase):
             Decimal("125.0"),
             "页面显示产量取标箱数",
         )
+
+    def test_模拟默认瓶数远大于箱数且规格每4小时切换(self):
+        bottle = PlcPoint.objects.create(
+            code="P-DEF-B", name="默认瓶数", device=self.device, role=PlcPoint.ROLE_BOTTLE, sim_rate=0,
+        )
+        case = PlcPoint.objects.create(
+            code="P-DEF-C", name="默认箱数", device=self.device, role=PlcPoint.ROLE_CASE, sim_rate=0,
+        )
+        spec = PlcPoint.objects.create(
+            code="P-DEF-S", name="默认规格", device=self.device, role=PlcPoint.ROLE_SPEC,
+        )
+        t = datetime(2026, 11, 20, 10, 0, 0)
+        b0, b1 = plc_service.simulated_value(bottle, t), plc_service.simulated_value(bottle, t + timedelta(hours=1))
+        c0, c1 = plc_service.simulated_value(case, t), plc_service.simulated_value(case, t + timedelta(hours=1))
+        self.assertGreater(b1 - b0, c1 - c0, "瓶数增量必须明显大于箱数")
+        self.assertEqual(b1 - b0, Decimal("12000.000"))
+        self.assertEqual(c1 - c0, Decimal("1000.000"))
+        specs = {int(plc_service.simulated_value(spec, t + timedelta(hours=4 * i))) for i in range(3)}
+        self.assertEqual(specs, {330, 500, 1000})
 
     def test_未配置标箱规则时按1倍兜底(self):
         self.point.enabled = False
@@ -4779,4 +4800,6 @@ class PlcProductionTests(TestCase):
         dev = node["types"][0]["devices"][0]
         self.assertEqual(dev["lineCode"], self.line.line_code)
         self.assertEqual(dev["pointCodes"], [self.point.code])
-        self.assertIn(self.point.code, [p["code"] for p in data["options"]["points"]])
+        option = next(p for p in data["options"]["points"] if p["code"] == self.point.code)
+        self.assertIn(option["role"], ("bottle", "case", "spec"))
+        self.assertTrue(option["roleLabel"])

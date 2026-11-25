@@ -361,12 +361,12 @@ onMounted(() => {
         :closable="false"
         show-icon
         class="mb-12"
-        title="示例：12 入（瓶/箱）+ 330ml → 设定值 1.25，标箱数 = 箱数 × 1.25"
+        title="示例：12 入（瓶/箱）+ 规格 330 → 设定值 1.25，标箱数 = 箱数 × 1.25"
         description="PLC 会读取现场选择的 ml 数；未配置对应规则时按 1.0 计，并在产量记录里标记「未命中规则」。"
       />
       <el-table v-loading="caseLoading" :data="caseRules" border stripe empty-text="暂无标箱换算规则">
         <el-table-column prop="inCount" label="入数（瓶/箱）" width="140" align="right" />
-        <el-table-column prop="ml" label="ml 数" width="120" align="right" />
+        <el-table-column prop="ml" label="规格" width="120" align="right" />
         <el-table-column prop="factor" label="设定值" width="140" align="right" />
         <el-table-column label="说明" min-width="200">
           <template #default="{ row }">{{ row.remark || '—' }}</template>
@@ -386,7 +386,7 @@ onMounted(() => {
         <el-form-item label="入数（瓶/箱）" required>
           <el-input-number v-model="caseDialog.inCount" :min="1" :max="999" controls-position="right" />
         </el-form-item>
-        <el-form-item label="ml 数" required>
+        <el-form-item label="规格" required>
           <el-input-number v-model="caseDialog.ml" :min="1" :max="100000" controls-position="right" />
         </el-form-item>
         <el-form-item label="设定值" required>

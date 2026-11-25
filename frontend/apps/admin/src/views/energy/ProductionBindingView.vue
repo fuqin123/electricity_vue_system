@@ -571,7 +571,7 @@ onMounted(load);
             <el-table-column prop="address" label="地址" width="110" />
             <el-table-column label="用途" width="120">
               <template #default="{ row }">
-                {{ row.role === 'bottle' ? '01 瓶数' : row.role === 'case' ? '02 箱数' : row.role === 'spec' ? '规格 ml' : '普通计数' }}
+                {{ row.role === 'bottle' ? '01 瓶数' : row.role === 'case' ? '02 箱数' : row.role === 'spec' ? '规格 ml' : '—' }}
               </template>
             </el-table-column>
             <el-table-column label="计数方式" width="100">

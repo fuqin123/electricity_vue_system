@@ -1367,15 +1367,14 @@ class PlcPoint(models.Model):
 
     # v1.8.1：同一个 PLC 设备上可能同时挂三类点——
     #   01 电眼（瓶数）/ 02 电眼（箱数）/ 产品规格（ml，由现场人员选择）。
-    ROLE_COUNTER = "counter"
+    # v1.8.2：取消「普通计数」，现场每个产量点必须明确是 01 瓶数 / 02 箱数 / 规格 ml。
     ROLE_BOTTLE = "bottle"
     ROLE_CASE = "case"
     ROLE_SPEC = "spec"
     ROLE_CHOICES = [
-        (ROLE_COUNTER, "普通计数（沿用瓶数口径）"),
         (ROLE_BOTTLE, "01 电眼 · 瓶数"),
         (ROLE_CASE, "02 电眼 · 箱数"),
-        (ROLE_SPEC, "产品规格（ml，当前选择）"),
+        (ROLE_SPEC, "产品规格 ml"),
     ]
 
     MODE_CUMULATIVE = "cumulative"
@@ -1398,8 +1397,8 @@ class PlcPoint(models.Model):
     )
     data_type = models.CharField("数据类型", max_length=12, choices=DATA_TYPE_CHOICES, default=DT_UINT32)
     role = models.CharField(
-        "点位用途", max_length=12, choices=ROLE_CHOICES, default=ROLE_COUNTER,
-        help_text="01 瓶数 / 02 箱数 / 产品规格 ml；标箱产量需要瓶数 + 箱数（+ 可选 ml）",
+        "点位用途", max_length=12, choices=ROLE_CHOICES, default=ROLE_BOTTLE,
+        help_text="01 瓶数 / 02 箱数 / 产品规格 ml；标箱产量需要瓶数 + 箱数（+ 可选规格）",
     )
     counter_mode = models.CharField(
         "计数方式", max_length=12, choices=COUNTER_MODE_CHOICES, default=MODE_CUMULATIVE

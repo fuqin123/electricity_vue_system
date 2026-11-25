@@ -56,14 +56,33 @@ class PlcReadError(Exception):
     """PLC 连接 / 读取失败（带现场可读的原因）。"""
 
 
-def simulated_value(point: PlcPoint, now: datetime) -> Decimal:
-    """模拟读数：`sim_base + sim_rate × 从 epoch 起的小时数`。
+#: v1.8.2：模拟规格每 4 小时切换一次（330 → 500 → 1000）
+SIMULATED_SPEC_CYCLE = (330, 500, 1000)
+SIMULATED_SPEC_HOURS = 4
+#: 未显式配置 sim_rate 时的默认速率（瓶数必须远大于箱数，按 12 入匹配）
+SIMULATED_DEFAULT_RATE = {
+    PlcPoint.ROLE_BOTTLE: Decimal("12000"),
+    PlcPoint.ROLE_CASE: Decimal("1000"),
+}
 
-    用 epoch 而不是「当天 0 点」是为了跨零点不回退：计数器一旦回退会被当成
-    换表，模拟测试就再也跑不出连续曲线。默认 rate=0 时读数恒为 base。
+
+def simulated_value(point: PlcPoint, now: datetime) -> Decimal:
+    """模拟读数。
+
+    · 规格点：每 4 小时在 330 / 500 / 1000 之间切换，便于验证标箱换算；
+    · 瓶数 / 箱数：默认瓶数 12000/h、箱数 1000/h（12 入），保证箱数明显小于瓶数；
+      现场可在点位里用「模拟速率」覆盖；
+    · 其他情况：`sim_base + sim_rate × 从 epoch 起的小时数`。
     """
+    if point.role == PlcPoint.ROLE_SPEC:
+        hours = int(now.timestamp() // 3600)
+        return Decimal(SIMULATED_SPEC_CYCLE[(hours // SIMULATED_SPEC_HOURS) % len(SIMULATED_SPEC_CYCLE)])
+
+    rate = Decimal(point.sim_rate or 0)
+    if rate == 0:
+        rate = SIMULATED_DEFAULT_RATE.get(point.role, Decimal("0"))
     hours = Decimal(str(now.timestamp())) / Decimal(3600)
-    return (point.sim_base + point.sim_rate * hours).quantize(Q3)
+    return (point.sim_base + rate * hours).quantize(Q3)
 
 
 def decode_value(raw: bytes, point: PlcPoint) -> Decimal:
@@ -203,7 +222,7 @@ def collect_device(
     if not results:
         return {"ok": False, "points": 0, "failed": 0, "written": 0, "lines": [], "error": "没有启用的点位"}
 
-    # 每线累计：瓶数 / 箱数 / 普通计数 / PLC 当前 ml
+    # 每线累计：瓶数 / 箱数 / PLC 当前规格 ml
     line_roles: dict[int, dict[str, object]] = {}
     failed = 0
     notes: list[str] = []

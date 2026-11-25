@@ -191,7 +191,7 @@ function blankPoint() {
     startOffset: 0,
     bitOffset: null as number | null,
     dataType: 'uint32' as PlcPoint['dataType'],
-    role: 'counter' as PlcPoint['role'],
+    role: 'bottle' as PlcPoint['role'],
     counterMode: 'cumulative' as PlcPoint['counterMode'],
     scale: 1,
     unit: '瓶',
@@ -510,10 +510,9 @@ onMounted(loadDevices);
         </el-form-item>
         <el-form-item label="点位用途">
           <el-select v-model="pointForm.role" style="width: 100%">
-            <el-option label="普通计数（沿用瓶数）" value="counter" />
             <el-option label="01 电眼 · 瓶数" value="bottle" />
             <el-option label="02 电眼 · 箱数" value="case" />
-            <el-option label="产品规格 ml（当前选择）" value="spec" />
+            <el-option label="产品规格 ml" value="spec" />
           </el-select>
         </el-form-item>
         <el-form-item label="计数方式">
