@@ -3,8 +3,9 @@
  * PlcReadingQueryView —— PLC 设备历史读数（v1.8.3）
  *
  * 参考仪表读数查询：看 `plc_reading` 的**原始读数**，而不是加工后的标箱产量。
- * 小时差值按「同一小时第一条与最后一条成功读数相减」计算：
- *   · 只有一条读数 → 「数据不足」，不拿 0 冒充；
+ * 小时差值按「本小时最后一条 − 上一小时最后一条成功读数」计算（v1.8.4 起
+ * PLC 与能源一样每小时采一次）：
+ *   · 上一小时没有成功读数 → 「数据不足」，不拿 0 冒充；
  *   · 累计值回退（换表 / 归零）→ 差值不成立；
  *   · 规格点不计算差值，只显示现场当前选择。
  */
@@ -138,7 +139,7 @@ function deltaStatus(row: PlcReadingRow): { label: string; type: 'success' | 'in
       show-icon
       class="mb-16"
       title="这里看的是 PLC 原始读数，不是标箱产量"
-      description="小时差值 = 同一小时第一条与最后一条成功读数相减；只有一条读数会标「数据不足」，规格点不计算差值。"
+      description="小时差值 = 本小时最后一条 − 上一小时最后一条成功读数；上一小时没有成功读数会标「数据不足」，规格点不计算差值。"
     />
 
     <el-card shadow="never" class="mb-16">
@@ -148,10 +149,12 @@ function deltaStatus(row: PlcReadingRow): { label: string; type: 'success' | 'in
           v-model="range"
           type="datetimerange"
           value-format="YYYY-MM-DD HH:mm"
-          format="MM-DD HH时"
-          size="small"
+          format="YYYY-MM-DD HH:mm"
+          range-separator="至"
+          start-placeholder="开始时间"
+          end-placeholder="结束时间"
           :clearable="false"
-          style="width: 330px"
+          style="width: 380px"
         />
         <span class="query-label">PLC 设备</span>
         <el-select v-model="deviceId" size="small" clearable placeholder="全部" style="width: 190px">

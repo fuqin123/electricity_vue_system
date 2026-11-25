@@ -3,8 +3,12 @@
 算式（口径必须和财务对得上，别在别处再算一遍）：
 
     变动费用(元) = 电(kWh) × 电价 + 水(t) × 水价 + 汽(t) × 汽价
-    箱数(箱)     = 产量(瓶) ÷ 箱规(瓶/箱)
-    单箱变动费用 = 变动费用 ÷ 箱数
+    单箱变动费用 = 变动费用 ÷ 车间产量(标箱)
+
+⚠ v1.8.4：产量侧从 v1.8.1 起已经统一为**标箱**，这里不能再按「瓶 ÷ 箱规」换算。
+   v1.8.3 及以前把标箱当瓶又除了一次箱规，得到的单箱费用会被放大/缩小十几倍。
+   `bottles_per_case` 只保留给「产量仍以瓶为单位」的历史数据兜底，见
+   `ranges._case_count`。
 
 ⚠ 三条不能含糊的地方：
 
@@ -43,10 +47,10 @@ class CostParams:
 
     @property
     def complete(self) -> bool:
-        """算单箱费用需要的四项是否齐全（标准线那项不参与，缺了只是不画线）。"""
+        """算单箱费用需要的三项单价是否齐全（箱规只在「产量还是瓶」时兜底用）。"""
         return all(
             v is not None and v > 0
-            for v in (self.electric, self.water, self.steam, self.bottles_per_case)
+            for v in (self.electric, self.water, self.steam)
         )
 
 
@@ -81,12 +85,15 @@ def variable_cost_yuan(
 
 
 def per_case_cost(
-    kwh: Decimal | None, water_t: Decimal | None, steam_t: Decimal | None, bottles: Decimal | None,
+    kwh: Decimal | None, water_t: Decimal | None, steam_t: Decimal | None, cases: Decimal | None,
     cp: CostParams,
 ) -> Decimal | None:
-    """单箱变动费用（元/箱）。产量未接入（bottle=None）或算料不齐时返回 None。"""
+    """单箱变动费用（元/标箱）。
+
+    `cases` 必须是**标箱数**（v1.8.1 起产量口径）；产量未接入或为 0 时返回 None。
+    如果上游拿到的是瓶数，请先按箱规换算成标箱再传进来（见 `ranges._case_count`）。
+    """
     cost = variable_cost_yuan(kwh, water_t, steam_t, cp)
-    if cost is None or bottles is None or bottles <= 0 or not cp.bottles_per_case:
+    if cost is None or cases is None or cases <= 0:
         return None
-    cases = bottles / cp.bottles_per_case  # type: ignore[operator]
     return cost / cases

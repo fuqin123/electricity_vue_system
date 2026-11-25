@@ -14,9 +14,12 @@
  *  ② 修「下方两列底边不齐」：并排卡片误吃全局 `.card + .card` 的纵向外边距
  *     （见样式区 `.grid-2 > .card + .card`）。
  *
- * ⚠ 产量与部分单价尚未接入，所以「累计产量 / 累计单耗 / 单箱变动费用」现在**必然为空**。
+ * ⚠ 产量与部分单价尚未接入时，「累计产量 / 累计单耗 / 单箱变动费用」如实留空。
  *   这是如实留空，不是坏了：界面必须把 cost.blockers 的原因显示出来，
  *   也绝不拿电量反推产量凑一个数（ADR-013 / B-406 同一条铁律）。
+ *
+ * v1.8.4：只保留**按日**粒度；累计用量卡片改为「本月累计 + 本年累计」，
+ *   单箱变动费用 = (能源用量 × 单价) ÷ 整体车间产量，按生产日计算。
  */
 import { computed, onMounted, ref } from 'vue';
 import { ElMessage } from 'element-plus';
@@ -24,8 +27,6 @@ import {
   adminApi,
   big,
   energyApi,
-  int,
-  productionDayStart,
   type AdminOverview,
   type DashboardResult,
   type DashboardEnergyBlock
@@ -37,43 +38,50 @@ import AlarmLevelTag from '@/components/AlarmLevelTag.vue';
 import { costPerCaseOption, energyCumulativeOption, unitKwhCompareOption } from '@/utils/charts';
 import { notImplemented } from '@/utils/pending';
 
-/* ── 时间区间（精确到小时）─────────────────────────────── */
+/* ── 时间区间（按日）──────────────────────────────────────
+ * v1.8.4：数据中心不再提供小时粒度。变动费用与累计用量都按**生产日**出数，
+ * 顶部卡片改为「累计本月 / 累计本年」，不再显示某一天的累计用量。
+ */
 
 function fmt(d: Date): string {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:00`;
 }
 
+/** 生产月 / 生产年从 1 日（1 月 1 日）06:00 起算，与后端生产日口径一致。
+ *  06:00 前仍属于上一个生产日，所以月初/年初凌晨要回退一天再取月/年起点。 */
+function prodDay(now: Date): Date {
+  const d = new Date(now);
+  if (d.getHours() < 6) d.setDate(d.getDate() - 1);
+  return d;
+}
+function monthStart(now: Date): Date {
+  const d = prodDay(now);
+  return new Date(d.getFullYear(), d.getMonth(), 1, 6, 0, 0, 0);
+}
+function yearStart(now: Date): Date {
+  const d = prodDay(now);
+  return new Date(d.getFullYear(), 0, 1, 6, 0, 0, 0);
+}
+
 function defaultRange(): [string, string] {
   const now = new Date();
-  // 生产日 06:00 → 现在；06:00 前 productionDayStart 会退到前一天 06:00
-  return [fmt(productionDayStart(now)), fmt(now)];
+  return [fmt(monthStart(now)), fmt(now)];
 }
 
 const range = ref<[string, string]>(defaultRange());
-const granularity = ref<'hour' | 'day'>('hour');
 const loading = ref(true);
 const dash = ref<DashboardResult | null>(null);
 const overview = ref<AdminOverview | null>(null);
 
-const QUICK: { label: string; span: number; gran: 'hour' | 'day' }[] = [
-  { label: '本小时起', span: 0, gran: 'hour' },
-  { label: '本生产日', span: 0, gran: 'hour' },
-  { label: '近 3 日', span: 3, gran: 'hour' },
-  { label: '近 30 日', span: 30, gran: 'day' }
+const QUICK: { label: string; from: (now: Date) => Date }[] = [
+  { label: '本月', from: monthStart },
+  { label: '本年', from: yearStart }
 ];
 
 function applyQuick(q: (typeof QUICK)[number]) {
   const now = new Date();
-  if (q.label === '本小时起') {
-    range.value = [fmt(now), fmt(now)];
-  } else if (q.span === 0) {
-    range.value = [fmt(productionDayStart(now)), fmt(now)];
-  } else {
-    const from = new Date(now.getTime() - q.span * 86400000);
-    range.value = [fmt(from), fmt(now)];
-  }
-  granularity.value = q.gran;
+  range.value = [fmt(q.from(now)), fmt(now)];
   void load();
 }
 
@@ -86,7 +94,7 @@ async function load() {
   try {
     // 两个请求互不依赖，并发出去；看板卡片与图表因此永远同一时刻出数
     const [d, o] = await Promise.all([
-      energyApi.getDashboard({ from: range.value[0], to: range.value[1], granularity: granularity.value }),
+      energyApi.getDashboard({ from: range.value[0], to: range.value[1], granularity: 'day' }),
       adminApi.getOverview()
     ]);
     dash.value = d;
@@ -100,16 +108,34 @@ async function load() {
 
 onMounted(load);
 
-/* ── 区间累计 KPI ─────────────────────────────────────── */
+/* ── 累计本月 / 累计本年 ───────────────────────────────── */
 
-const t = computed(() => dash.value?.totals ?? null);
+const month = computed(() => dash.value?.month ?? null);
+const year = computed(() => dash.value?.year ?? null);
 const kpi = computed(() => overview.value?.kpi);
 
-/** 单箱变动费用：算不出就是 null（显示 --），不能显示 0 */
+/** 单箱变动费用：取区间内**最新一个算得出来的生产日**（v1.8.4 只到每日）。 */
 const perCaseText = computed(() => {
-  const v = t.value?.perCaseCost;
-  return v === null || v === undefined ? '--' : v.toFixed(2);
+  const arr = dash.value?.cost.perCase ?? [];
+  for (let i = arr.length - 1; i >= 0; i -= 1) {
+    const v = arr[i];
+    if (v !== null && v !== undefined) return v.toFixed(2);
+  }
+  return '--';
 });
+
+function num(v: number | null | undefined, digits = 2): string {
+  return v === null || v === undefined ? '--' : v.toFixed(digits);
+}
+
+function kwhText(v: number | null | undefined): string {
+  const b = big(v ?? null, 'kWh');
+  return `${b.v}${b.u}`;
+}
+
+function waterText(v: number | null | undefined): string {
+  return v === null || v === undefined ? '--' : `${v.toFixed(2)} t`;
+}
 
 /* ── 图表 ─────────────────────────────────────────────── */
 
@@ -132,7 +158,9 @@ function blockOf(key: 'electric' | 'water' | 'steam'): DashboardEnergyBlock | nu
   return dash.value?.energies[key] ?? null;
 }
 
-const unitUseLabel = (usageUnit: string) => `${usageUnit}/千瓶`;
+/** 产量单位以接口为准：v1.8.4 起优先标箱，历史数据才退回瓶 */
+const prodUnit = computed(() => dash.value?.productionUnit ?? '标箱');
+const unitUseLabel = (usageUnit: string) => `${usageUnit}/千${prodUnit.value === '标箱' ? '箱' : '瓶'}`;
 
 const electricOption = computed(() => {
   const d = dash.value;
@@ -143,6 +171,7 @@ const electricOption = computed(() => {
     usage: b.cumulative,
     usageUnit: b.unit,
     output: b.outputCumulative,
+    outputUnit: prodUnit.value,
     unitUse: b.unitCumulative,
     unitUseLabel: unitUseLabel(b.unit),
     color: '#1664ff',
@@ -159,6 +188,7 @@ const waterOption = computed(() => {
     usage: b.cumulative,
     usageUnit: b.unit,
     output: b.outputCumulative,
+    outputUnit: prodUnit.value,
     unitUse: b.unitCumulative,
     unitUseLabel: unitUseLabel(b.unit),
     color: '#387bff',
@@ -175,6 +205,7 @@ const steamOption = computed(() => {
     usage: b.cumulative,
     usageUnit: b.unit,
     output: b.outputCumulative,
+    outputUnit: prodUnit.value,
     unitUse: b.unitCumulative,
     unitUseLabel: unitUseLabel(b.unit),
     color: '#bd7e00',
@@ -197,7 +228,7 @@ function coverage(b: DashboardEnergyBlock | null): string {
 const costNote = computed(() => {
   const d = dash.value;
   if (!d) return '';
-  if (d.cost.available) return '实际值 vs 每月标准变动费用';
+  if (d.cost.available) return '按日实际值 vs 每月标准变动费用';
   return d.cost.blockers.join(' · ') || '算料未齐，暂时算不出';
 });
 </script>
@@ -228,17 +259,12 @@ const costNote = computed(() => {
           :clearable="false"
           style="width: 380px"
         />
-        <span class="query__label">粒度</span>
-        <el-radio-group v-model="granularity" size="small" @change="load">
-          <el-radio-button value="hour">按小时</el-radio-button>
-          <el-radio-button value="day">按天</el-radio-button>
-        </el-radio-group>
         <el-button-group>
           <el-button v-for="q in QUICK" :key="q.label" size="small" @click="applyQuick(q)">{{ q.label }}</el-button>
         </el-button-group>
         <el-button type="primary" size="small" :loading="loading" @click="load">查询</el-button>
         <span class="query__hint">
-          {{ dash ? `${dash.from} 至 ${dash.to} · ${dash.bucketCount} 个时段` : '加载中…' }}
+          {{ dash ? `${dash.from} 至 ${dash.to} · 按日 · ${dash.bucketCount} 个生产日` : '加载中…' }}
         </span>
       </div>
     </el-card>
@@ -254,47 +280,47 @@ const costNote = computed(() => {
       :description="dash.cost.blockers.join('；') + '。相关指标如实留空（显示 --），不拿电量反推产量凑数。'"
     />
 
-    <!-- 区间累计指标卡（原「今日用量统计」已按 v1.4.0 改为累计口径） -->
+    <!-- 累计本月 / 累计本年（v1.8.4：不再显示「一天」的累计用量） -->
     <div class="stat-grid">
       <StatCard
-        label="区间累计用电"
-        :value="big(t?.kwh ?? 0, '').v"
-        :unit="big(t?.kwh ?? 0, 'kWh').u"
+        label="本月累计用电"
+        :value="big(month?.kwh ?? null, '').v"
+        :unit="big(month?.kwh ?? null, 'kWh').u"
         color="#1664ff"
         :loading="loading"
-        :foot="`折合 ${int(t?.kwh ?? 0)} kWh`"
+        :foot="`本年累计 ${kwhText(year?.kwh)}`"
       />
       <StatCard
-        label="区间累计用水"
-        :value="t?.waterT === null || t?.waterT === undefined ? '--' : t.waterT.toFixed(2)"
+        label="本月累计用水"
+        :value="num(month?.waterT)"
         unit="t"
         color="#387bff"
         :loading="loading"
-        :foot="t?.waterT == null ? '车间进水总表未接入' : '车间总表，不可拆分到线别'"
+        :foot="`本年累计 ${waterText(year?.waterT)}`"
       />
       <StatCard
-        label="区间累计用汽"
-        :value="t?.steamT === null || t?.steamT === undefined ? '--' : t.steamT.toFixed(2)"
+        label="本月累计用汽"
+        :value="num(month?.steamT)"
         unit="t"
         color="#bd7e00"
         :loading="loading"
-        :foot="t?.steamT == null ? '蒸汽总表本区间无数据' : '蒸汽总表（已温压补偿）'"
+        :foot="`本年累计 ${waterText(year?.steamT)}`"
       />
       <StatCard
-        label="区间累计产量"
-        :value="big(t?.output ?? null, '').v"
-        :unit="big(t?.output ?? null, '标箱').u"
+        label="本月累计产量"
+        :value="big(month?.output ?? null, '').v"
+        :unit="month?.outputUnit ?? '标箱'"
         color="#86909c"
         :loading="loading"
-        :foot="dash && !dash.productionAvailable ? '产量数据源未接入，统一显示 --' : '来自 MES / 计数器报工'"
+        :foot="`本年累计 ${big(year?.output ?? null, '').v}${year?.outputUnit ?? '标箱'}`"
       />
       <StatCard
-        label="单箱变动费用"
+        label="最新一日单箱变动费用"
         :value="perCaseText"
         unit="元/箱"
         color="#2a814b"
         :loading="loading"
-        :foot="dash?.cost.standardPerCase ? `标准 ${dash.cost.standardPerCase} 元/箱` : '标准值未标定，暂不比对'"
+        :foot="dash?.cost.standardPerCase ? `按日 · 标准 ${dash.cost.standardPerCase} 元/箱` : '按日 · 标准值未标定'"
       />
       <StatCard
         label="未处理告警"
@@ -314,14 +340,14 @@ const costNote = computed(() => {
       />
     </div>
 
-    <!-- 主趋势图：单箱变动费用 vs 每月标准变动费用 -->
+    <!-- 主趋势图：按日的单箱变动费用 vs 每月标准变动费用 -->
     <div class="card">
       <div class="card__head">
         <h3 class="card__title">单箱变动费用趋势</h3>
         <span class="card__extra">{{ costNote }}</span>
       </div>
       <el-skeleton v-if="loading" :rows="6" animated />
-      <ChartPanel v-else title="" :option="costOption" :height="300" class="chart-inner" />
+      <ChartPanel v-else title="" :option="costOption" :height="280" class="chart-inner" />
     </div>
 
     <!-- 三张按能源分的累计趋势图：电为主，水/汽为辅 -->
@@ -331,7 +357,7 @@ const costNote = computed(() => {
         <span class="card__extra">{{ coverage(dash?.energies.electric ?? null) }}</span>
       </div>
       <el-skeleton v-if="loading" :rows="7" animated />
-      <ChartPanel v-else title="" :option="electricOption" :height="320" class="chart-inner" />
+      <ChartPanel v-else title="" :option="electricOption" :height="280" class="chart-inner" />
     </div>
 
     <div class="grid-2">
@@ -341,7 +367,7 @@ const costNote = computed(() => {
           <span class="card__extra">车间总表 · {{ coverage(dash?.energies.water ?? null) }}</span>
         </div>
         <el-skeleton v-if="loading" :rows="5" animated />
-        <ChartPanel v-else title="" :option="waterOption" :height="260" class="chart-inner" />
+        <ChartPanel v-else title="" :option="waterOption" :height="280" class="chart-inner" />
       </div>
 
       <div class="card">
@@ -350,7 +376,7 @@ const costNote = computed(() => {
           <span class="card__extra">车间总表 · {{ coverage(dash?.energies.steam ?? null) }}</span>
         </div>
         <el-skeleton v-if="loading" :rows="5" animated />
-        <ChartPanel v-else title="" :option="steamOption" :height="260" class="chart-inner" />
+        <ChartPanel v-else title="" :option="steamOption" :height="280" class="chart-inner" />
       </div>
     </div>
 

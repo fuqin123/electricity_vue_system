@@ -1239,6 +1239,67 @@ def _unit_series(cum_usage: list[float | None], cum_out: list[float | None], sca
     return out
 
 
+def _case_count(value: float | None, unit: str, cp: cost.CostParams) -> Decimal | None:
+    """产量 → 标箱数。标箱直接返回；瓶数按箱规换算（缺箱规则为 None）。"""
+    v = _dec(value)
+    if v is None or v <= 0:
+        return None
+    if unit == "标箱":
+        return v
+    if cp.bottles_per_case is not None and cp.bottles_per_case > 0:
+        return v / cp.bottles_per_case
+    return None
+
+
+def _production_year_series(
+    lines: list[ProductionLine], years: list[str]
+) -> tuple[list[float | None], str]:
+    """年度产量：优先 `production_case_hourly`（标箱），没有时退回瓶数。"""
+    if not lines or not years:
+        return [None for _ in years], "标箱"
+    wanted = {int(y) for y in years}
+    rows = (
+        ProductionCaseHourly.objects.filter(line__in=lines, stat_date__year__in=wanted)
+        .values("stat_date")
+        .annotate(t=Sum("standard_cases"))
+    )
+    by_year: dict[int, Decimal] = {}
+    for r in rows:
+        y = r["stat_date"].year
+        by_year[y] = by_year.get(y, Decimal(0)) + Decimal(r["t"])
+    if by_year:
+        return [_round(by_year.get(int(y))) if int(y) in by_year else None for y in years], "标箱"
+    out: list[float | None] = []
+    for y in years:
+        start, end = B.period_window(PeriodSummary.DIM_YEAR, y)
+        out.append(_round(S.production_total(lines, start, end), 0))
+    return out, "瓶"
+
+
+def _period_totals(dim: str, now: datetime) -> dict:
+    """车间本月 / 本年累计（能源 + 产量）。
+
+    与用量查询页、大屏 KPI 同源：能源读 `period_rows`，产量优先读标箱表
+    （没有标箱数据时才退回瓶数）。用于数据中心「累计本月 / 累计本年」卡片。
+    """
+    key = S.make_key(dim, B.production_day(now))
+    row = S.period_rows(dim, S.SCOPE_WORKSHOP, None, [key], now=now).get(key)
+    lines = list(ProductionLine.active_lines_qs())
+    if dim == S.DIM_MONTH:
+        out_vals, out_unit = _production_month_series(lines, [key])
+    else:
+        out_vals, out_unit = _production_year_series(lines, [key])
+    output = out_vals[0] if out_vals else None
+    return {
+        "label": key,
+        "kwh": round_kwh(row.kwh) if row is not None else None,
+        "waterT": round(float(row.water_t), 2) if (row is not None and row.water_t is not None) else None,
+        "steamT": round(float(row.steam_t), 2) if (row is not None and row.steam_t is not None) else None,
+        "output": int(output) if output is not None else None,
+        "outputUnit": out_unit,
+    }
+
+
 def _output_hour_series(lines: list[ProductionLine], buckets: list[tuple[date_cls, int]]) -> list[float | None]:
     """按（日期, 小时）取真实产量；未接入的桶给 None（不是 0）。"""
     if not lines or not buckets:
@@ -1300,7 +1361,8 @@ def dashboard_range(
         labels = [f"{d:%m-%d} {h:02d}:00" for d, h in buckets]
         emat = _hour_matrix(meters, buckets) if buckets else {}
         kwh_vals = [round_kwh(emat[b][0]) for b in buckets]
-        out_vals = _output_hour_series(lines, buckets)
+        # 与能源计量页同源：优先 `production_case_hourly`（标箱），没有时退回瓶数
+        out_vals, prod_unit = _production_hour_series(lines, buckets)
         if per_line:
             water_vals = [None for _ in buckets]
             steam_vals = [None for _ in buckets]
@@ -1313,7 +1375,7 @@ def dashboard_range(
         kwh_vals = [
             round_kwh(_range_total_kwh(meters, B.day_start(d), B.day_end(d))) for d in days
         ]
-        out_vals = _output_day_series(lines, days)
+        out_vals, prod_unit = _production_day_series(lines, days)
         if per_line:
             water_vals = [None for _ in days]
             steam_vals = [None for _ in days]
@@ -1351,25 +1413,29 @@ def dashboard_range(
     for k, w, s, o in zip(kwh_vals, water_vals, steam_vals, out_vals):
         kk, ww, ss = _dec(k), _dec(w), _dec(s)
         cost_yuan.append(_round(cost.variable_cost_yuan(kk, ww, ss, cp), 2))
-        per_case.append(_round(cost.per_case_cost(kk, ww, ss, _dec(o), cp), 2))
+        # 产量侧统一成标箱后再除：产量本该是标箱时不再重复除以箱规（v1.8.4）
+        per_case.append(_round(cost.per_case_cost(kk, ww, ss, _case_count(o, prod_unit, cp), cp), 2))
 
     cum_cost, cost_covers = _cumulative(cost_yuan)
+    cum_cases = [_case_count(o, prod_unit, cp) for o in cum_out]
     per_case_cum: list[float | None] = []
-    for c, o in zip(cum_cost, cum_out):
-        if c is None or o is None or o <= 0 or not cp.bottles_per_case:
+    for c, cases in zip(cum_cost, cum_cases):
+        if c is None or cases is None or cases <= 0:
             per_case_cum.append(None)
             continue
-        per_case_cum.append(round(c / (o / float(cp.bottles_per_case)), 2))
+        per_case_cum.append(round(c / float(cases), 2))
 
     # ── 算不出费用时，把原因说清楚（界面上直接显示，不让人以为系统坏了）──
     blockers: list[str] = []
     missing_prices = [
         label
-        for label, v in (("电价", cp.electric), ("工业水价", cp.water), ("蒸汽单价", cp.steam), ("箱规", cp.bottles_per_case))
+        for label, v in (("电价", cp.electric), ("工业水价", cp.water), ("蒸汽单价", cp.steam))
         if v is None or v <= 0
     ]
     if missing_prices:
         blockers.append("成本参数未标定：" + "、".join(missing_prices) + "（后台「系统参数」页维护）")
+    if prod_real and prod_unit != "标箱" and (cp.bottles_per_case is None or cp.bottles_per_case <= 0):
+        blockers.append("产量以瓶为单位且箱规未标定，算不出标箱数")
     if not prod_real:
         blockers.append("产量数据源未接入，折不出箱数")
     if not per_line:
@@ -1385,9 +1451,12 @@ def dashboard_range(
         "line": line_code.upper() if line_code else None,
         "labels": labels,
         "bucketCount": len(labels),
+        "productionUnit": prod_unit,
         "energies": energies,
         "cost": {
-            "available": cp.complete and prod_real,
+            # 只有真的算出了单箱费用才算「可用」：水/汽缺数时整段为 None，
+            # 此时要把 blockers 显示给现场，而不是默默给一张空图（v1.8.4）
+            "available": cp.complete and prod_real and any(v is not None for v in per_case_cum),
             "values": cost_yuan,
             "cumulative": cum_cost,
             "cumulativeCovered": cost_covers,
@@ -1398,6 +1467,9 @@ def dashboard_range(
         },
         "productionAvailable": prod_real,
         "dayStartHour": B.DAY_START_HOUR,
+        # 数据中心顶部卡片：累计本月 / 累计本年（不再提供「一天累计」）
+        "month": _period_totals(S.DIM_MONTH, now),
+        "year": _period_totals(S.DIM_YEAR, now),
         "totals": {
             "kwh": _sum_optional(kwh_vals),
             "waterT": _sum_optional(water_vals),

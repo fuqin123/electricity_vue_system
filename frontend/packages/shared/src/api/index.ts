@@ -343,6 +343,9 @@ export const energyApi = {
           blockers: ['后端接口未启用，走演示数据']
         },
         productionAvailable: false,
+        productionUnit: '标箱',
+        month: { label: '', kwh: null, waterT: null, steamT: null, output: null, outputUnit: '标箱' },
+        year: { label: '', kwh: null, waterT: null, steamT: null, output: null, outputUnit: '标箱' },
         totals: { kwh: null, waterT: null, steamT: null, output: null, costYuan: null, perCaseCost: null }
       };
       return delay(empty, 120);
@@ -1240,18 +1243,18 @@ export interface DashboardEnergyBlock {
   values: (number | null)[];
   /** 逐桶累计用量 */
   cumulative: (number | null)[];
-  /** 累计到该桶时吃进了几格可信数据 —— 与 bucketCount 一起显示「已覆盖 N/M」 */
+/** 累计到该桶时吃进了几格可信数据 —— 与 bucketCount 一起显示「已覆盖 N/M」 */
   cumulativeCovered: number[];
-  /** 累计产量（瓶）；产量未接入时整段 null */
+  /** 累计产量（单位见 DashboardResult.productionUnit，v1.8.4 起标箱优先）；未接入时整段 null */
   outputCumulative: (number | null)[];
-  /** 累计单耗（用量 ÷ 千瓶）；产量缺 → null */
+  /** 累计单耗（用量 ÷ 千产量单位）；产量缺 → null */
   unitCumulative: (number | null)[];
   /** 该能源是否支持按线拆分（水/汽只有车间总表 → false） */
   perLineAvailable?: boolean;
 }
 
 export interface DashboardCostBlock {
-  /** 算料是否齐全（单价 + 箱规 + 产量）。false 时下面几条序列都是 null */
+  /** 算料是否齐全（三项能源单价 + 产量）。false 时下面几条序列都是 null */
   available: boolean;
   values: (number | null)[];
   cumulative: (number | null)[];
@@ -1264,6 +1267,18 @@ export interface DashboardCostBlock {
   blockers: string[];
 }
 
+export interface DashboardPeriodTotals {
+  /** 周期键：月 = `2026-11`，年 = `2026` */
+  label: string;
+  kwh: number | null;
+  waterT: number | null;
+  steamT: number | null;
+  /** 累计产量；未接入 → null */
+  output: number | null;
+  /** 产量单位：标箱优先，历史数据才退回瓶 */
+  outputUnit?: '标箱' | '瓶';
+}
+
 export interface DashboardResult {
   from: string;
   to: string;
@@ -1271,9 +1286,15 @@ export interface DashboardResult {
   line?: string | null;
   labels: string[];
   bucketCount: number;
+  /** 产量序列单位：v1.8.4 起优先「标箱」，没有标箱数据时才退回「瓶」 */
+  productionUnit?: '标箱' | '瓶';
   energies: { electric: DashboardEnergyBlock; water: DashboardEnergyBlock; steam: DashboardEnergyBlock };
   cost: DashboardCostBlock;
   productionAvailable: boolean;
+  /** 累计本月（能源 + 产量） */
+  month?: DashboardPeriodTotals;
+  /** 累计本年 */
+  year?: DashboardPeriodTotals;
   totals: {
     kwh: number | null;
     waterT: number | null;

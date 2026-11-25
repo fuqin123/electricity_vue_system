@@ -77,7 +77,7 @@ function blankDevice() {
     rack: 0,
     slot: 1,
     timeoutMs: 3000,
-    intervalSeconds: 60,
+    intervalSeconds: 3600,
     enabled: true,
     remark: ''
   };
@@ -458,6 +458,9 @@ onMounted(loadDevices);
         </el-form-item>
         <el-form-item label="采样周期(秒)">
           <el-input-number v-model="deviceForm.intervalSeconds" :min="5" :max="86400" controls-position="right" />
+          <span style="margin-left: 8px; color: var(--el-text-color-secondary); font-size: 12px">
+            与能源采集一致，每小时一次（3600 秒）
+          </span>
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="deviceForm.enabled" />

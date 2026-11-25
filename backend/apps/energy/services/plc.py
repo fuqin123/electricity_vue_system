@@ -178,8 +178,13 @@ def _scaled(value: Decimal, point: PlcPoint) -> Decimal:
 
 
 def _hour_bucket(now: datetime) -> tuple[object, int]:
-    """读数归到哪个自然小时：06:00 整点采集的增量属于 05:00 那一小时。"""
-    anchor = now - timedelta(seconds=1)
+    """读数归到**刚结束的那个自然小时**（v1.8.4）。
+
+    PLC 与能源一样每小时采一次：11:05 采到的累计值，与 10:05 的读数相减，
+    得到的就是 10:00—11:00 这一个小时的产量，必须记在 10 点，而不是 11 点。
+    若仍按「读数所在的小时」归属，切到小时采集后 11 点只会拿到 5 分钟的增量。
+    """
+    anchor = now.replace(minute=0, second=0, microsecond=0) - timedelta(seconds=1)
     return anchor.date(), anchor.hour
 
 

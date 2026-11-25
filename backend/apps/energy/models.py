@@ -1286,7 +1286,8 @@ class PlcDevice(models.Model):
     slot = models.PositiveSmallIntegerField("槽位", default=1)
     mode = models.CharField("采集模式", max_length=12, choices=MODE_CHOICES, default=MODE_SIMULATED)
     timeout_ms = models.PositiveIntegerField("超时(ms)", default=3000)
-    interval_seconds = models.PositiveIntegerField("采样周期(秒)", default=60)
+    # v1.8.4：PLC 产量与能源一致，每小时采集一次（容器按小时调用 --if-due）
+    interval_seconds = models.PositiveIntegerField("采样周期(秒)", default=3600)
     enabled = models.BooleanField("启用", default=True)
     remark = models.CharField("备注", max_length=200, blank=True, default="")
 

@@ -20,6 +20,7 @@ from django.test import Client, RequestFactory, TestCase
 from apps.energy.collectors.base import BaseCollector, CollectResult, get_path
 from apps.energy.collectors.modbus_rtu import ModbusRtuOverTcpCollector, decode_registers
 from apps.energy.management.commands import collect
+from apps.energy.management.commands import collect_production
 from apps.energy.management.commands.ingest_production import write_production
 from apps.energy import api
 from apps.energy.models import (
@@ -1324,6 +1325,32 @@ class DashboardCumulativeTests(TestCase):
         self.assertEqual(d["cost"]["perCase"][0], 0.33)
         # 标准值未标定 → 不画基准线，且不能是 0
         self.assertIsNone(d["cost"]["standardPerCase"])
+
+    def test_产量已是标箱时不再除以箱规(self):
+        """v1.8.4：1000 标箱、费用 334 元 → 0.334 元/箱。
+
+        以前把标箱当瓶又除以箱规，会得到 0.03 或 4.01 这类差十几倍的假费用。
+        """
+        elec = self.meter("E-A1-02", EnergyType.ELECTRIC)
+        water = self.meter("E-W-02", EnergyType.WATER, EnergyMeter.SCOPE_WORKSHOP)
+        steam = self.meter("E-S-02", EnergyType.STEAM, EnergyMeter.SCOPE_WORKSHOP)
+        self.usage(elec, 8, "100")
+        self.usage(water, 8, "2")
+        self.usage(steam, 8, "1")
+        ProductionCaseHourly.objects.create(
+            line=self.line, stat_date=self.DAY, stat_hour=8, standard_cases=Decimal("1000")
+        )
+        for key, val in (("price.electric", "0.65"), ("price.water", "4.5"), ("price.steam", "260")):
+            SystemParam.objects.create(key=key, name=key, value=Decimal(val), unit="")
+
+        d = ranges.dashboard_range(
+            datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), now=self.NOW
+        )
+        self.assertEqual(d["productionUnit"], "标箱")
+        self.assertEqual(d["cost"]["values"][0], 334.0)
+        self.assertEqual(d["cost"]["perCase"][0], 0.33)
+        # 产量是标箱时，箱规未标定不影响费用计算
+        self.assertNotIn("箱规", " ".join(d["cost"]["blockers"]))
 
     def test_少一项单价时整段费用为null而不是偏小值(self):
         """只标定电价时，按「水汽 0 元」算出来的费用会偏小且看起来完全正常 —— 必须拒绝。"""
@@ -4555,6 +4582,23 @@ class PlcProductionTests(TestCase):
         self.assertEqual(row.output, Decimal("100.000"))
         self.assertEqual(row.source, ProductionHourly.SOURCE_PLC)
 
+    def test_if_due每小时只采集一次(self):
+        """v1.8.4：与能源一致，整点后第一轮采完，本小时剩余轮次跳过。"""
+        cmd = collect_production.Command()
+        t = datetime(2026, 11, 20, 10, 5)
+        self.assertEqual(cmd._due_devices([self.device], now=t), [self.device])
+        plc_service.collect_device(self.device, now=t, force_simulated=True)
+        self.assertEqual(
+            cmd._due_devices([self.device], now=datetime(2026, 11, 20, 10, 10)),
+            [],
+            "本小时已采集成功的设备不应重复读取",
+        )
+        self.assertEqual(
+            cmd._due_devices([self.device], now=datetime(2026, 11, 20, 11, 5)),
+            [self.device],
+            "下一个整点应重新采集",
+        )
+
     def test_瓶数箱数加ml按规则换算标箱并分表存放(self):
         self.point.enabled = False
         self.point.save(update_fields=["enabled"])
@@ -4601,6 +4645,8 @@ class PlcProductionTests(TestCase):
         )
 
     def test_PLC历史读数返回原始值与本小时差值(self):
+        # v1.8.4：小时差值 = 本小时最后一条 − 上一小时最后一条成功读数
+        PlcReading.objects.create(point=self.point, collect_time=datetime(2026, 11, 20, 9, 55), value=Decimal("880"))
         PlcReading.objects.create(point=self.point, collect_time=datetime(2026, 11, 20, 10, 5), value=Decimal("1000"))
         PlcReading.objects.create(point=self.point, collect_time=datetime(2026, 11, 20, 10, 55), value=Decimal("1120"))
         PlcReading.objects.create(
@@ -4617,7 +4663,7 @@ class PlcProductionTests(TestCase):
         first = body["list"][0]
         self.assertEqual(first["point"], self.point.code)
         self.assertEqual(first["value"], 1120.0)
-        self.assertEqual(first["hourDelta"], 120.0)
+        self.assertEqual(first["hourDelta"], 240.0)
         self.assertEqual(first["hourStatus"], "ok")
 
     def test_部分产线无产量时数据中心不抛500(self):

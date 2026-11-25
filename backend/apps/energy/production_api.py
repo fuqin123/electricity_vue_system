@@ -869,17 +869,25 @@ def admin_plc_readings(request: HttpRequest) -> JsonResponse:
     size = max(1, min(int(request.GET.get("pageSize", 50) or 50), 500))
     rows = list(qs[(page - 1) * size : page * size])
 
-    # 计算本页涉及到的 (点位, 小时) 的首末差值：只多查这一小段，不扫整库
+    # 小时差值：把读数按「它作为终点所属的小时」归桶，再与上一小时的
+    # 最后一条成功读数相减。v1.8.4 起 PLC 每小时只采一次，所以这就是
+    # 「本小时最后一条 − 上一小时最后一条」，与能源小时差值同口径。
+    def bucket_of(value: datetime) -> tuple[object, int]:
+        anchor = value.replace(minute=0, second=0, microsecond=0) - timedelta(seconds=1)
+        return anchor.date(), anchor.hour
+
+    def bucket_start(key: tuple[object, int]) -> datetime:
+        d, h = key
+        return datetime(d.year, d.month, d.day, h)  # type: ignore[union-attr]
+
     delta_map: dict[tuple[int, object, int], dict] = {}
     if rows:
         point_ids = {r.point_id for r in rows}
-        hour_starts = [
-            r.collect_time.replace(minute=0, second=0, microsecond=0)
-            for r in rows
-            if r.collect_time
-        ]
-        range_start = min(hour_starts)
-        range_end = max(hour_starts) + timedelta(hours=1)
+        first_bucket = min(bucket_of(r.collect_time) for r in rows if r.collect_time)
+        last_bucket = max(bucket_of(r.collect_time) for r in rows if r.collect_time)
+        # 多查一小时：计算最早一小时的差值需要上一小时的最后一条读数
+        range_start = bucket_start(first_bucket) - timedelta(hours=1)
+        range_end = bucket_start(last_bucket) + timedelta(hours=2)
         readings = (
             PlcReading.objects.filter(
                 point_id__in=point_ids,
@@ -893,8 +901,8 @@ def admin_plc_readings(request: HttpRequest) -> JsonResponse:
         )
         buckets: dict[tuple[int, object, int], list] = {}
         for r in readings:
-            key = (r.point_id, r.collect_time.date(), r.collect_time.hour)
-            buckets.setdefault(key, []).append(r)
+            buckets.setdefault((r.point_id, *bucket_of(r.collect_time)), []).append(r)
+
         for key, items in buckets.items():
             p = items[0].point
             if p.role == PlcPoint.ROLE_SPEC:
@@ -904,18 +912,19 @@ def admin_plc_readings(request: HttpRequest) -> JsonResponse:
                 delta_map[key] = {
                     "hourDelta": sum((r.value for r in items), Decimal(0)),
                     "hourStatus": "ok",
-                    "hourNote": "瞬时值按本条小时累加",
+                    "hourNote": "瞬时值按本小时累加",
                 }
                 continue
-            if len(items) < 2:
+            prev_anchor = bucket_start(key[1:]) - timedelta(seconds=1)
+            prev_items = buckets.get((key[0], prev_anchor.date(), prev_anchor.hour))
+            if not prev_items:
                 delta_map[key] = {
                     "hourDelta": None,
                     "hourStatus": "insufficient",
-                    "hourNote": "本小时仅 1 条成功读数，无法计算差值",
+                    "hourNote": "上一小时没有成功读数，无法计算小时差值",
                 }
                 continue
-            first, last = items[0], items[-1]
-            delta = last.value - first.value
+            delta = items[-1].value - prev_items[-1].value
             if delta < 0:
                 delta_map[key] = {
                     "hourDelta": None,
@@ -926,12 +935,12 @@ def admin_plc_readings(request: HttpRequest) -> JsonResponse:
                 delta_map[key] = {
                     "hourDelta": delta,
                     "hourStatus": "ok",
-                    "hourNote": "本小时最后一条 − 第一条成功读数",
+                    "hourNote": "本小时最后一条 − 上一小时最后一条成功读数",
                 }
 
     items = []
     for r in rows:
-        key = (r.point_id, r.collect_time.date(), r.collect_time.hour)
+        key = (r.point_id, *bucket_of(r.collect_time))
         extra = delta_map.get(
             key,
             {"hourDelta": None, "hourStatus": "insufficient", "hourNote": "本小时没有该点位的成功读数"},

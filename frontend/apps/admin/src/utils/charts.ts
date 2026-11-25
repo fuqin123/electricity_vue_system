@@ -361,8 +361,10 @@ export interface EnergyCumulativeInput {
   usageUnit: string;
   output: (number | null)[];
   unitUse: (number | null)[];
-  /** 单耗轴标题，如 'kWh/千瓶' 或 't/千瓶' */
+  /** 单耗轴标题，如 'kWh/千箱' 或 't/千瓶' */
   unitUseLabel: string;
+  /** 产量单位（v1.8.4：标箱优先，历史数据退回瓶） */
+  outputUnit?: string;
   color: string;
   labelInterval?: number | "auto";
 }
@@ -393,12 +395,13 @@ export function energyCumulativeOption(
   ];
   if (showOutput) {
     series.push({
-      name: "累计产量（瓶）",
+      name: `累计产量（${i.outputUnit ?? "标箱"}）`,
       type: "bar",
       yAxisIndex: 1,
       data: i.output,
       barMaxWidth: 18,
-      itemStyle: { color: "rgba(134,144,156,.45)", borderRadius: [2, 2, 0, 0] },
+      // 与能源计量页的产量柱同色（#2a814b），避免同一个「产量」在两个页面是两个颜色
+      itemStyle: { color: "#2a814b", opacity: 0.75, borderRadius: [2, 2, 0, 0] },
     });
   }
   if (showUnit) {
@@ -461,8 +464,10 @@ export function energyCumulativeOption(
     },
     grid: {
       left: 4,
+      // 顶部给图例和纵轴单位各留一行：右侧轴的 name 默认落在绘图区上沿，
+      // 3 根轴时会被右上角图例盖住（v1.8.4 反馈，与「区间用电趋势」一致）
       right: showUnit && showOutput ? 116 : 48,
-      top: 34,
+      top: 56,
       bottom: 2,
       containLabel: true,
     },
@@ -545,7 +550,7 @@ export function costPerCaseOption(
       icon: "roundRect",
       textStyle: { color: C.slate, fontSize: 12, fontFamily: FONT },
     },
-    grid: { left: 4, right: 12, top: 34, bottom: 2, containLabel: true },
+    grid: { left: 4, right: 12, top: 56, bottom: 2, containLabel: true },
     xAxis: catAxis(labels, opts.labelInterval ?? "auto"),
     yAxis: [{ ...valAxis("元/箱"), min: 0 }],
     series,
@@ -613,7 +618,8 @@ export function energyUsageOption(
     grid: {
       left: 4,
       right: 12 + Math.max(0, shown.length - 1) * 56,
-      top: 34,
+      // 与「区间用电趋势」同高：顶部留够图例 + 纵轴单位，右侧轴的 name 不再被图例遮挡
+      top: 56,
       bottom: 2,
       containLabel: true,
     },
