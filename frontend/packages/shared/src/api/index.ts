@@ -59,6 +59,8 @@ import type {
   PageResult,
   PlcDevice,
   PlcPoint,
+  PlcReadingPage,
+  PlcReadingQuery,
   PlcTestResult,
   ProductionBindingDeviceNode,
   ProductionBindingDevicePayload,
@@ -661,6 +663,13 @@ export const adminApi = {
 
   async deletePlcPoint(id: number): Promise<{ deleted: number }> {
     return request<{ deleted: number }>(`/api/admin/plc-points/${id}`, { method: 'DELETE' });
+  },
+
+  async getPlcReadings(query: PlcReadingQuery): Promise<PlcReadingPage> {
+    if (!useApi('admin.plc')) return delay({ list: [], total: 0, page: 1, pageSize: 50 }, 120);
+    return request<PlcReadingPage>('/api/admin/plc-readings', {
+      params: query as unknown as Record<string, string | number | boolean | null | undefined>
+    });
   },
 
   /* ── 产量计量绑定（v1.8.0）──────────────────────────────── */

@@ -154,6 +154,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'PLC 设备', desc: 'S7-200 SMART 产量采集设备与点位（支持模拟联调）' }
       },
       {
+        path: 'device/plc-readings',
+        name: 'device-plc-readings',
+        component: () => import('@/views/device/PlcReadingQueryView.vue'),
+        meta: { title: 'PLC 历史读数', desc: 'PLC 原始读数与小时差值查询，用于现场排障' }
+      },
+      {
         path: 'device/quality',
         name: 'device-quality',
         component: () => import('@/views/device/QualityView.vue'),

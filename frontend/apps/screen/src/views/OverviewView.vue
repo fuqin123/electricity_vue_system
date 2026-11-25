@@ -15,7 +15,6 @@ import { storeToRefs } from 'pinia';
 import {
   big,
   dataConfig,
-  dec1,
   int,
   pad2,
   plantConfig,
@@ -134,12 +133,6 @@ const kpiCards = computed<KpiCard[]>(() => {
 /* ── 图表 option ──────────────────────────────────────── */
 /** 图例单位与出数除数同源（见 charts/index.ts 的 OVERVIEW_TREND） */
 const trendUnits = computed(() => OVERVIEW_TREND[dim.value]);
-/** 六线对比面板的说明必须跟着图表的自适应口径走，否则文字会指着一张画了别的东西的图 */
-const compareNote = computed(() =>
-  prodOn
-    ? '条长＝本生产日产量 · 右侧为单位电耗'
-    : '条长＝本生产日用电量 · 右侧为占车间合计（产量未接入，算不出单位电耗）'
-);
 const trendOption = computed(() => (ws.value ? overviewTrendOption(ws.value, dim.value) : null));
 const compareOption = computed(() => (ws.value ? overviewLinesCompareOption(ws.value) : null));
 const todayOption = computed(() =>
@@ -152,29 +145,6 @@ const todayOption = computed(() =>
     : null
 );
 
-/* ── 今日分时备注 ─────────────────────────────────────── */
-/** 六线列表取的是锚点那一小时的数据：实时=本小时，历史整日=该日最后一小时（B-522） */
-const listNote = computed(() => {
-  const w = ws.value;
-  if (!w) return '--';
-  const cur = w.hours[w.currentHour];
-  return w.dayClosed ? `${pad2(cur?.clock ?? 0)} 时段 · 点击查看详情` : '本小时 · 点击查看详情';
-});
-
-const todayNote = computed(() => {
-  const w = ws.value;
-  if (!w) return '--';
-  const done = w.hours.filter((x) => !x.future);
-  /* 产量未接入时改报用电，避免显示「峰值 0.0 · 均值 0.0 千瓶」这种无信息量的数 */
-  if (!prodOn) {
-    const kpeak = done.reduce((a, x) => Math.max(a, x.kwh ?? 0), 0);
-    const kavg = done.length ? done.reduce((a, x) => a + (x.kwh ?? 0), 0) / done.length : 0;
-    return `用电峰值 ${dec1(kpeak)} · 均值 ${kavg.toFixed(1)} kWh`;
-  }
-  const peak = done.reduce((a, x) => Math.max(a, x.output ?? 0), 0);
-  const avg = done.length ? done.reduce((a, x) => a + (x.output ?? 0), 0) / done.length : 0;
-  return `峰值 ${(peak / 1000).toFixed(1)} · 均值 ${(avg / 1000).toFixed(1)} 千瓶`;
-});
 </script>
 
 <template>
@@ -262,7 +232,6 @@ const todayNote = computed(() => {
 
         <PanelBox
           title="六条产线实时数据"
-          :note="listNote"
           height="var(--l2)"
           body-class="panel__body--list"
         >
@@ -309,7 +278,6 @@ const todayNote = computed(() => {
              这里写死 --c3 会让中列底边比两侧短一截（B-517 的「底部没对齐」）。 -->
         <PanelBox
           :title="prodOn ? '六条产线产量与单位电耗对比' : '六条产线用电量对比'"
-          :note="compareNote"
           body-class="panel__body--col"
         >
           <ChartBox :option="compareOption" grow />
@@ -319,7 +287,6 @@ const todayNote = computed(() => {
       <!-- ══════ 右列 ══════ -->
       <div class="col">
         <PanelBox title="本生产日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
-          <template #note><span class="panel__note">{{ todayNote }}</span></template>
           <ChartBox :option="todayOption" grow />
         </PanelBox>
 

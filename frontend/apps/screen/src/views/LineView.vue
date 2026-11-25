@@ -16,7 +16,6 @@ import { useRoute, useRouter } from 'vue-router';
 import {
   big,
   dataConfig,
-  dec1,
   int,
   pad2,
   PLAN_RATE,
@@ -314,21 +313,6 @@ const todayOption = computed(() =>
     : null
 );
 
-const todayNote = computed(() => {
-  const l = line.value;
-  if (!l) return '--';
-  const done = l.hours.filter((x) => !x.future);
-  /* 产量未接入时改报用电，避免显示「峰值 0.0 · 均值 0.0 千瓶」这种无信息量的数 */
-  if (!prodOn) {
-    const kpeak = done.reduce((a, x) => Math.max(a, x.kwh ?? 0), 0);
-    const kavg = done.length ? done.reduce((a, x) => a + (x.kwh ?? 0), 0) / done.length : 0;
-    return `用电峰值 ${dec1(kpeak)} · 均值 ${kavg.toFixed(1)} kWh`;
-  }
-  const peak = done.reduce((a, x) => Math.max(a, x.output ?? 0), 0);
-  const avg = done.length ? done.reduce((a, x) => a + (x.output ?? 0), 0) / done.length : 0;
-  return `峰值 ${(peak / 1000).toFixed(1)} · 均值 ${(avg / 1000).toFixed(1)} 千瓶`;
-});
-
 const tableNote = computed(() => {
   const w = ws.value;
   return w ? `最新在上 · 已完成 ${w.currentHour + 1} 点` : '--';
@@ -434,7 +418,6 @@ function switchLine(id: string) {
 
         <PanelBox
           title="近 7 日 × 24 小时产量热力图"
-          :note="prodOn ? '颜色越亮产量越高 · 空格为未上报' : '产量数据源未接入，热力图暂无数据'"
           height="var(--c3)"
           body-class="panel__body--col"
         >
@@ -445,11 +428,10 @@ function switchLine(id: string) {
       <!-- ══════ 右列 ══════ -->
       <div class="col">
         <PanelBox title="本生产日分时产量与电耗" height="var(--r1)" body-class="panel__body--col">
-          <template #note><span class="panel__note">{{ todayNote }}</span></template>
           <ChartBox :option="todayOption" grow />
         </PanelBox>
 
-        <PanelBox title="单位电耗对标" note="条长＝目标/实际 · 越长越优" height="var(--r2)" body-class="panel__body--list">
+        <PanelBox title="单位电耗对标" height="var(--r2)" body-class="panel__body--list">
           <BenchmarkBars :ws="ws" :line="line" />
         </PanelBox>
 

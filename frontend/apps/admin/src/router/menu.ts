@@ -74,6 +74,7 @@ export const menuTree: MenuNode[] = [
       { path: '/device/gateway', title: '采集网关', icon: 'Connection' },
       { path: '/device/plc', title: 'PLC 设备', icon: 'Cpu' },
       { path: '/device/readings', title: '仪表读数查询', icon: 'Histogram' },
+      { path: '/device/plc-readings', title: 'PLC 历史读数', icon: 'Histogram' },
       { path: '/device/quality', title: '数据质量', icon: 'CircleCheck' }
     ]
   },

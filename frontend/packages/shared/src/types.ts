@@ -806,3 +806,42 @@ export interface ProductionBindingDevicePayload {
   countsOutput?: boolean;
   sort?: number;
 }
+
+/** PLC 设备历史读数（v1.8.3） */
+export interface PlcReadingRow {
+  id: number;
+  collectTime: string;
+  device: string;
+  deviceName: string;
+  deviceId: number;
+  point: string;
+  pointName: string;
+  pointId: number;
+  role: PlcPointRole;
+  roleLabel: string;
+  address: string;
+  unit: string;
+  value: number | null;
+  ok: boolean;
+  error: string;
+  hourDelta: number | null;
+  hourStatus: 'ok' | 'insufficient' | 'reset' | 'spec';
+  hourNote: string;
+}
+
+export interface PlcReadingQuery {
+  from: string;
+  to: string;
+  device?: number | string;
+  point?: number | string;
+  ok?: 0 | 1;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface PlcReadingPage {
+  list: PlcReadingRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+}

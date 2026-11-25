@@ -10,7 +10,8 @@ PLC 设备 / 点位读写在本模块；真正的采集动作在 `services/plc.p
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Prefetch
@@ -22,6 +23,7 @@ from .api import _binding_name, _binding_sort, _body, json_err, json_ok
 from .models import (
     PlcDevice,
     PlcPoint,
+    PlcReading,
     ProductionBindingAssignment,
     ProductionBindingDevice,
     ProductionBindingType,
@@ -822,3 +824,139 @@ def admin_standard_case_rule_detail(request: HttpRequest, pk: int) -> JsonRespon
     except ValueError as exc:
         return json_err(str(exc))
     return json_ok({"rule": _case_rule_json(rule)})
+
+
+# ══════════════════════════════════════════════════════════════
+#  PLC 设备历史读数（v1.8.3）
+# ══════════════════════════════════════════════════════════════
+
+
+@require_GET
+def admin_plc_readings(request: HttpRequest) -> JsonResponse:
+    """PLC 设备历史读数 —— 原始值 + 本小时首末差值。
+
+    与仪表读数查询同思路：现场排查要看 PLC 原始读数，而不是加工后的产量。
+    小时差值按「同一小时第一条与最后一条成功读数相减」计算；只有一条读数时
+    如实标记为「数据不足」，不拿 0 冒充。
+    """
+    from .services import ranges
+
+    try:
+        start_at, end_at = ranges.parse_hours(request)
+    except ValueError as exc:
+        return json_err(str(exc))
+
+    qs = PlcReading.objects.filter(
+        collect_time__gte=start_at, collect_time__lte=end_at
+    ).select_related("point", "point__device")
+    device = request.GET.get("device")
+    if device:
+        qs = qs.filter(point__device__id=int(device)) if device.isdigit() else qs.filter(
+            point__device__code__iexact=device
+        )
+    point = request.GET.get("point")
+    if point:
+        qs = qs.filter(point__id=int(point)) if point.isdigit() else qs.filter(
+            point__code__iexact=point
+        )
+    ok = request.GET.get("ok")
+    if ok in ("0", "1"):
+        qs = qs.filter(ok=(ok == "1"))
+
+    qs = qs.order_by("-collect_time", "point__code")
+    total = qs.count()
+    page = max(1, int(request.GET.get("page", 1) or 1))
+    size = max(1, min(int(request.GET.get("pageSize", 50) or 50), 500))
+    rows = list(qs[(page - 1) * size : page * size])
+
+    # 计算本页涉及到的 (点位, 小时) 的首末差值：只多查这一小段，不扫整库
+    delta_map: dict[tuple[int, object, int], dict] = {}
+    if rows:
+        point_ids = {r.point_id for r in rows}
+        hour_starts = [
+            r.collect_time.replace(minute=0, second=0, microsecond=0)
+            for r in rows
+            if r.collect_time
+        ]
+        range_start = min(hour_starts)
+        range_end = max(hour_starts) + timedelta(hours=1)
+        readings = (
+            PlcReading.objects.filter(
+                point_id__in=point_ids,
+                collect_time__gte=range_start,
+                collect_time__lt=range_end,
+                ok=True,
+                value__isnull=False,
+            )
+            .select_related("point")
+            .order_by("point_id", "collect_time", "id")
+        )
+        buckets: dict[tuple[int, object, int], list] = {}
+        for r in readings:
+            key = (r.point_id, r.collect_time.date(), r.collect_time.hour)
+            buckets.setdefault(key, []).append(r)
+        for key, items in buckets.items():
+            p = items[0].point
+            if p.role == PlcPoint.ROLE_SPEC:
+                delta_map[key] = {"hourDelta": None, "hourStatus": "spec", "hourNote": "规格点不计算差值"}
+                continue
+            if p.counter_mode == PlcPoint.MODE_INSTANT:
+                delta_map[key] = {
+                    "hourDelta": sum((r.value for r in items), Decimal(0)),
+                    "hourStatus": "ok",
+                    "hourNote": "瞬时值按本条小时累加",
+                }
+                continue
+            if len(items) < 2:
+                delta_map[key] = {
+                    "hourDelta": None,
+                    "hourStatus": "insufficient",
+                    "hourNote": "本小时仅 1 条成功读数，无法计算差值",
+                }
+                continue
+            first, last = items[0], items[-1]
+            delta = last.value - first.value
+            if delta < 0:
+                delta_map[key] = {
+                    "hourDelta": None,
+                    "hourStatus": "reset",
+                    "hourNote": "本小时累计值回退（换表 / 归零），差值不成立",
+                }
+            else:
+                delta_map[key] = {
+                    "hourDelta": delta,
+                    "hourStatus": "ok",
+                    "hourNote": "本小时最后一条 − 第一条成功读数",
+                }
+
+    items = []
+    for r in rows:
+        key = (r.point_id, r.collect_time.date(), r.collect_time.hour)
+        extra = delta_map.get(
+            key,
+            {"hourDelta": None, "hourStatus": "insufficient", "hourNote": "本小时没有该点位的成功读数"},
+        )
+        p = r.point
+        items.append(
+            {
+                "id": r.id,
+                "collectTime": _fmt(r.collect_time),
+                "device": p.device.code,
+                "deviceName": p.device.name,
+                "deviceId": p.device_id,
+                "point": p.code,
+                "pointName": p.name,
+                "pointId": p.id,
+                "role": p.role,
+                "roleLabel": p.get_role_display(),
+                "address": p.address,
+                "unit": p.unit,
+                "value": float(r.value) if r.value is not None else None,
+                "ok": r.ok,
+                "error": r.error,
+                "hourDelta": float(extra["hourDelta"]) if extra["hourDelta"] is not None else None,
+                "hourStatus": extra["hourStatus"],
+                "hourNote": extra["hourNote"],
+            }
+        )
+    return json_ok({"list": items, "total": total, "page": page, "pageSize": size})

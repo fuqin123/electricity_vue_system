@@ -282,7 +282,6 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
       :title="`区间用电趋势 · ${selectionLabel}`"
       :option="chartOption"
       :height="280"
-      note="缺数处断开不连线；产量未接入，故不叠单位电耗曲线"
       class="mt-16"
     />
 

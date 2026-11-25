@@ -387,7 +387,6 @@ function exportCsv() {
       title="区间能源趋势图"
       :option="chartOption"
       :height="280"
-      note="每种能源一根轴（单位不同不可共轴）· 缺数处断开不连线"
       class="mb-16"
     />
 

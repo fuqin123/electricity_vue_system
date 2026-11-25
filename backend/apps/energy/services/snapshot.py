@@ -767,8 +767,12 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
     # 车间产量 = 各线真实产量之和（演示占位已在上游被排除）
     # 是否有**真实**产量数据源（演示占位不算）—— 决定要不要挂「产量未接入」提示
     real_any = any(production_info(ln, today).real for ln in lines)
-    w_today_out = sum(int(ln["today"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
-    w_y_out = sum(int(ln["yesterday"]["output"]) for ln in line_dicts) if real_any else None  # type: ignore[index]
+    # 只累加有值的产线：PLC 标箱数据是逐线写入的，可能一部分线已有产量、另一部分
+    # 还没有；对 None 直接 int() 会让「数据中心 / 大屏 overview」整体 500（v1.8.3 修复）。
+    today_outs = [ln["today"]["output"] for ln in line_dicts if ln["today"]["output"] is not None]
+    y_outs = [ln["yesterday"]["output"] for ln in line_dicts if ln["yesterday"]["output"] is not None]
+    w_today_out = sum(int(v) for v in today_outs) if today_outs else None
+    w_y_out = sum(int(v) for v in y_outs) if y_outs else None
 
     # 车间告警条。
     #

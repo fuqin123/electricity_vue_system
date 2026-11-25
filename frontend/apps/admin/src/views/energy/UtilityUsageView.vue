@@ -280,7 +280,6 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
       :title="`区间用${isSteam ? '汽' : '水'}趋势 · ${selectionLabel}`"
       :option="chartOption"
       :height="280"
-      note="整点差值 · 缺数处断开不连线"
       class="mt-16"
     />
 

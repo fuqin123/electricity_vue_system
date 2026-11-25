@@ -74,6 +74,8 @@ _ADMIN_ROUTES = [
     ("plc-points", production_api.admin_plc_points, "admin-plc-points"),
     ("plc-points/create", production_api.admin_plc_point_create, "admin-plc-point-create"),
     ("plc-points/<int:pk>", production_api.admin_plc_point_detail, "admin-plc-point-detail"),
+    # PLC 设备历史读数（v1.8.3）：原始读数 + 本小时首末差值
+    ("plc-readings", production_api.admin_plc_readings, "admin-plc-readings"),
     # 产量计量绑定（v1.8.0）：车间 → 类型 → 设备 → PLC 点位
     ("production-bindings/tree", production_api.admin_production_binding_tree, "admin-production-binding-tree"),
     ("production-binding-workshops", production_api.admin_prod_binding_workshops, "admin-prod-binding-workshops"),

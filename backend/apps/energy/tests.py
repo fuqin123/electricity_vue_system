@@ -4600,6 +4600,39 @@ class PlcProductionTests(TestCase):
             "页面显示产量取标箱数",
         )
 
+    def test_PLC历史读数返回原始值与本小时差值(self):
+        PlcReading.objects.create(point=self.point, collect_time=datetime(2026, 11, 20, 10, 5), value=Decimal("1000"))
+        PlcReading.objects.create(point=self.point, collect_time=datetime(2026, 11, 20, 10, 55), value=Decimal("1120"))
+        PlcReading.objects.create(
+            point=self.point, collect_time=datetime(2026, 11, 20, 10, 30),
+            value=None, ok=False, error="timeout",
+        )
+        res = self._api(
+            "get", "/api/admin/plc-readings",
+            {"from": "2026-11-20 10", "to": "2026-11-20 11", "device": self.device.id},
+        )
+        self.assertEqual(res.status_code, 200, res.content)
+        body = res.json()
+        self.assertEqual(body["total"], 3)
+        first = body["list"][0]
+        self.assertEqual(first["point"], self.point.code)
+        self.assertEqual(first["value"], 1120.0)
+        self.assertEqual(first["hourDelta"], 120.0)
+        self.assertEqual(first["hourStatus"], "ok")
+
+    def test_部分产线无产量时数据中心不抛500(self):
+        """v1.8.3：车间产量求和对 None 直接 int() 会让首页/大屏 500。"""
+        ProductionLine.objects.create(
+            line_code="W802", line_name="产量二线", node_type=ProductionLine.NODE_LINE,
+            parent=self.ws, rated=24000, product="测试产品 500ml",
+        )
+        ProductionHourly.objects.create(
+            line=self.line, stat_date=datetime(2026, 11, 20).date(), stat_hour=10,
+            output=Decimal("100"), quality=ProductionHourly.Q_OK, source=ProductionHourly.SOURCE_PLC,
+        )
+        data = build_overview(datetime(2026, 11, 20, 10, 30))["workshop"]
+        self.assertEqual(data["today"]["output"], 100)
+
     def test_模拟默认瓶数远大于箱数且规格每4小时切换(self):
         bottle = PlcPoint.objects.create(
             code="P-DEF-B", name="默认瓶数", device=self.device, role=PlcPoint.ROLE_BOTTLE, sim_rate=0,
