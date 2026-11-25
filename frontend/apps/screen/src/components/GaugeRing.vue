@@ -21,7 +21,7 @@ const score = computed(() =>
 
 const dashArray = computed(() => {
   const s = CIRC * score.value;
-  return `${s.toFixed(1)} ${(CIRC - s).toFixed(1)}`;
+  return `${s.toFixed(3)} ${(CIRC - s).toFixed(3)}`;
 });
 
 const strokeColor = computed(() => {
@@ -56,8 +56,8 @@ const strokeColor = computed(() => {
       <circle cx="75" cy="75" r="42" class="gauge__inner" />
     </svg>
     <div class="gauge__center">
-      <b>{{ actual > 0 ? actual.toFixed(2) : '--' }}</b>
-      <span>kWh/千瓶</span>
+      <b>{{ actual > 0 ? actual.toFixed(3) : '--' }}</b>
+      <span>kWh/千标箱</span>
     </div>
   </div>
 </template>

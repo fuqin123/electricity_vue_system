@@ -17,7 +17,7 @@ openapi: 3.0.3
 
 info:
   title: 能源产效管理系统 API
-  version: 1.8.4
+  version: 1.8.5
   description: |
     车间电 / 水 / 汽 能源数据与产量数据的统一接口。
 

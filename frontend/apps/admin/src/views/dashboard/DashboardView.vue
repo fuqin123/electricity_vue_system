@@ -119,7 +119,7 @@ const perCaseText = computed(() => {
   const arr = dash.value?.cost.perCase ?? [];
   for (let i = arr.length - 1; i >= 0; i -= 1) {
     const v = arr[i];
-    if (v !== null && v !== undefined) return v.toFixed(2);
+    if (v !== null && v !== undefined) return v.toFixed(3);
   }
   return '--';
 });
@@ -134,7 +134,7 @@ function kwhText(v: number | null | undefined): string {
 }
 
 function waterText(v: number | null | undefined): string {
-  return v === null || v === undefined ? '--' : `${v.toFixed(2)} t`;
+  return v === null || v === undefined ? '--' : `${v.toFixed(3)} t`;
 }
 
 /* ── 图表 ─────────────────────────────────────────────── */
@@ -332,7 +332,7 @@ const costNote = computed(() => {
       />
       <StatCard
         label="数据上报完整率"
-        :value="(kpi?.dataQualityRate ?? 0).toFixed(1)"
+        :value="(kpi?.dataQualityRate ?? 0).toFixed(3)"
         unit="%"
         color="#bd7e00"
         :loading="loading"
@@ -385,7 +385,7 @@ const costNote = computed(() => {
       <div class="card">
         <div class="card__head">
           <h3 class="card__title">各产线单位电耗对标</h3>
-          <span class="card__extra">{{ overview?.targetUnitKwh == null ? '标准未标定' : `车间目标 ${overview.targetUnitKwh.toFixed(2)} kWh/千瓶` }}</span>
+          <span class="card__extra">{{ overview?.targetUnitKwh == null ? '标准未标定' : `车间目标 ${overview.targetUnitKwh.toFixed(3)} kWh/千瓶` }}</span>
         </div>
         <ChartPanel v-if="!loading" title="" :option="compareOption" :height="260" class="chart-inner" />
         <el-skeleton v-else :rows="5" animated />

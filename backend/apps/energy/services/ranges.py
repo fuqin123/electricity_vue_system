@@ -16,9 +16,9 @@
 显式标注，不让人误以为「今天真的没产量」。
 
 ⚠ v1.5.2 修复（B-524 同类）：本模块此前用 `_round()`（默认 3 位小数）输出电量，
-  而大屏走 `snapshot.round_kwh()`（**1 位小数**）。同一格 24.812 与 24.8 会让
+  而大屏走 `snapshot.round_kwh()`。同一格 24.812 与 24.8 会让
   现场核对时先怀疑「系统数字对不上」。电量一律改走 `round_kwh`，
-  本文件的 `_round` 只留给非电量（水/汽吨数等）。
+  本文件的 `_round` 只留给非电量（水/汽吨数等）。v1.8.5 起两者统一 3 位小数。
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from .coverage import (
     split_by_kind,
     unit_of,
 )
-# 电量展示口径与大屏同源（1 位小数）：见 snapshot.round_kwh 的说明（B-524）
+# 电量展示口径与大屏同源（3 位小数）：见 snapshot.round_kwh 的说明（B-524）
 from .snapshot import round_kwh
 
 logger = logging.getLogger(__name__)
@@ -980,7 +980,7 @@ def usage_range(
             for k in klist:
                 if k in rows:
                     # 汇总行存在但 kwh 为 NULL = 该周期没有任何可信数据 → 传 None（不是 0）
-                    # ⚠ 走 round_kwh 而不是 float()：大屏对同一行也做 1 位小数，
+                    # ⚠ 走 round_kwh 而不是 float()：大屏对同一行也做 3 位小数，
                     #   这里若不处理，同一天在两处会显示不同位数（B-524）
                     vals.append(round_kwh(rows[k].kwh))
                     continue
@@ -1163,11 +1163,7 @@ def _utility_hour_series(kind: str, buckets, start: date_cls, end: date_cls) -> 
 
 
 def _round_for(unit: str, v: Decimal | None) -> float | None:
-    """按单位选展示精度 —— 电量 1 位（与大屏同源），其余能源沿用 3 位。
-
-    为什么必须按单位分：焦点通道同一段代码要服务水/汽（unit='t'），
-    若一律按电量舍入，水/汽 0.004 t 会被抹成 0，看起来像「这小时没用汽」。
-    """
+    """统一展示精度 —— v1.8.5 起电量与水/汽一律 3 位小数。"""
     if unit == "kWh":
         return round_kwh(v)
     return _round(v)
@@ -1293,8 +1289,8 @@ def _period_totals(dim: str, now: datetime) -> dict:
     return {
         "label": key,
         "kwh": round_kwh(row.kwh) if row is not None else None,
-        "waterT": round(float(row.water_t), 2) if (row is not None and row.water_t is not None) else None,
-        "steamT": round(float(row.steam_t), 2) if (row is not None and row.steam_t is not None) else None,
+        "waterT": round(float(row.water_t), 3) if (row is not None and row.water_t is not None) else None,
+        "steamT": round(float(row.steam_t), 3) if (row is not None and row.steam_t is not None) else None,
         "output": int(output) if output is not None else None,
         "outputUnit": out_unit,
     }
@@ -1412,9 +1408,9 @@ def dashboard_range(
     per_case: list[float | None] = []
     for k, w, s, o in zip(kwh_vals, water_vals, steam_vals, out_vals):
         kk, ww, ss = _dec(k), _dec(w), _dec(s)
-        cost_yuan.append(_round(cost.variable_cost_yuan(kk, ww, ss, cp), 2))
+        cost_yuan.append(_round(cost.variable_cost_yuan(kk, ww, ss, cp), 3))
         # 产量侧统一成标箱后再除：产量本该是标箱时不再重复除以箱规（v1.8.4）
-        per_case.append(_round(cost.per_case_cost(kk, ww, ss, _case_count(o, prod_unit, cp), cp), 2))
+        per_case.append(_round(cost.per_case_cost(kk, ww, ss, _case_count(o, prod_unit, cp), cp), 3))
 
     cum_cost, cost_covers = _cumulative(cost_yuan)
     cum_cases = [_case_count(o, prod_unit, cp) for o in cum_out]
@@ -1423,7 +1419,7 @@ def dashboard_range(
         if c is None or cases is None or cases <= 0:
             per_case_cum.append(None)
             continue
-        per_case_cum.append(round(c / float(cases), 2))
+        per_case_cum.append(round(c / float(cases), 3))
 
     # ── 算不出费用时，把原因说清楚（界面上直接显示，不让人以为系统坏了）──
     blockers: list[str] = []

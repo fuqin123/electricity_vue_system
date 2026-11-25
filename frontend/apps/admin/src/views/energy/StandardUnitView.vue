@@ -64,7 +64,7 @@ function resetFilters() {
 /** 0 与 null 都显示 -；其余按最多 4 位小数显示，避免 8.5000 这种噪声 */
 function formatStd(value: number | null | undefined): string {
   if (value === null || value === undefined || Number(value) === 0) return '-';
-  return Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+  return Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 }
 
 /* ── 新增 / 修改 ───────────────────────────────────────── */

@@ -271,7 +271,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
       />
       <StatCard
         label="单位电耗告警线"
-        :value="thresholds.unitKwhHigh.toFixed(2)"
+        :value="thresholds.unitKwhHigh.toFixed(3)"
         unit="kWh/千瓶"
         color="#d7312a"
         :foot="'按线标准见「能源配置管理 → 标准单耗配置」；产量接入后才能算实际值'"

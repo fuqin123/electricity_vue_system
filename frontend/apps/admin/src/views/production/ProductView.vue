@@ -63,7 +63,7 @@ const productColumns: TableColumn[] = [
   { prop: 'name', label: '产品名称', minWidth: 160 },
   { prop: 'spec', label: '规格', width: 100, mono: true },
   { prop: 'lineCode', label: '主生产线', width: 110 },
-  { prop: 'standardUnitKwh', label: '标准单位电耗（kWh/千瓶）', width: 210, mono: true, formatter: (r) => r.standardUnitKwh.toFixed(2) },
+  { prop: 'standardUnitKwh', label: '标准单位电耗（kWh/千瓶）', width: 210, mono: true, formatter: (r) => r.standardUnitKwh.toFixed(3) },
   { prop: 'status', label: '状态', width: 90 },
   { prop: 'id', label: '操作', width: 90, slot: 'col-op' }
 ];

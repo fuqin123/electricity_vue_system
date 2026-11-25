@@ -52,7 +52,7 @@ const yestColor = (p: number | null) => (p === null ? '#6e78b4' : p > 0 ? '#ec48
 /** 昨日同期文本：超过 1 万才用「万」，空值显示 `--` */
 function yestText(v: number | null): string {
   if (v === null || v === undefined) return '--';
-  return Math.abs(v) >= 10000 ? `${wan(v, 2)}万` : int(v);
+  return Math.abs(v) >= 10000 ? `${wan(v, 3)}万` : int(v);
 }
 </script>
 
@@ -75,7 +75,7 @@ function yestText(v: number | null): string {
         <span :style="{ color: yestColor(rise(r.today, r.yest)) }">
           昨日同期 {{ yestText(r.yest) }}{{ r.unit }}
           <template v-if="rise(r.today, r.yest) !== null">
-            · {{ (rise(r.today, r.yest) as number) > 0 ? '+' : '' }}{{ (rise(r.today, r.yest) as number).toFixed(1) }}%
+            · {{ (rise(r.today, r.yest) as number) > 0 ? '+' : '' }}{{ (rise(r.today, r.yest) as number).toFixed(3) }}%
           </template>
         </span>
         <em v-if="r.cover" class="energy-row__cover">{{ r.cover }}</em>

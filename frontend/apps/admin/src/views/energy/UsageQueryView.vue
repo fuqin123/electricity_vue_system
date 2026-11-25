@@ -160,9 +160,9 @@ const seriesKeys = computed(() => tableSeries.value.map((s) => s.key));
 /** 缺数的行数：用来在界面上说明「这批数据不完整」，而不是让人自己一行行看 */
 const missingRows = computed(() => rows.value.filter((r) => r.values[0] === null).length);
 
-function fmtCell(v: number | null, digits = 1): string {
+function fmtCell(v: number | null, digits = 3): string {
   if (v === null || v === undefined) return '--';
-  return v.toLocaleString('zh-CN', { maximumFractionDigits: digits, minimumFractionDigits: 0 });
+  return v.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
 /* ── 图表 ─────────────────────────────────────────────── */
@@ -330,7 +330,7 @@ function exportCsv() {
     <div class="stat-grid mb-16">
       <StatCard
         label="区间用电合计"
-        :value="data ? fmtCell(data.totals.kwh, 1) : '--'"
+        :value="data ? fmtCell(data.totals.kwh) : '--'"
         unit="kWh"
         color="#1664ff"
         :loading="loading"
@@ -346,7 +346,7 @@ function exportCsv() {
       />
       <StatCard
         label="区间用水合计"
-        :value="data ? fmtCell(data.totals.waterT, 2) : '--'"
+        :value="data ? fmtCell(data.totals.waterT) : '--'"
         unit="t"
         color="#387bff"
         :loading="loading"
@@ -354,7 +354,7 @@ function exportCsv() {
       />
       <StatCard
         label="区间用汽合计"
-        :value="data ? fmtCell(data.totals.steamT, 2) : '--'"
+        :value="data ? fmtCell(data.totals.steamT) : '--'"
         unit="t"
         color="#ec48bd"
         :loading="loading"
@@ -428,17 +428,17 @@ function exportCsv() {
             align="right"
           >
             <template #default="{ row }">
-              <span :class="{ 'is-missing': row.values[idx] === null }">{{ fmtCell(row.values[idx], 1) }}</span>
+              <span :class="{ 'is-missing': row.values[idx] === null }">{{ fmtCell(row.values[idx]) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="用水(t)" min-width="110" align="right">
             <template #default="{ row }">
-              <span :class="{ 'is-missing': row.water === null }">{{ fmtCell(row.water, 2) }}</span>
+              <span :class="{ 'is-missing': row.water === null }">{{ fmtCell(row.water) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="用汽(t)" min-width="110" align="right">
             <template #default="{ row }">
-              <span :class="{ 'is-missing': row.steam === null }">{{ fmtCell(row.steam, 2) }}</span>
+              <span :class="{ 'is-missing': row.steam === null }">{{ fmtCell(row.steam) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="数据质量" min-width="110">

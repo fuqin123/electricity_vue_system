@@ -205,15 +205,15 @@ export function unitKwhCompareOption(
         if (std === null || std === undefined) {
           return (
             `<b style="color:${C.text}">${d.name}</b><br>` +
-            `单位电耗：<b>${d.value.toFixed(2)}</b> kWh/千瓶<br>` +
+            `单位电耗：<b>${d.value.toFixed(3)}</b> kWh/千瓶<br>` +
             `标准单耗未标定（后台「能源配置管理 → 标准单耗配置」维护）`
           );
         }
         const diff = ((d.value - std) / std) * 100;
         return (
           `<b style="color:${C.text}">${d.name}</b><br>` +
-          `单位电耗：<b>${d.value.toFixed(2)}</b> kWh/千瓶<br>` +
-          `标准 ${std.toFixed(2)} · 偏离 <b style="color:${diff > 0 ? C.red : C.green}">${diff > 0 ? "+" : ""}${diff.toFixed(1)}%</b>`
+          `单位电耗：<b>${d.value.toFixed(3)}</b> kWh/千瓶<br>` +
+          `标准 ${std.toFixed(3)} · 偏离 <b style="color:${diff > 0 ? C.red : C.green}">${diff > 0 ? "+" : ""}${diff.toFixed(3)}%</b>`
         );
       },
     },
@@ -244,7 +244,7 @@ export function unitKwhCompareOption(
                 label: { show: true, formatter: "--", color: C.slate },
               }
             : {
-                value: +r.unitKwh.toFixed(2),
+                value: +r.unitKwh.toFixed(3),
                 name: r.lineName,
                 standard: std,
                 itemStyle: {

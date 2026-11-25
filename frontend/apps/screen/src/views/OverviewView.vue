@@ -69,7 +69,7 @@ const gauge = computed(() => ({
   yesterday: ws.value?.yesterday.unitKwh ?? 0
 }));
 const gaugeTargetText = computed(() =>
-  gauge.value.target === null ? '标准未标定' : `目标 ${gauge.value.target.toFixed(2)}`
+  gauge.value.target === null ? '标准未标定' : `目标 ${gauge.value.target.toFixed(3)}`
 );
 
 /* ── KPI 卡 ───────────────────────────────────────────── */
@@ -92,7 +92,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   const mk = big(w.month.kwh, 'kWh');
   const hk = big(h?.kwh ?? 0, 'kWh');
   /** 产量未接入时，达成率无意义 —— 显示 `--`，不要显示 0% */
-  const rateText = prodOn && rate !== null ? `${rate.toFixed(1)}%` : '--';
+  const rateText = prodOn && rate !== null ? `${rate.toFixed(3)}%` : '--';
 
   return [
     {
@@ -206,8 +206,8 @@ const todayOption = computed(() =>
               <li>
                 <span>本生产日产量</span>
                 <b class="t-num">
-                  {{ wan(ws.today.output, 1) }}
-                  <span class="c-muted" style="font-family: var(--font-cn); font-size: 11px">万瓶</span>
+                  {{ wan(ws.today.output, 3) }}
+                  <span class="c-muted" style="font-family: var(--font-cn); font-size: 11px">万标箱</span>
                 </b>
               </li>
               <li>

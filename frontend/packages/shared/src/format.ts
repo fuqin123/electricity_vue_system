@@ -9,38 +9,35 @@ export function int(v: number | null | undefined): string {
 }
 
 /**
- * 电量显示口径：**保留 1 位小数，整数值不带尾随 .0**（v1.4.1，B-524）。
+ * 电量显示口径：**统一保留 3 位小数，整数值不带尾随 .000**（v1.8.5）。
  *
- * 为什么单独开一个函数：大屏原来对 ≥20 kWh 一律取整（24.8 → 25），
- * 而后台表格一直是 1 位小数。两边逐格核对时每一行都差 0.x，
- * 现场的第一反应是「系统数字对不上」，于是真正的问题（缺数、结算延迟）
- * 反而被这种纯显示差异淹掉了。大屏与后台同源同口径是硬要求，
- * 所以电量类数字统一走这里，不再按量级切换精度。
+ * 函数名保留 `dec1` 只为兼容旧引用：v1.4.1 起电量统一走这里，
+ * 避免「大屏取整、后台一位小数」两边逐格核对永远差 0.x（B-524）。
  */
 export function dec1(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(v)) return '--';
-  const r = Math.round(v * 10) / 10;
-  const text = Number.isInteger(r) ? String(r) : r.toFixed(1);
+  const r = Math.round(v * 1000) / 1000;
+  const text = Number.isInteger(r) ? String(r) : r.toFixed(3);
   return text.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
-/** 固定小数位，空值返回 '--' */
-export function dec(v: number | null | undefined, d = 2): string {
+/** 固定小数位（默认 3 位），空值返回 '--' */
+export function dec(v: number | null | undefined, d = 3): string {
   if (v === null || v === undefined || Number.isNaN(v)) return '--';
   return Number(v).toFixed(d);
 }
 
-/** 瓶 → 万瓶 */
-export function wan(v: number | null | undefined, d = 2): string {
+/** 瓶 → 万瓶（默认 3 位小数） */
+export function wan(v: number | null | undefined, d = 3): string {
   if (v === null || v === undefined || Number.isNaN(v)) return '--';
   return (v / 10000).toFixed(d);
 }
 
-/** 大数自动降级：≥1e8 用「亿」，≥1e4 用「万」；万以下非整数保留 1 位小数 */
+/** 大数自动降级：≥1e8 用「亿」，≥1e4 用「万」；万以下非整数保留 3 位小数 */
 export function big(v: number | null | undefined, unit = ''): { v: string; u: string } {
   if (v === null || v === undefined || Number.isNaN(v)) return { v: '--', u: unit };
-  if (Math.abs(v) >= 1e8) return { v: (v / 1e8).toFixed(2), u: '亿' + unit };
-  if (Math.abs(v) >= 1e4) return { v: (v / 1e4).toFixed(2), u: '万' + unit };
+  if (Math.abs(v) >= 1e8) return { v: (v / 1e8).toFixed(3), u: '亿' + unit };
+  if (Math.abs(v) >= 1e4) return { v: (v / 1e4).toFixed(3), u: '万' + unit };
   // 产量本来就是整数（走 int 的千分位），电量类带小数 —— 不能把 385.5 显示成 386
   return { v: Number.isInteger(v) ? int(v) : dec1(v), u: unit };
 }

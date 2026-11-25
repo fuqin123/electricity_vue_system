@@ -75,19 +75,22 @@ const DIM_NOTE: Record<TrendDim, string> = {
   时: '每柱＝1 小时 · 本生产日 24 小时（06:00—次日06:00） · 本线'
 };
 
-/** 单位电耗是否算得出来 —— 决定趋势第二条曲线是「单位电耗」还是「用电量」 */
-const hasUnitKwh = computed(() => line.value?.hours.some((h) => h.unitKwh !== null) ?? false);
-
-/**
- * 图例单位直接取 charts/index.ts 的 LINE_TREND —— 出数除数与单位文案同源，
- * 之前这里另写一份，改一处忘一处就会「图例说万瓶、tooltip 说亿瓶」。
- */
+/** 中心图固定为「产量 + 用电量」；单位电耗只在面板右上角显示实际/标准 */
 const trendLegend = computed(() => {
   const u = LINE_TREND[dim.value];
   return {
     out: `产量（${u.outUnit}）`,
-    second: hasUnitKwh.value ? '单位电耗（kWh/千瓶）' : `用电量（${u.kwhUnit}）`
+    second: `用电量（${u.kwhUnit}）`
   };
+});
+
+/** 面板右上角：实际单耗 / 标准单耗（kWh/千标箱） */
+const unitNote = computed(() => {
+  const l = line.value;
+  if (!l) return '--';
+  const actual = l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(3);
+  const std = l.standardUnitKwh === null ? '--' : l.standardUnitKwh.toFixed(3);
+  return `实际单耗 ${actual} · 标准单耗 ${std} kWh/千标箱`;
 });
 
 /** 产量数据源是否已接入（来自全局配置，不用逐处判断字段是否为 0） */
@@ -148,7 +151,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   const target = l.standardUnitKwh;
   const overTarget = target !== null && l.today.unitKwh !== null && l.today.unitKwh > target;
   /** 产量未接入时，达成率没有意义 —— 显示 `--`，不要显示 0% */
-  const rateText = prodOn ? `${l.today.rate.toFixed(1)}%` : '--';
+  const rateText = prodOn ? `${l.today.rate.toFixed(3)}%` : '--';
 
   return [
     {
@@ -163,7 +166,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#7c8cff',
       label: '本月累计产量',
       value: mq,
-      sub: `用电 ${mk.v}${mk.u} · 本生产日单耗 ${l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(2)}${overTarget ? '（超标准）' : ''}`
+      sub: `用电 ${mk.v}${mk.u} · 本生产日单耗 ${l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(3)}${overTarget ? '（超标准）' : ''}`
     },
     {
       tag: '日',
@@ -226,7 +229,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
     const w2 = worst;
     list.push({
       level: 'err',
-      text: `单位电耗 ${(w2.unitKwh ?? 0).toFixed(2)}，超阈值 ${thresholds.unitKwhHigh.toFixed(2)}`,
+      text: `单位电耗 ${(w2.unitKwh ?? 0).toFixed(3)}，超阈值 ${thresholds.unitKwhHigh.toFixed(3)}`,
       time: `${pad2(w2.clock)}:00:00`
     });
   }
@@ -277,7 +280,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
     ) {
       list.unshift({
         level: 'warn',
-        text: `本小时预计产量 ${((cur.projected ?? 0) / 1000).toFixed(1)} 千瓶，低于额定 ${Math.round(
+        text: `本小时预计产量 ${((cur.projected ?? 0) / 1000).toFixed(3)} 千标箱，低于额定 ${Math.round(
           thresholds.outputLowRate * 100
         )}%`,
         time: `${pad2(cur.clock)}:00:00`
@@ -391,13 +394,14 @@ function switchLine(id: string) {
         <KpiCards :cards="kpiCards" style="height: var(--c1)" />
 
         <PanelBox
-          :title="hasUnitKwh ? '本线产量与单位电耗趋势' : '本线产量与用电趋势'"
+          title="本线产量与用电趋势"
           :hint="DIM_NOTE[dim]"
           height="var(--c2)"
           tall
           body-class="panel__body--col"
         >
           <template #note>
+            <span class="panel__note" style="margin-right: 12px">{{ unitNote }}</span>
             <div class="tabs">
               <button
                 v-for="d in DIMS"

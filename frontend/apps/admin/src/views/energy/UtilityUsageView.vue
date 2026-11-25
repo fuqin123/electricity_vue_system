@@ -227,7 +227,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
     <div class="stat-grid">
       <StatCard
         :label="`区间累计用${isSteam ? '汽' : '水'}`"
-        :value="totalT === null || totalT === undefined ? '--' : totalT.toFixed(2)"
+        :value="totalT === null || totalT === undefined ? '--' : totalT.toFixed(3)"
         unit="t"
         :color="meta.color"
         :loading="loading"

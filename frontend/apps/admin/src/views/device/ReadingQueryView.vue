@@ -118,13 +118,13 @@ const columns: TableColumn<MeterReading>[] = [
 
 function readingText(v: number | null): string {
   // null = 这次没读到。显示 -- 而不是 0：0 会被当成真实读数参与差分（B-502）
-  return v === null || v === undefined ? '--' : v.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+  return v === null || v === undefined ? '--' : v.toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 }
 
 /** 该读数作为终点的上一小时差值；无匹配时如实说明是待结算还是非整点读数 */
 function hourUsageText(row: MeterReading): string {
   if (row.hourUsage === null || row.hourUsage === undefined) return '--';
-  return row.hourUsage.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+  return row.hourUsage.toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 }
 
 function hourStatusText(row: MeterReading): string {
@@ -186,7 +186,7 @@ async function readCurrent(row?: MeterReading, again = false) {
 const probeValueText = computed(() => {
   const r = probe.result;
   if (!r) return '--';
-  return r.value === null ? '--' : r.value.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
+  return r.value === null ? '--' : r.value.toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 });
 
 /** API 类网关会带回瞬时流量 / 温度 / 压力等，排障时有据可查 */

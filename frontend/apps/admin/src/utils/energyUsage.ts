@@ -488,7 +488,7 @@ export function useEnergyUsage(energy: UsageEnergy) {
         id: i,
         label: d.labels[i],
         usageText: v === null || v === undefined ? '--' : String(v),
-        deltaText: delta === null ? '--' : `${delta > 0 ? '+' : ''}${delta.toFixed(1)}%`,
+        deltaText: delta === null ? '--' : `${delta > 0 ? '+' : ''}${delta.toFixed(3)}%`,
         deltaColor: delta === null ? '#86909c' : delta > 0 ? '#d7312a' : '#2a814b',
         quality: d.quality?.[i] ?? '',
         outputText: out === null ? '--' : String(Math.round(out)),

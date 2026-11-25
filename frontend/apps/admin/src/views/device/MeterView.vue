@@ -41,7 +41,7 @@ const extraQuery = computed(() => ({
 
 function fmtNum(v: number | null | undefined): string {
   if (v === null || v === undefined) return '--';
-  return v.toLocaleString('zh-CN', { maximumFractionDigits: 3 });
+  return v.toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 }
 
 /* ── 列定义 ───────────────────────────────────────────── */

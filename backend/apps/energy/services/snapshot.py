@@ -11,7 +11,7 @@
     而不是「有几块算几块」的偏小值。宁可空一格，也不要一个偏低的数被当成真实用电。
   · **日 / 月 / 年一律读 `eep_period_summary`**（与后台读同一张表）——
     这是保证「大屏与后台数字完全一致」的关键。表里缺行时才退化为现场现算。
-  · 电量展示口径：**一律保留 1 位小数**（`round_kwh`，v1.4.1 起）。
+  · 电量展示口径：**一律保留 3 位小数**（`round_kwh`，v1.8.5 起）。
     旧规则「≥20 取整」与后台表格的 1 位小数永远差 0.x，两边逐格核对必然被当成对不上。
 
 查历史日期（接口带 `?date=`）时调用方必须传 `closed=True`：
@@ -37,6 +37,7 @@ from ..models import (
     EnergyRaw,
     EnergyType,
     PeriodSummary,
+    ProductionCaseHourly,
     ProductionHourly,
     ProductionLine,
 )
@@ -59,20 +60,17 @@ DEMO_SOURCES = (ProductionHourly.SOURCE_DEMO, ProductionHourly.SOURCE_NONE)
 
 
 def round_kwh(value: Decimal | None) -> float | None:
-    """电量展示口径：**统一保留 1 位小数**（v1.4.1，B-524）。
+    """电量展示口径：**统一保留 3 位小数**（v1.8.5 起；原 1 位，B-524）。
 
-    旧规则是「< 20 kWh 保留 1 位、其余取整」。取整在大屏上看着干净，
-    但后台的表格一直是 1 位小数，于是同一格「24.8 / 25」两边永远差一点 ——
-    现场拿着两边核对时，第一个结论就是「系统数字对不上」，
-    而真正的问题（缺数、延迟结算）反而被这种假差异淹掉了。
-    两边同源同口径是这个项目的底线，宁可大屏多一位小数。
+    大屏与后台必须同源同精度，否则两边逐格核对时每一行都差 0.x，
+    真正的问题（缺数、结算延迟）反而被这种纯显示差异淹掉。
     """
     if value is None:
         return None
-    return round(float(value), 1)
+    return round(float(value), 3)
 
 
-def round_any(value: Decimal | None, digits: int = 2) -> float | None:
+def round_any(value: Decimal | None, digits: int = 3) -> float | None:
     if value is None:
         return None
     return round(float(value), digits)
@@ -257,7 +255,22 @@ class ProdInfo:
 
 
 def production_info(line: ProductionLine, day: date_cls) -> ProdInfo:
-    """某线某个生产日的逐小时产量；by_hour 仍按**时钟小时**索引（06…23、00…05）。"""
+    """某线某个生产日的逐小时产量；by_hour 仍按**时钟小时**索引（06…23、00…05）。
+
+    v1.8.5：优先读 `production_case_hourly`（标箱），只有没有标箱数据时才退回
+    `production_hourly`（历史瓶数）。大屏所有产量都必须按标箱显示。
+    """
+    case_rows = [
+        r
+        for r in ProductionCaseHourly.objects.filter(
+            line=line, stat_date__in=(day, day + timedelta(days=1))
+        )
+        if B.hour_index(day, r.stat_date, r.stat_hour) is not None
+    ]
+    if case_rows:
+        by_hour = {r.stat_hour: r.standard_cases for r in case_rows}
+        return ProdInfo(by_hour, True, ProductionHourly.SOURCE_PLC, ProductionHourly.Q_OK)
+
     rows = [
         r
         for r in ProductionHourly.objects.filter(
@@ -315,7 +328,7 @@ def _hour_point(
     """
     output = (int(prod) if prod is not None else None) if real_prod else None
     if real_prod and prod is not None and cell.value is not None and prod > 0:
-        unit = round(float(cell.value / prod * 1000), 2)
+        unit = round(float(cell.value / prod * 1000), 3)
     else:
         unit = None
     return {
@@ -456,7 +469,7 @@ def _period_series(
                     # row.output 为 NULL = 该周期没有可信产量 → 留空
                     "output": int(row.output) if (real and row.output is not None) else (0 if real else NULL),
                     "kwh": round_kwh(row.kwh),
-                    "unitKwh": round_any(row.unit_kwh, 2) if row.unit_kwh is not None else NULL,
+                    "unitKwh": round_any(row.unit_kwh, 3) if row.unit_kwh is not None else NULL,
                 }
             )
             continue
@@ -470,7 +483,7 @@ def _period_series(
         )
         kwh = _range_kwh(meters, start, end)
         prodv = production_sum(prod_line, start, end) if prod_line else Decimal(0)
-        unit = round(float(kwh / prodv * 1000), 2) if (kwh and prodv > 0) else NULL
+        unit = round(float(kwh / prodv * 1000), 3) if (kwh and prodv > 0) else NULL
         out.append(
             {
                 "label": _labels_for(dim, d),
@@ -573,12 +586,12 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
         "today": {
             "output": int(today_out) if today_out is not None else NULL,
             "kwh": round_kwh(today_kwh),
-            "unitKwh": round(float(today_kwh / today_out * 1000), 2)
+            "unitKwh": round(float(today_kwh / today_out * 1000), 3)
             if (today_kwh and today_out is not None and today_out > 0)
             else NULL,
             "plan": int(plan_now),
             "planFull": int(line.rated * 24 * 0.88) if line.rated else 0,
-            "rate": round(float(today_out / plan_now * 100), 2)
+            "rate": round(float(today_out / plan_now * 100), 3)
             if (today_out is not None and plan_now > 0)
             else 0,
             # 今日用电的采集覆盖度 —— 界面必须显示，
@@ -589,7 +602,7 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
         "yesterday": {
             "output": int(y_out) if y_out is not None else NULL,
             "kwh": round_kwh(y_kwh),
-            "unitKwh": round(float(y_kwh / y_out * 1000), 2)
+            "unitKwh": round(float(y_kwh / y_out * 1000), 3)
             if (y_kwh and y_out is not None and y_out > 0)
             else NULL,
             "fullOutput": int(y_out) if y_out is not None else NULL,
@@ -622,7 +635,7 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
 
 
 def _heat(line: ProductionLine, today: date_cls, now: datetime, real: bool) -> list[list[int | None]]:
-    """近 7 个生产日 × 24 格产量热力图，单位「百瓶」。未接入时整片 null。"""
+    """近 7 个生产日 × 24 格产量热力图，单位「百标箱」。未接入时整片 null。"""
     if not real:
         return [[NULL for _ in range(24)] for _ in range(7)]
     days = [today - timedelta(days=i) for i in reversed(range(7))]
@@ -709,7 +722,7 @@ def _utility_metric(kind: str, now: datetime, unit: str, closed: bool = False) -
     cells = hourly_cells(meters, today, now, closed=closed)
     y_cells = hourly_cells(meters, yesterday, now, closed=True)
 
-    trend = [round_any(cells[i].value, 2) if cells[i].value is not None else NULL for i in range(24)]
+    trend = [round_any(cells[i].value, 3) if cells[i].value is not None else NULL for i in range(24)]
 
     today_total, cov, exp = _sum_cells(cells, upto=upto, running=True)
     y_total, y_cov, y_exp = _sum_cells(y_cells, upto=23)
@@ -733,12 +746,12 @@ def _utility_metric(kind: str, now: datetime, unit: str, closed: bool = False) -
     if current_index is not None:
         current = cells.get(current_index)
         if current and current.value is not None and current.progress:
-            rate_now = round(float(current.value) / max(current.progress, 1e-6), 2)
+            rate_now = round(float(current.value) / max(current.progress, 1e-6), 3)
 
     return {
         # 取不到就是 null（未知 ≠ 0）
-        "today": round_any(today_total, 2),
-        "yesterday": round_any(y_total, 2),
+        "today": round_any(today_total, 3),
+        "yesterday": round_any(y_total, 3),
         "rateNow": rate_now,
         "unit": unit,
         "trend": trend,
@@ -756,8 +769,26 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
     lines = list(ProductionLine.active_lines_qs())
     line_dicts = [build_line(ln, now, closed=closed) for ln in lines]
 
+    # 是否有**真实**产量数据源（演示占位不算）—— build_line 已把结论写进 note
+    real_any = any(not ln["note"] for ln in line_dicts)
+
     w_cells = _workshop_kwh_cells(today, now, closed)
-    w_hours = [_hour_point(i, B.hour_bucket(today, i)[1], w_cells[i]) for i in range(24)]
+    # v1.8.5：车间小时产量 = 已接入产量数据源的各产线该小时产量之和。
+    # 「成功获取到数据」包括 0（确实没产出），所以 0 必须照常显示；
+    # 只要任意一条已接入的产线该小时为 null（没采到），整小时就给 null，
+    # 绝不拿部分线求和冒充车间合计。没有产量数据源的产线不参与求和。
+    prod_lines = [ln for ln in line_dicts if not ln["note"]]
+    w_hours: list[dict] = []
+    for i in range(24):
+        line_outs = [ln["hours"][i]["output"] for ln in prod_lines]
+        hour_out = (
+            sum(int(v) for v in line_outs)
+            if line_outs and all(v is not None for v in line_outs)
+            else None
+        )
+        w_hours.append(
+            _hour_point(i, B.hour_bucket(today, i)[1], w_cells[i], hour_out, real_any)
+        )
     w_today, w_cov, w_exp = _sum_cells(w_cells, upto=upto, running=True)
     w_yesterday, _, _ = _sum_cells(_workshop_kwh_cells(today - timedelta(days=1), now, closed=True), upto=23)
 
@@ -765,8 +796,6 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
     steam = _utility_metric(EnergyType.STEAM, now, "t", closed)
 
     # 车间产量 = 各线真实产量之和（演示占位已在上游被排除）
-    # 是否有**真实**产量数据源（演示占位不算）—— 决定要不要挂「产量未接入」提示
-    real_any = any(production_info(ln, today).real for ln in lines)
     # 只累加有值的产线：PLC 标箱数据是逐线写入的，可能一部分线已有产量、另一部分
     # 还没有；对 None 直接 int() 会让「数据中心 / 大屏 overview」整体 500（v1.8.3 修复）。
     today_outs = [ln["today"]["output"] for ln in line_dicts if ln["today"]["output"] is not None]
@@ -833,7 +862,7 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
         "today": {
             "output": w_today_out,
             "kwh": round_kwh(w_today),
-            "unitKwh": round(float(w_today / w_today_out * 1000), 2)
+            "unitKwh": round(float(w_today / w_today_out * 1000), 3)
             if (w_today and w_today_out is not None and w_today_out > 0)
             else NULL,
             "plan": w_plan,

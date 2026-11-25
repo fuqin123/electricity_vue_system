@@ -23,7 +23,7 @@ const color = computed(() => {
 const text = computed(() => {
   const p = props.value;
   if (p === null || p === undefined || Number.isNaN(p)) return '--';
-  return `${p >= 0 ? '+' : ''}${p.toFixed(1)}%`;
+  return `${p >= 0 ? '+' : ''}${p.toFixed(3)}%`;
 });
 
 const up = computed(() => (props.value ?? 0) >= 0);

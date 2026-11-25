@@ -27,12 +27,12 @@ function rowClass(l: LineData) {
 function displayText(l: LineData) {
   const s = l.hours[props.currentHour] ?? {};
   const v = s.partial ? (s.projected ?? s.output ?? null) : (s.output ?? null);
-  return v === null || v === undefined ? '--' : `${(v / 1000).toFixed(1)}`;
+  return v === null || v === undefined ? '--' : `${(v / 1000).toFixed(3)}`;
 }
 
 function unitLabel(l: LineData) {
   const s = l.hours[props.currentHour] ?? {};
-  return s.partial ? '千瓶/h · 预计' : '千瓶/h';
+  return s.partial ? '千标箱/h · 预计' : '千标箱/h';
 }
 
 function unitKwh(l: LineData) {
@@ -70,9 +70,9 @@ void pad2;
         </span>
         <span class="v">
           <b :class="{ 'c-amber': unitKwh(l) !== null && (unitKwh(l) as number) > thresholds.unitKwhHigh }">
-            {{ unitKwh(l) === null ? '--' : (unitKwh(l) as number).toFixed(2) }}
+            {{ unitKwh(l) === null ? '--' : (unitKwh(l) as number).toFixed(3) }}
           </b>
-          <span>kWh/千瓶</span>
+          <span>kWh/千标箱</span>
         </span>
       </div>
     </div>

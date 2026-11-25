@@ -43,7 +43,7 @@ const rows = computed<BenchRow[]>(() => {
 
 function width(v: number | null) {
   const t = target.value;
-  return t !== null && v && v > 0 ? Math.min((t / v) * 100, 100).toFixed(1) : '0.0';
+  return t !== null && v && v > 0 ? Math.min((t / v) * 100, 100).toFixed(3) : '0.000';
 }
 
 function color(r: BenchRow) {
@@ -59,7 +59,7 @@ function color(r: BenchRow) {
     <div v-for="r in rows" :key="r.key" class="bench__row" :class="r.cls">
       <span>{{ r.key }}</span>
       <div class="bench__bar"><i :style="{ width: width(r.value) + '%' }" /></div>
-      <b :style="{ color: color(r) }">{{ r.value === null ? '--' : r.value.toFixed(2) }}</b>
+      <b :style="{ color: color(r) }">{{ r.value === null ? '--' : r.value.toFixed(3) }}</b>
     </div>
   </div>
 </template>

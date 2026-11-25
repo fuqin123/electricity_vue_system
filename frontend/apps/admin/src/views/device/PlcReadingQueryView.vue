@@ -106,12 +106,12 @@ const columns: TableColumn<PlcReadingRow>[] = [
 ];
 
 function valueText(v: number | null): string {
-  return v === null || v === undefined ? '--' : v.toLocaleString('zh-CN', { maximumFractionDigits: 3 });
+  return v === null || v === undefined ? '--' : v.toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 }
 
 function deltaText(row: PlcReadingRow): string {
   if (row.hourDelta === null || row.hourDelta === undefined) return '--';
-  return row.hourDelta.toLocaleString('zh-CN', { maximumFractionDigits: 3 });
+  return row.hourDelta.toLocaleString('zh-CN', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
 }
 
 function deltaStatus(row: PlcReadingRow): { label: string; type: 'success' | 'info' | 'warning' | 'danger' } | null {

@@ -47,7 +47,7 @@ const rows = ref<RuleRow[]>([
   { id: 6, code: 'R-COVERAGE', name: '周期覆盖率不足', target: '日汇总', condition: '上一生产日日汇总 covered_count < expected_count，即该日合计少算了若干小时', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_coverage' },
   { id: 11, code: 'R-HOUR-DEVIATION', name: '异常时段待复核', target: '上一生产日', condition: '端点/区间时长偏差超过「系统参数 → 数据质量 → 异常时段允许偏差」，在复核时刻生成；需人工确认，不自动恢复', level: '次要', levelType: 'info', enabled: true, impl: 'alerts._rule_hour_deviation' },
   // ── 以下依赖产量，产量侧接入后才启用（接口与表结构已就位）──
-  { id: 7, code: 'R-UNIT-KWH-HIGH', name: '单位电耗超上限', target: '产线 / 车间', condition: `单位电耗 > ${thresholds.unitKwhHigh.toFixed(2)} kWh/千瓶`, level: '严重', levelType: 'danger', enabled: false, impl: '待产量接入' },
+  { id: 7, code: 'R-UNIT-KWH-HIGH', name: '单位电耗超上限', target: '产线 / 车间', condition: `单位电耗 > ${thresholds.unitKwhHigh.toFixed(3)} kWh/千瓶`, level: '严重', levelType: 'danger', enabled: false, impl: '待产量接入' },
   { id: 8, code: 'R-OUTPUT-LOW', name: '本小时低产', target: '产线', condition: `整点预期产量 < 额定的 ${Math.round(thresholds.outputLowRate * 100)}%`, level: '警告', levelType: 'warning', enabled: false, impl: '待产量接入' },
   { id: 9, code: 'R-ZERO-OUTPUT', name: '整点无产量', target: '产线', condition: '整点产量 = 0 且电表有读数', level: '警告', levelType: 'warning', enabled: false, impl: '待产量接入' },
   { id: 10, code: 'R-TARGET-DEV', name: '单位电耗偏离目标', target: '车间合计', condition: '单位电耗 > 按线标准单耗的 105%', level: '提示', levelType: 'info', enabled: false, impl: '待产量接入' }

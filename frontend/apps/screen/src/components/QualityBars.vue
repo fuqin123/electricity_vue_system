@@ -30,12 +30,12 @@ const stoppedHours = computed(() =>
     <div class="quality__row">
       <span>电量上报</span>
       <div class="quality__bar"><i :style="{ width: rate + '%' }" /></div>
-      <b>{{ rate.toFixed(1) }}%</b>
+      <b>{{ rate.toFixed(3) }}%</b>
     </div>
     <div class="quality__row">
       <span>产量上报</span>
       <div class="quality__bar"><i :style="{ width: rate + '%' }" /></div>
-      <b>{{ rate.toFixed(1) }}%</b>
+      <b>{{ rate.toFixed(3) }}%</b>
     </div>
     <div class="quality__miss">
       {{ missHours.length ? `缺失时段：${missHours.join('、')} 时` : '本生产日各整点数据完整' }}

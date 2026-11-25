@@ -1322,7 +1322,7 @@ class DashboardCumulativeTests(TestCase):
         d = ranges.dashboard_range(datetime(2026, 9, 24, 8), datetime(2026, 9, 24, 8), now=self.NOW)
         self.assertTrue(d["cost"]["available"])
         self.assertEqual(d["cost"]["values"][0], 334.0)
-        self.assertEqual(d["cost"]["perCase"][0], 0.33)
+        self.assertEqual(d["cost"]["perCase"][0], 0.334)
         # 标准值未标定 → 不画基准线，且不能是 0
         self.assertIsNone(d["cost"]["standardPerCase"])
 
@@ -1348,7 +1348,7 @@ class DashboardCumulativeTests(TestCase):
         )
         self.assertEqual(d["productionUnit"], "标箱")
         self.assertEqual(d["cost"]["values"][0], 334.0)
-        self.assertEqual(d["cost"]["perCase"][0], 0.33)
+        self.assertEqual(d["cost"]["perCase"][0], 0.334)
         # 产量是标箱时，箱规未标定不影响费用计算
         self.assertNotIn("箱规", " ".join(d["cost"]["blockers"]))
 
@@ -2627,10 +2627,10 @@ class WorkshopHierarchyTests(TestCase):
         )
         self.assertEqual(data["totals"]["waterT"], None)
 
-    def test_电量一位小数_与大屏同源(self):
-        """B-524 同族：本模块曾用 3 位小数，大屏用 1 位，同一格 24.812 / 24.8。"""
-        self.assertEqual(ranges.round_kwh(Decimal("24.8123")), 24.8)
-        self.assertEqual(ranges.round_kwh(Decimal("1234.5678")), 1234.6)
+    def test_电量统一三位小数_与大屏同源(self):
+        """B-524 同族 + v1.8.5：电量统一 3 位小数，大屏与后台一致。"""
+        self.assertEqual(ranges.round_kwh(Decimal("24.8123")), 24.812)
+        self.assertEqual(ranges.round_kwh(Decimal("1234.5678")), 1234.568)
         self.assertIsNone(ranges.round_kwh(None))
 
     def test_水汽不给kwh字段_避免量纲错误(self):
@@ -4598,6 +4598,52 @@ class PlcProductionTests(TestCase):
             [self.device],
             "下一个整点应重新采集",
         )
+
+    def test_车间小时产量为六线之和_0照常显示(self):
+        """v1.8.5：已接入的线都有值（含 0）才给合计；任一线缺数则整小时留空。"""
+        line2 = ProductionLine.objects.create(
+            line_code="W803", line_name="产量三线", node_type=ProductionLine.NODE_LINE,
+            parent=self.ws, rated=24000, product="测试产品 500ml",
+        )
+        day = datetime(2026, 11, 20).date()
+        idx = B.hour_index(day, day, 10)
+        # 第二条线只有 9 点的数据 → 说明它「已接入」，但 10 点缺数
+        ProductionHourly.objects.create(
+            line=line2, stat_date=day, stat_hour=9, output=Decimal("50"),
+            quality=ProductionHourly.Q_OK, source=ProductionHourly.SOURCE_PLC,
+        )
+        ProductionHourly.objects.create(
+            line=self.line, stat_date=day, stat_hour=10, output=Decimal("100"),
+            quality=ProductionHourly.Q_OK, source=ProductionHourly.SOURCE_PLC,
+        )
+        data = build_overview(datetime(2026, 11, 20, 10, 30))["workshop"]
+        self.assertIsNone(data["hours"][idx]["output"], "任一线缺数时不能用部分线求和冒充车间")
+
+        # 第二条线 10 点确实为 0：0 是有效产量，必须照常求和
+        ProductionHourly.objects.create(
+            line=line2, stat_date=day, stat_hour=10, output=Decimal("0"),
+            quality=ProductionHourly.Q_OK, source=ProductionHourly.SOURCE_PLC,
+        )
+        data2 = build_overview(datetime(2026, 11, 20, 10, 30))["workshop"]
+        self.assertEqual(data2["hours"][idx]["output"], 100, "0 也是有效产量，不能当成缺数")
+
+    def test_清空采集数据保留主数据(self):
+        """clear_measurements 只删采集/统计结果，产线与点位主数据保留。"""
+        self.point.last_value = Decimal("123")
+        self.point.save(update_fields=["last_value"])
+        PlcReading.objects.create(
+            point=self.point, collect_time=datetime(2026, 11, 20, 10, 5), value=Decimal("123")
+        )
+        ProductionHourly.objects.create(
+            line=self.line, stat_date=datetime(2026, 11, 20).date(), stat_hour=10,
+            output=Decimal("100"), quality=ProductionHourly.Q_OK, source=ProductionHourly.SOURCE_PLC,
+        )
+        call_command("clear_measurements", "--yes", stdout=StringIO())
+        self.assertFalse(PlcReading.objects.exists())
+        self.assertFalse(ProductionHourly.objects.exists())
+        self.assertTrue(PlcPoint.objects.filter(pk=self.point.pk).exists())
+        self.point.refresh_from_db()
+        self.assertIsNone(self.point.last_value)
 
     def test_瓶数箱数加ml按规则换算标箱并分表存放(self):
         self.point.enabled = False

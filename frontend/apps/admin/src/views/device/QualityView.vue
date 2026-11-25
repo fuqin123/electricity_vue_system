@@ -51,7 +51,7 @@ function fetchQuality(query: { page: number; pageSize: number; keyword?: string 
 const chartOption = computed(() =>
   simpleBarOption(
     rows.value.map((r) => r.lineCode),
-    rows.value.map((r) => +(r.rate.toFixed(1))),
+    rows.value.map((r) => +(r.rate.toFixed(3))),
     { name: '完整率', unit: '%', color: '#1664ff', labelInterval: 0 }
   )
 );
@@ -78,7 +78,7 @@ const chartOption = computed(() =>
     />
 
     <div class="stat-grid">
-      <StatCard label="平均上报完整率" :value="avgRate.toFixed(1)" unit="%" color="#1664ff" :loading="loading" :trend="avgRate >= 98 ? 'down' : 'up'" foot="低于 98% 需排查采集链路" />
+      <StatCard label="平均上报完整率" :value="avgRate.toFixed(3)" unit="%" color="#1664ff" :loading="loading" :trend="avgRate >= 98 ? 'down' : 'up'" foot="低于 98% 需排查采集链路" />
       <StatCard label="缺失总点数" :value="totalMissing" unit="点" color="#d7312a" :loading="loading" foot="应报未报的整点数量合计" />
       <StatCard label="监测量" :value="rows.length" unit="条产线" color="#2a814b" :loading="loading" foot="每条产线每日应有 24 个整点" />
       <StatCard label="补采机制" value="断点续跑" color="#bd7e00" :loading="loading" foot="长期任务失败后可从断点继续" />

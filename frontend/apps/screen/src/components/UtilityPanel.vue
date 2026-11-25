@@ -34,7 +34,7 @@ const sparkOption = computed(() => utilitySparkOption(props.ws.utility));
             rise(it.d.today, it.d.yesterday) === null
               ? '--'
               : ((rise(it.d.today, it.d.yesterday) as number) > 0 ? '+' : '') +
-                (rise(it.d.today, it.d.yesterday) as number).toFixed(1) +
+                (rise(it.d.today, it.d.yesterday) as number).toFixed(3) +
                 '%'
           }}
         </em>
