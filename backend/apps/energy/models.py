@@ -1251,3 +1251,316 @@ class VideoChannel(models.Model):
 
     def __str__(self) -> str:
         return f"{self.line_code} {self.channel} {self.stream}"
+
+
+# ── 产量 PLC 采集（v1.8.0）─────────────────────────────────────
+
+
+class PlcDevice(models.Model):
+    """产量 PLC 设备 —— 西门子 S7-200 SMART（以太网，102 端口）。
+
+    v1.8.0 起产量不再依赖人工 `ingest_production`：由本表登记 PLC 连接参数，
+    再由 `collect_production` 读取其点位（DB/M/I/Q 区）写入 `production_hourly`。
+
+    `mode` 两种：
+      · snap7     —— 真实连接，依赖 `python-snap7>=3`（纯 Python，无 dll）；
+      · simulated —— 本地模拟值，用于没有 PLC 时跑通页面、绑定与采集链路。
+    """
+
+    MODEL_S7_200_SMART = "s7_200_smart"
+    MODEL_CHOICES = [(MODEL_S7_200_SMART, "西门子 S7-200 SMART")]
+
+    MODE_SNAP7 = "snap7"
+    MODE_SIMULATED = "simulated"
+    MODE_CHOICES = [
+        (MODE_SNAP7, "真实 PLC（python-snap7）"),
+        (MODE_SIMULATED, "模拟数据（无 PLC 联调）"),
+    ]
+
+    code = models.CharField("设备编号", max_length=32, unique=True)
+    name = models.CharField("设备名称", max_length=64)
+    model = models.CharField("PLC 型号", max_length=32, choices=MODEL_CHOICES, default=MODEL_S7_200_SMART)
+    host = models.CharField("IP", max_length=64, blank=True, default="")
+    port = models.PositiveIntegerField("端口", default=102)
+    rack = models.PositiveSmallIntegerField("机架号", default=0)
+    slot = models.PositiveSmallIntegerField("槽位", default=1)
+    mode = models.CharField("采集模式", max_length=12, choices=MODE_CHOICES, default=MODE_SIMULATED)
+    timeout_ms = models.PositiveIntegerField("超时(ms)", default=3000)
+    interval_seconds = models.PositiveIntegerField("采样周期(秒)", default=60)
+    enabled = models.BooleanField("启用", default=True)
+    remark = models.CharField("备注", max_length=200, blank=True, default="")
+
+    # 最近一次读取 / 测试证据（与能源网关同一套「最新证据优先」显示口径）
+    last_ok_at = models.DateTimeField("最近读取成功", null=True, blank=True)
+    last_fail_at = models.DateTimeField("最近读取失败", null=True, blank=True)
+    last_error = models.CharField("最近错误", max_length=200, blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "plc_device"
+        ordering = ["code"]
+        verbose_name = "PLC 设备"
+        verbose_name_plural = "PLC 设备"
+
+    def __str__(self) -> str:
+        return f"{self.code} {self.name}"
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.host}:{self.port}" if self.host else "未配置"
+
+    @property
+    def is_online(self) -> bool:
+        """最新证据优先：一次更新的失败可以推翻旧的成功（与网关 B-542 同口径）。"""
+        if self.last_ok_at is None and self.last_fail_at is None:
+            return False
+        if self.last_fail_at is None:
+            return True
+        if self.last_ok_at is None:
+            return False
+        return self.last_ok_at >= self.last_fail_at
+
+
+class PlcPoint(models.Model):
+    """PLC 产量点位 —— 一个累计计数器或一个瞬时值。
+
+    S7 地址拆成「区域 + DB 号 + 起始字节 + 位偏移 + 数据类型」，而不是让现场
+    手写 `DB1.DBD0`：拼地址、定读取长度、解码都只能有一处实现，否则同一个
+    点位在页面、采集器、测试接口里会出现三种解释。
+    """
+
+    AREA_DB = "DB"
+    AREA_M = "M"
+    AREA_I = "I"
+    AREA_Q = "Q"
+    AREA_CHOICES = [
+        (AREA_DB, "DB 数据块"),
+        (AREA_M, "M 位存储区"),
+        (AREA_I, "I 输入区"),
+        (AREA_Q, "Q 输出区"),
+    ]
+
+    DT_UINT16 = "uint16"
+    DT_INT16 = "int16"
+    DT_UINT32 = "uint32"
+    DT_INT32 = "int32"
+    DT_FLOAT32 = "float32"
+    DT_BOOL = "bool"
+    DATA_TYPE_CHOICES = [
+        (DT_UINT16, "16 位无符号整数（2 字节）"),
+        (DT_INT16, "16 位有符号整数（2 字节）"),
+        (DT_UINT32, "32 位无符号整数（4 字节）"),
+        (DT_INT32, "32 位有符号整数（4 字节）"),
+        (DT_FLOAT32, "32 位浮点数 REAL（4 字节）"),
+        (DT_BOOL, "布尔位（1 字节内按位取）"),
+    ]
+    SIZE_BY_TYPE = {
+        DT_UINT16: 2,
+        DT_INT16: 2,
+        DT_UINT32: 4,
+        DT_INT32: 4,
+        DT_FLOAT32: 4,
+        DT_BOOL: 1,
+    }
+
+    MODE_CUMULATIVE = "cumulative"
+    MODE_INSTANT = "instant"
+    COUNTER_MODE_CHOICES = [
+        (MODE_CUMULATIVE, "累计值（两次读数相减）"),
+        (MODE_INSTANT, "本次读数即区间产量"),
+    ]
+
+    code = models.CharField("点位编号", max_length=32, unique=True)
+    name = models.CharField("点位名称", max_length=64)
+    device = models.ForeignKey(
+        PlcDevice, on_delete=models.CASCADE, related_name="points", verbose_name="PLC 设备"
+    )
+    area = models.CharField("存储区", max_length=4, choices=AREA_CHOICES, default=AREA_DB)
+    db_number = models.PositiveIntegerField("DB 号", null=True, blank=True, default=1)
+    start_offset = models.PositiveIntegerField("起始字节", default=0)
+    bit_offset = models.PositiveSmallIntegerField(
+        "位偏移", null=True, blank=True, help_text="仅 bool 使用，0—7"
+    )
+    data_type = models.CharField("数据类型", max_length=12, choices=DATA_TYPE_CHOICES, default=DT_UINT32)
+    counter_mode = models.CharField(
+        "计数方式", max_length=12, choices=COUNTER_MODE_CHOICES, default=MODE_CUMULATIVE
+    )
+    scale = models.DecimalField("倍率", max_digits=12, decimal_places=4, default=1)
+    unit = models.CharField("单位", max_length=16, default="瓶")
+    max_hourly = models.DecimalField(
+        "单次增量上限", max_digits=18, decimal_places=1, null=True, blank=True,
+        help_text="留空不限制；超过上限的增量视为异常，不计入产量",
+    )
+    enabled = models.BooleanField("启用", default=True)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    description = models.CharField("说明", max_length=200, blank=True, default="")
+
+    # 模拟模式参数：value = sim_base + sim_rate × 运行小时数（从 epoch 起算）
+    sim_base = models.DecimalField("模拟起始值", max_digits=18, decimal_places=3, default=0)
+    sim_rate = models.DecimalField("模拟速率(单位/小时)", max_digits=12, decimal_places=3, default=0)
+
+    # 最近一次成功读数 —— 下一次采集据此计算增量（换表/归零时只重置基准）
+    last_value = models.DecimalField("最近读数", max_digits=18, decimal_places=3, null=True, blank=True)
+    last_at = models.DateTimeField("最近读数时间", null=True, blank=True)
+    last_ok = models.BooleanField("最近读取成功", null=True, blank=True)
+    last_error = models.CharField("最近错误", max_length=200, blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "plc_point"
+        ordering = ["device_id", "sort", "code"]
+        verbose_name = "PLC 产量点位"
+        verbose_name_plural = "PLC 产量点位"
+
+    def __str__(self) -> str:
+        return f"{self.code} {self.name}"
+
+    @property
+    def address(self) -> str:
+        """给页面与排障用的一行地址，如 `DB1.DBD0` / `M10.0`。"""
+        if self.area == self.AREA_DB:
+            prefix = f"DB{self.db_number or 1}."
+        else:
+            prefix = self.area
+        if self.data_type == self.DT_BOOL:
+            return f"{prefix}{self.start_offset}.{self.bit_offset or 0}"
+        return f"{prefix}{self.start_offset}"
+
+    @property
+    def size(self) -> int:
+        return self.SIZE_BY_TYPE.get(self.data_type, 4)
+
+
+class PlcReading(models.Model):
+    """PLC 原始读数（只追加，供复核 / 排障）。"""
+
+    point = models.ForeignKey(
+        PlcPoint, on_delete=models.CASCADE, related_name="readings", verbose_name="点位"
+    )
+    collect_time = models.DateTimeField("采集时间", db_index=True)
+    value = models.DecimalField("读数", max_digits=18, decimal_places=3, null=True, blank=True)
+    ok = models.BooleanField("读取成功", default=True)
+    error = models.CharField("错误", max_length=200, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "plc_reading"
+        ordering = ["-collect_time", "-id"]
+        verbose_name = "PLC 原始读数"
+        verbose_name_plural = "PLC 原始读数"
+        indexes = [models.Index(fields=("point", "collect_time"), name="plc_reading_point_time_idx")]
+
+    def __str__(self) -> str:
+        return f"{self.point_id}@{self.collect_time}={self.value}"
+
+
+# ── 产量计量绑定（v1.8.0）─────────────────────────────────────
+# 结构与「能源计量绑定」同构（车间 → 类型 → 设备 → 勾选点位），但**完全独立**：
+# 能源绑定的是 EnergyMeter，产量绑定的是 PlcPoint；两套树互不影响。
+
+
+class ProductionBindingWorkshop(models.Model):
+    """产量绑定树 · 车间（仅查询 / 管理分组，不替代 production_line）。"""
+
+    name = models.CharField("车间名称", max_length=64, unique=True)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "production_binding_workshop"
+        ordering = ["sort", "id"]
+        verbose_name = "产量绑定车间"
+        verbose_name_plural = "产量绑定车间"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class ProductionBindingType(models.Model):
+    """产量绑定树 · 类型（如「灌装产量」「包装产量」）。"""
+
+    workshop = models.ForeignKey(
+        ProductionBindingWorkshop, on_delete=models.CASCADE, related_name="types", verbose_name="车间"
+    )
+    name = models.CharField("类型名称", max_length=64)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "production_binding_type"
+        ordering = ["sort", "id"]
+        verbose_name = "产量绑定类型"
+        verbose_name_plural = "产量绑定类型"
+        constraints = [
+            models.UniqueConstraint(fields=("workshop", "name"), name="uk_prod_binding_type"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.workshop_id}/{self.name}"
+
+
+class ProductionBindingDevice(models.Model):
+    """产量绑定树 · 设备 —— 右侧勾选的 PLC 点位挂在这里。
+
+    `line` 是**真实产线**：采集到的增量最终要落到 `production_hourly.line`，
+      没有产线的设备只能用于展示，不参与产量入库。
+    `counts_output=False` 用于「装箱机」这类与灌装机重复计数的设备：
+      点位照常采集，但不写产量，避免同一条线被算两遍。
+    """
+
+    type = models.ForeignKey(
+        ProductionBindingType, on_delete=models.CASCADE, related_name="devices", verbose_name="类型"
+    )
+    name = models.CharField("设备名称", max_length=64)
+    line = models.ForeignKey(
+        ProductionLine, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_binding_devices", verbose_name="对应产线",
+        help_text="采集增量写入该产线的小时产量；留空则不参与产量入库",
+    )
+    counts_output = models.BooleanField("计入产量", default=True)
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "production_binding_device"
+        ordering = ["sort", "id"]
+        verbose_name = "产量绑定设备"
+        verbose_name_plural = "产量绑定设备"
+        constraints = [
+            models.UniqueConstraint(fields=("type", "name"), name="uk_prod_binding_device"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.type_id}/{self.name}"
+
+
+class ProductionBindingAssignment(models.Model):
+    """产量绑定设备 ↔ PLC 点位。"""
+
+    device = models.ForeignKey(
+        ProductionBindingDevice, on_delete=models.CASCADE, related_name="assignments", verbose_name="绑定设备"
+    )
+    point = models.ForeignKey(
+        PlcPoint, on_delete=models.CASCADE, related_name="production_assignments", verbose_name="PLC 点位"
+    )
+    sort = models.PositiveSmallIntegerField("排序", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "production_binding_assignment"
+        ordering = ["sort", "id"]
+        verbose_name = "产量绑定点位"
+        verbose_name_plural = "产量绑定点位"
+        constraints = [
+            models.UniqueConstraint(fields=("device", "point"), name="uk_prod_binding_device_point"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.device_id}→{self.point_id}"

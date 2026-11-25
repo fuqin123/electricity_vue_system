@@ -57,6 +57,14 @@ import type {
   OperationLog,
   PageQuery,
   PageResult,
+  PlcDevice,
+  PlcPoint,
+  PlcTestResult,
+  ProductionBindingDeviceNode,
+  ProductionBindingDevicePayload,
+  ProductionBindingTreeResult,
+  ProductionBindingTypeNode,
+  ProductionBindingWorkshopNode,
   EnergyPriceRow,
   ReportTemplate,
   StandardUnitOptions,
@@ -598,6 +606,158 @@ export const adminApi = {
     return request<{ device: MeterBindingDeviceNode; saved: number }>(
       `/api/admin/meter-binding-devices/${id}/meters`,
       { method: 'PUT', body: JSON.stringify({ meterCodes }) }
+    );
+  },
+
+  /* ── PLC 产量采集（v1.8.0）────────────────────────────── */
+  async getPlcDevices(): Promise<PlcDevice[]> {
+    if (!useApi('admin.plc')) return delay([], 120);
+    return request<PlcDevice[]>('/api/admin/plc-devices');
+  },
+
+  async createPlcDevice(payload: Partial<PlcDevice>): Promise<{ device: PlcDevice }> {
+    return request<{ device: PlcDevice }>('/api/admin/plc-devices/create', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async savePlcDevice(id: number, payload: Partial<PlcDevice>): Promise<{ device: PlcDevice }> {
+    return request<{ device: PlcDevice }>(`/api/admin/plc-devices/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async deletePlcDevice(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/plc-devices/${id}`, { method: 'DELETE' });
+  },
+
+  async testPlcDevice(id: number): Promise<PlcTestResult> {
+    return request<PlcTestResult>(`/api/admin/plc-devices/${id}/test`, { method: 'POST' });
+  },
+
+  async getPlcPoints(deviceId?: number): Promise<PlcPoint[]> {
+    if (!useApi('admin.plc')) return delay([], 120);
+    return request<PlcPoint[]>('/api/admin/plc-points', {
+      params: deviceId ? { device: deviceId } : undefined
+    });
+  },
+
+  async createPlcPoint(payload: Partial<PlcPoint> & { deviceId: number }): Promise<{ point: PlcPoint }> {
+    return request<{ point: PlcPoint }>('/api/admin/plc-points/create', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async savePlcPoint(id: number, payload: Partial<PlcPoint>): Promise<{ point: PlcPoint }> {
+    return request<{ point: PlcPoint }>(`/api/admin/plc-points/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async deletePlcPoint(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/plc-points/${id}`, { method: 'DELETE' });
+  },
+
+  /* ── 产量计量绑定（v1.8.0）──────────────────────────────── */
+  async getProductionBindingTree(): Promise<ProductionBindingTreeResult> {
+    if (!useApi('admin.productionBindings')) {
+      return delay(
+        { workshops: [], options: { workshops: [], lines: [], points: [] } },
+        120
+      );
+    }
+    return request<ProductionBindingTreeResult>('/api/admin/production-bindings/tree');
+  },
+
+  async createProductionBindingWorkshop(payload: {
+    name: string;
+    sort?: number;
+  }): Promise<{ workshop: ProductionBindingWorkshopNode }> {
+    return request<{ workshop: ProductionBindingWorkshopNode }>(
+      '/api/admin/production-binding-workshops',
+      { method: 'POST', body: JSON.stringify(payload) }
+    );
+  },
+
+  async updateProductionBindingWorkshop(
+    id: number,
+    payload: { name: string; sort?: number }
+  ): Promise<{ workshop: ProductionBindingWorkshopNode }> {
+    return request<{ workshop: ProductionBindingWorkshopNode }>(
+      `/api/admin/production-binding-workshops/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) }
+    );
+  },
+
+  async deleteProductionBindingWorkshop(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/production-binding-workshops/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async createProductionBindingType(payload: {
+    workshopId: number;
+    name: string;
+    sort?: number;
+  }): Promise<{ type: ProductionBindingTypeNode }> {
+    return request<{ type: ProductionBindingTypeNode }>(
+      '/api/admin/production-binding-types',
+      { method: 'POST', body: JSON.stringify(payload) }
+    );
+  },
+
+  async updateProductionBindingType(
+    id: number,
+    payload: { name: string; sort?: number }
+  ): Promise<{ type: ProductionBindingTypeNode }> {
+    return request<{ type: ProductionBindingTypeNode }>(
+      `/api/admin/production-binding-types/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) }
+    );
+  },
+
+  async deleteProductionBindingType(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/production-binding-types/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async createProductionBindingDevice(
+    payload: ProductionBindingDevicePayload
+  ): Promise<{ device: ProductionBindingDeviceNode }> {
+    return request<{ device: ProductionBindingDeviceNode }>(
+      '/api/admin/production-binding-devices',
+      { method: 'POST', body: JSON.stringify(payload) }
+    );
+  },
+
+  async updateProductionBindingDevice(
+    id: number,
+    payload: Partial<ProductionBindingDevicePayload>
+  ): Promise<{ device: ProductionBindingDeviceNode }> {
+    return request<{ device: ProductionBindingDeviceNode }>(
+      `/api/admin/production-binding-devices/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) }
+    );
+  },
+
+  async deleteProductionBindingDevice(id: number): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(`/api/admin/production-binding-devices/${id}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async setProductionBindingDevicePoints(
+    id: number,
+    pointCodes: string[]
+  ): Promise<{ device: ProductionBindingDeviceNode; saved: number }> {
+    return request<{ device: ProductionBindingDeviceNode; saved: number }>(
+      `/api/admin/production-binding-devices/${id}/points`,
+      { method: 'PUT', body: JSON.stringify({ pointCodes }) }
     );
   },
 

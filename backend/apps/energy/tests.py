@@ -39,6 +39,13 @@ from apps.energy.models import (
     PeriodSummary,
     ProductionHourly,
     ProductionLine,
+    PlcDevice,
+    PlcPoint,
+    PlcReading,
+    ProductionBindingAssignment,
+    ProductionBindingDevice,
+    ProductionBindingType,
+    ProductionBindingWorkshop,
     StandardUnitConsumption,
     SystemParam,
     VideoChannel,
@@ -46,6 +53,7 @@ from apps.energy.models import (
 )
 from apps.energy.services import alerts
 from apps.energy.services import business_day as B
+from apps.energy.services import plc as plc_service
 from apps.energy.services import ranges, registry, slots
 from apps.energy.services import summary as S
 from apps.energy.services.aggregate import aggregate_hour, compute_hour, current_hour_usage
@@ -4477,3 +4485,178 @@ class WaterDailyFallbackTests(TestCase):
         now = B.day_start(self.DAY + timedelta(days=1)) + timedelta(hours=2)
         data = build_overview(now=now, closed=False)
         self.assertEqual(data["workshop"]["yesterday"]["waterT"], 120.0)
+
+
+class PlcProductionTests(TestCase):
+    """v1.8.0：S7-200 SMART 产量采集（模拟模式）与产量计量绑定。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.ws = ProductionLine.default_workshop()
+        cls.line = ProductionLine.objects.create(
+            line_code="W801", line_name="产量一线", node_type=ProductionLine.NODE_LINE,
+            parent=cls.ws, rated=24000, product="测试产品 500ml",
+        )
+        cls.device = PlcDevice.objects.create(
+            code="PLC-T1", name="测试 PLC", mode=PlcDevice.MODE_SIMULATED, host="127.0.0.1",
+        )
+        cls.point = PlcPoint.objects.create(
+            code="P-T1", name="灌装计数", device=cls.device, area=PlcPoint.AREA_DB,
+            db_number=1, start_offset=0, data_type=PlcPoint.DT_UINT32,
+            counter_mode=PlcPoint.MODE_CUMULATIVE, unit="瓶",
+            sim_base=Decimal("1000"), sim_rate=Decimal("100"),
+        )
+        cls.b_ws = ProductionBindingWorkshop.objects.create(name="产量测试车间")
+        cls.b_type = ProductionBindingType.objects.create(workshop=cls.b_ws, name="灌装产量")
+        cls.b_device = ProductionBindingDevice.objects.create(
+            type=cls.b_type, name="一线灌装", line=cls.line, counts_output=True,
+        )
+        ProductionBindingAssignment.objects.create(device=cls.b_device, point=cls.point)
+
+    def setUp(self):
+        ProductionHourly.objects.filter(line=self.line).delete()
+        PlcReading.objects.all().delete()
+        self.point.refresh_from_db()
+        self.point.last_value = None
+        self.point.last_at = None
+        self.point.last_ok = None
+        self.point.last_error = ""
+        self.point.max_hourly = None
+        self.point.save()
+
+    def _api(self, method: str, url: str, payload: dict | None = None):
+        client = Client()
+        if method == "get":
+            return client.get(url, payload or {})
+        if method == "delete":
+            return client.delete(url)
+        return getattr(client, method)(
+            url, data=json.dumps(payload or {}), content_type="application/json"
+        )
+
+    def test_模拟累计值按两次读数差写入小时产量(self):
+        t1 = datetime(2026, 11, 20, 10, 0, 0)
+        first = plc_service.collect_device(self.device, now=t1, force_simulated=True)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["written"], 0, "首次采集只建立基准，不应写产量")
+        self.assertFalse(ProductionHourly.objects.filter(line=self.line).exists())
+
+        t2 = datetime(2026, 11, 20, 11, 0, 0)
+        second = plc_service.collect_device(self.device, now=t2, force_simulated=True)
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["written"], 1)
+        row = ProductionHourly.objects.get(line=self.line, stat_date=t2.date(), stat_hour=10)
+        self.assertEqual(row.output, Decimal("100.000"))
+        self.assertEqual(row.source, ProductionHourly.SOURCE_PLC)
+
+    def test_同一点位被同产线多个设备勾选只计一次(self):
+        device2 = ProductionBindingDevice.objects.create(
+            type=self.b_type, name="一线灌装备份", line=self.line, counts_output=True
+        )
+        ProductionBindingAssignment.objects.create(device=device2, point=self.point)
+        t1 = datetime(2026, 11, 20, 10, 0, 0)
+        plc_service.collect_device(self.device, now=t1, force_simulated=True)
+        plc_service.collect_device(self.device, now=t1 + timedelta(hours=1), force_simulated=True)
+        row = ProductionHourly.objects.get(line=self.line, stat_date=t1.date(), stat_hour=10)
+        self.assertEqual(row.output, Decimal("100.000"), "共享计数器只能计一次")
+
+    def test_未绑定或不计产的设备不写产量(self):
+        t1 = datetime(2026, 11, 20, 10, 0, 0)
+        plc_service.collect_device(self.device, now=t1, force_simulated=True)
+        self.b_device.counts_output = False
+        self.b_device.save(update_fields=["counts_output"])
+        plc_service.collect_device(self.device, now=t1 + timedelta(hours=1), force_simulated=True)
+        self.assertFalse(ProductionHourly.objects.filter(line=self.line).exists())
+
+        self.b_device.counts_output = True
+        self.b_device.line = None
+        self.b_device.save(update_fields=["counts_output", "line"])
+        plc_service.collect_device(self.device, now=t1 + timedelta(hours=2), force_simulated=True)
+        self.assertFalse(ProductionHourly.objects.filter(line=self.line).exists())
+
+    def test_累计值回退只重置基准(self):
+        now = datetime(2026, 11, 20, 10, 0, 0)
+        current = plc_service.simulated_value(self.point, now)
+        self.point.last_value = current + Decimal("1000")
+        self.point.save(update_fields=["last_value"])
+        plc_service.collect_device(self.device, now=now, force_simulated=True)
+        self.assertFalse(ProductionHourly.objects.filter(line=self.line).exists())
+        self.point.refresh_from_db()
+        self.assertEqual(self.point.last_value, current, "回退时只把基准重置为本次读数")
+
+    def test_超过单次上限的增量被过滤(self):
+        self.point.max_hourly = Decimal("50")
+        self.point.save(update_fields=["max_hourly"])
+        t1 = datetime(2026, 11, 20, 10, 0, 0)
+        plc_service.collect_device(self.device, now=t1, force_simulated=True)
+        plc_service.collect_device(self.device, now=t1 + timedelta(hours=1), force_simulated=True)
+        self.assertFalse(ProductionHourly.objects.filter(line=self.line).exists())
+
+    def test_PLC设备与点位接口CRUD与试读(self):
+        created = self._api(
+            "post",
+            "/api/admin/plc-devices/create",
+            {"code": "PLC-API", "name": "接口 PLC", "mode": "simulated", "host": "127.0.0.1"},
+        )
+        self.assertEqual(created.status_code, 200, created.content)
+        device_id = created.json()["device"]["id"]
+
+        point = self._api(
+            "post",
+            "/api/admin/plc-points/create",
+            {
+                "deviceId": device_id, "code": "P-API", "name": "接口点位",
+                "area": "DB", "dbNumber": 1, "startOffset": 0, "dataType": "uint32",
+                "simBase": 500, "simRate": 10,
+            },
+        )
+        self.assertEqual(point.status_code, 200, point.content)
+        self.assertEqual(point.json()["point"]["address"], "DB1.0")
+
+        rows = self._api("get", "/api/admin/plc-points", {"device": device_id})
+        self.assertEqual(rows.status_code, 200)
+        self.assertEqual(len(rows.json()), 1)
+
+        tested = self._api("post", f"/api/admin/plc-devices/{device_id}/test", {"simulate": True})
+        self.assertEqual(tested.status_code, 200, tested.content)
+        body = tested.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["items"][0]["point"], "P-API")
+        self.assertIsNotNone(body["items"][0]["value"])
+
+        deleted = self._api("delete", f"/api/admin/plc-devices/{device_id}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse(PlcPoint.objects.filter(code="P-API").exists())
+
+    def test_产量绑定树与点位勾选(self):
+        ws = self._api("post", "/api/admin/production-binding-workshops", {"name": "接口车间"})
+        self.assertEqual(ws.status_code, 200, ws.content)
+        ws_id = ws.json()["workshop"]["id"]
+        btype = self._api(
+            "post", "/api/admin/production-binding-types", {"workshopId": ws_id, "name": "接口类型"}
+        )
+        self.assertEqual(btype.status_code, 200, btype.content)
+        type_id = btype.json()["type"]["id"]
+        device = self._api(
+            "post",
+            "/api/admin/production-binding-devices",
+            {"typeId": type_id, "name": "接口设备", "lineCode": self.line.line_code, "countsOutput": True},
+        )
+        self.assertEqual(device.status_code, 200, device.content)
+        device_id = device.json()["device"]["id"]
+
+        saved = self._api(
+            "put", f"/api/admin/production-binding-devices/{device_id}/points",
+            {"pointCodes": [self.point.code]},
+        )
+        self.assertEqual(saved.status_code, 200, saved.content)
+        self.assertEqual(saved.json()["saved"], 1)
+
+        tree = self._api("get", "/api/admin/production-bindings/tree")
+        self.assertEqual(tree.status_code, 200)
+        data = tree.json()
+        node = next(w for w in data["workshops"] if w["name"] == "接口车间")
+        dev = node["types"][0]["devices"][0]
+        self.assertEqual(dev["lineCode"], self.line.line_code)
+        self.assertEqual(dev["pointCodes"], [self.point.code])
+        self.assertIn(self.point.code, [p["code"] for p in data["options"]["points"]])

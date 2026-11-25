@@ -51,7 +51,8 @@ export const menuTree: MenuNode[] = [
     children: [
       { path: '/energy-config/standard-unit', title: '标准单耗配置', icon: 'DataLine' },
       { path: '/energy-config/price', title: '能源单价', icon: 'Tickets' },
-      { path: '/energy-config/meter-binding', title: '计量绑定', icon: 'Connection' }
+      { path: '/energy-config/meter-binding', title: '能源计量绑定', icon: 'Connection' },
+      { path: '/energy-config/production-binding', title: '产量计量绑定', icon: 'DataLine' }
     ]
   },
   {
@@ -71,6 +72,7 @@ export const menuTree: MenuNode[] = [
     children: [
       { path: '/device/meter', title: '计量点位', icon: 'DataAnalysis' },
       { path: '/device/gateway', title: '采集网关', icon: 'Connection' },
+      { path: '/device/plc', title: 'PLC 设备', icon: 'Cpu' },
       { path: '/device/readings', title: '仪表读数查询', icon: 'Histogram' },
       { path: '/device/quality', title: '数据质量', icon: 'CircleCheck' }
     ]

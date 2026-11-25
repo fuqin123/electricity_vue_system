@@ -99,8 +99,17 @@ const routes: RouteRecordRaw[] = [
             name: 'energy-config-meter-binding',
             component: () => import('@/views/energy/MeterBindingView.vue'),
             meta: {
-              title: '计量绑定',
-              desc: '按车间 / 类型 / 设备绑定计量点，供电、水、汽计量页按设备查询'
+              title: '能源计量绑定',
+              desc: '按车间 / 类型 / 设备绑定能源计量点，供电、水、汽计量页按设备查询'
+            }
+          },
+          {
+            path: 'production-binding',
+            name: 'energy-config-production-binding',
+            component: () => import('@/views/energy/ProductionBindingView.vue'),
+            meta: {
+              title: '产量计量绑定',
+              desc: '按车间 / 类型 / 设备绑定 PLC 产量点位，指定对应产线与是否计入产量'
             }
           }
         ]
@@ -137,6 +146,12 @@ const routes: RouteRecordRaw[] = [
         name: 'device-gateway',
         component: () => import('@/views/device/GatewayView.vue'),
         meta: { title: '采集网关', desc: '网关在线状态与心跳监控' }
+      },
+      {
+        path: 'device/plc',
+        name: 'device-plc',
+        component: () => import('@/views/device/PlcView.vue'),
+        meta: { title: 'PLC 设备', desc: 'S7-200 SMART 产量采集设备与点位（支持模拟联调）' }
       },
       {
         path: 'device/quality',

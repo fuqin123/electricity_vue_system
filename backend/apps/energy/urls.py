@@ -14,7 +14,7 @@
 
 from django.urls import path
 
-from . import api
+from . import api, production_api
 
 #: 大屏只读组（挂在 /api/energy/ 下）
 energy_urlpatterns = [
@@ -66,6 +66,23 @@ _ADMIN_ROUTES = [
     ("meter-binding-devices/<int:pk>/meters", api.admin_binding_device_meters, "admin-binding-device-meters"),
     # 读取当前值：只读、不落库（与 /test 的区别见 api.admin_meter_current 的说明）
     ("meters/<int:pk>/current", api.admin_meter_current, "admin-meter-current"),
+    # PLC 产量采集（v1.8.0）：设备 / 点位 / 试读
+    ("plc-devices", production_api.admin_plc_devices, "admin-plc-devices"),
+    ("plc-devices/create", production_api.admin_plc_device_create, "admin-plc-device-create"),
+    ("plc-devices/<int:pk>", production_api.admin_plc_device_detail, "admin-plc-device-detail"),
+    ("plc-devices/<int:pk>/test", production_api.admin_plc_device_test, "admin-plc-device-test"),
+    ("plc-points", production_api.admin_plc_points, "admin-plc-points"),
+    ("plc-points/create", production_api.admin_plc_point_create, "admin-plc-point-create"),
+    ("plc-points/<int:pk>", production_api.admin_plc_point_detail, "admin-plc-point-detail"),
+    # 产量计量绑定（v1.8.0）：车间 → 类型 → 设备 → PLC 点位
+    ("production-bindings/tree", production_api.admin_production_binding_tree, "admin-production-binding-tree"),
+    ("production-binding-workshops", production_api.admin_prod_binding_workshops, "admin-prod-binding-workshops"),
+    ("production-binding-workshops/<int:pk>", production_api.admin_prod_binding_workshop_detail, "admin-prod-binding-workshop-detail"),
+    ("production-binding-types", production_api.admin_prod_binding_types, "admin-prod-binding-types"),
+    ("production-binding-types/<int:pk>", production_api.admin_prod_binding_type_detail, "admin-prod-binding-type-detail"),
+    ("production-binding-devices", production_api.admin_prod_binding_devices, "admin-prod-binding-devices"),
+    ("production-binding-devices/<int:pk>", production_api.admin_prod_binding_device_detail, "admin-prod-binding-device-detail"),
+    ("production-binding-devices/<int:pk>/points", production_api.admin_prod_binding_device_points, "admin-prod-binding-device-points"),
 ]
 
 #: 后台配置组（挂在 /api/admin/ 下）

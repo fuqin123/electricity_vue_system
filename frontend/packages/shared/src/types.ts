@@ -646,3 +646,149 @@ export interface AdminOverview {
   /** 最新告警 */
   latestAlarms: AlarmRecord[];
 }
+
+/* ══════════════════════════════════════════════════════════════
+   产量 PLC 采集（v1.8.0）
+   ══════════════════════════════════════════════════════════════ */
+
+export type PlcMode = 'snap7' | 'simulated';
+export type PlcArea = 'DB' | 'M' | 'I' | 'Q';
+export type PlcDataType = 'uint16' | 'int16' | 'uint32' | 'int32' | 'float32' | 'bool';
+export type PlcCounterMode = 'cumulative' | 'instant';
+
+export interface PlcDevice {
+  id: number;
+  code: string;
+  name: string;
+  model: string;
+  host: string;
+  port: number;
+  rack: number;
+  slot: number;
+  mode: PlcMode;
+  timeoutMs: number;
+  intervalSeconds: number;
+  enabled: boolean;
+  remark: string;
+  endpoint: string;
+  status: 'online' | 'offline';
+  lastOkAt: string;
+  lastFailAt: string;
+  lastError: string;
+  pointCount: number;
+  updatedAt: string;
+}
+
+export interface PlcPoint {
+  id: number;
+  code: string;
+  name: string;
+  deviceId: number;
+  deviceCode: string;
+  area: PlcArea;
+  areaLabel: string;
+  dbNumber: number | null;
+  startOffset: number;
+  bitOffset: number | null;
+  dataType: PlcDataType;
+  dataTypeLabel: string;
+  address: string;
+  counterMode: PlcCounterMode;
+  scale: number;
+  unit: string;
+  maxHourly: number | null;
+  enabled: boolean;
+  sort: number;
+  description: string;
+  simBase: number;
+  simRate: number;
+  lastValue: number | null;
+  lastAt: string;
+  lastOk: boolean | null;
+  lastError: string;
+}
+
+export interface PlcTestItem {
+  point: string;
+  name: string;
+  address: string;
+  ok: boolean;
+  value: number | null;
+  error: string;
+}
+
+export interface PlcTestResult {
+  ok: boolean;
+  simulated: boolean;
+  durationMs: number;
+  items: PlcTestItem[];
+}
+
+/* ══════════════════════════════════════════════════════════════
+   产量计量绑定（v1.8.0，与能源计量绑定独立）
+   ══════════════════════════════════════════════════════════════ */
+
+export interface ProductionBindingPoint {
+  id: number;
+  code: string;
+  name: string;
+  deviceId: number;
+  deviceCode: string;
+  deviceName: string;
+  address: string;
+  unit: string;
+  counterMode: PlcCounterMode;
+  enabled: boolean;
+}
+
+export interface ProductionBindingDeviceNode {
+  id: number;
+  name: string;
+  sort: number;
+  typeId: number;
+  typeName: string;
+  workshopId: number;
+  workshopName: string;
+  lineCode: string | null;
+  lineName: string;
+  countsOutput: boolean;
+  pointCodes: string[];
+  pointCount: number;
+  points: ProductionBindingPoint[];
+}
+
+export interface ProductionBindingTypeNode {
+  id: number;
+  name: string;
+  sort: number;
+  devices: ProductionBindingDeviceNode[];
+  pointCount: number;
+}
+
+export interface ProductionBindingWorkshopNode {
+  id: number;
+  name: string;
+  sort: number;
+  types: ProductionBindingTypeNode[];
+  typeCount: number;
+  pointCount: number;
+}
+
+export interface ProductionBindingOptions {
+  workshops: { code: string; name: string }[];
+  lines: { code: string; name: string; product: string; rated: number }[];
+  points: ProductionBindingPoint[];
+}
+
+export interface ProductionBindingTreeResult {
+  workshops: ProductionBindingWorkshopNode[];
+  options: ProductionBindingOptions;
+}
+
+export interface ProductionBindingDevicePayload {
+  typeId: number;
+  name: string;
+  lineCode?: string | null;
+  countsOutput?: boolean;
+  sort?: number;
+}

@@ -785,7 +785,7 @@ def build_workshop(now: datetime | None = None, *, closed: bool = False) -> dict
         alerts.append(
             {
                 "level": "info",
-                "text": "产量数据源未接入（灌装机计数器 / 装箱机 PLC / MES 班次报工待改造），本期产量统一显示为 --",
+                "text": "产量数据源未接入（可在「设备与采集 → PLC 设备」接入 S7-200 SMART），本期产量统一显示为 --",
                 "time": "--:--:--",
             }
         )

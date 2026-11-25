@@ -31,6 +31,9 @@ PyYAML==6.0.2                       # 读取 settings.yaml（采集参数与设�
 pymodbus==3.7.4                     # Modbus；串口服务器必须用 FramerType.RTU
 # ⚠ 不要传 retries=0：pymodbus 3.7 在该值下不发请求，表现为「所有点位无响应」
 # pyserial==3.5                     # 直连串口（RS485 直插工控机）时才需要，当前走串口服务器
+# 西门子 S7-200 SMART 产量采集（v1.8.0）：3.x 为纯 Python，无需 snap7.dll，
+# 官方支持矩阵对 S7-200 SMART 标注为「基础以太网读写可用」
+python-snap7==3.6.0                 # S7 协议客户端（Python >=3.10）
 
 # ── 定时任务与重试 ──────────────────────────────────────────
 # 当前用系统计划任务（schtasks / cron）驱动 `manage.py collect`，未引入调度库
