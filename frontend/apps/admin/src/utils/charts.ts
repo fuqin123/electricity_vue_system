@@ -14,7 +14,12 @@ const C = {
   axis: "#86909c",
   grid: "#eaedf1",
   text: "#1d2129",
+  /** 单耗专用色（v1.8.6）：紫罗兰，与蓝/绿/黄/红四种用量色都能区分 */
+  unit: "#722ed1",
 };
+
+/** 单耗曲线统一颜色 —— 后台所有单耗曲线共用（数据中心累计单耗、计量页单耗） */
+export const UNIT_COLOR = C.unit;
 
 const FONT = "PingFang SC, Microsoft YaHei, sans-serif";
 
@@ -405,8 +410,8 @@ export function energyCumulativeOption(
     });
   }
   if (showUnit) {
-    // v1.8.6：单耗曲线改用紫色，与「累计用量」蓝线、产量绿柱区分开
-    const unitColor = "#7c8cff";
+    // v1.8.6：单耗曲线统一用紫罗兰，与「累计用量」蓝线、产量绿柱明确区分
+    const unitColor = UNIT_COLOR;
     series.push({
       name: `累计单耗（${i.unitUseLabel}）`,
       type: "line",
@@ -466,8 +471,10 @@ export function energyCumulativeOption(
     },
     grid: {
       left: 4,
-      // v1.8.6：电 / 水 / 汽三张累计图统一右侧留白，避免汽图右侧空出一大截
-      right: 116,
+      // v1.8.6：containLabel 已把右轴标签宽度算进绘图区，这里的 right 只是
+      // 标签外侧的空白。旧值 116 会在最右一列数字后再空出约 100px（现场反馈
+      // 「右侧空白太大」），收到 24px 即可，仍能容纳偏移 56px 的单耗轴标签。
+      right: 24,
       top: 56,
       bottom: 2,
       containLabel: true,

@@ -37,7 +37,7 @@ import {
   type MeterCategoryWorkshop,
   type UsageRangeResult
 } from '@eep/shared';
-import { energyUsageOption, type EnergyUsageSeries } from './charts';
+import { energyUsageOption, UNIT_COLOR, type EnergyUsageSeries } from './charts';
 
 export type UsageEnergy = 'electric' | 'water' | 'steam';
 export type UsageGranularity = 'hour' | 'day' | 'month';
@@ -591,7 +591,8 @@ export function useEnergyUsage(energy: UsageEnergy) {
         key: 'unit',
         name: '单耗',
         unit: unitName.value || `${meta.unit}/${outputUnit.value}`,
-        color: '#bd7e00',
+        // v1.8.6：单耗曲线统一紫罗兰，和用量（蓝/黄）、产量（绿柱）区分开
+        color: UNIT_COLOR,
         data: unitValues.value,
         emptyHint: '产量为 0 或未接入，单耗无法计算'
       });
