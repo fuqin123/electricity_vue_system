@@ -84,13 +84,13 @@ const trendLegend = computed(() => {
   };
 });
 
-/** 面板右上角：实际单耗 / 标准单耗（kWh/千标箱） */
+/** 面板右上角：实际单耗 / 标准单耗（kWh/箱） */
 const unitNote = computed(() => {
   const l = line.value;
   if (!l) return '--';
-  const actual = l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(3);
-  const std = l.standardUnitKwh === null ? '--' : l.standardUnitKwh.toFixed(3);
-  return `实际单耗 ${actual} · 标准单耗 ${std} kWh/千标箱`;
+  const actual = l.today.unitKwh === null ? '--' : (l.today.unitKwh / 1000).toFixed(3);
+  const std = l.standardUnitKwh === null ? '--' : (l.standardUnitKwh / 1000).toFixed(3);
+  return `实际单耗 ${actual} · 标准单耗 ${std} kWh/箱`;
 });
 
 /** 产量数据源是否已接入（来自全局配置，不用逐处判断字段是否为 0） */
@@ -137,7 +137,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   if (!l || !w) return [];
   const curH = w.currentHour;
   const h = l.hours[curH];
-  const hPlan = Math.round(l.rated * PLAN_RATE * PROFILE[h?.clock ?? 0]);
+  const hPlan = Math.round((l.ratedCases ?? l.rated) * PLAN_RATE * PROFILE[h?.clock ?? 0]);
   /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
   const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
   const hRef = hOut ?? 0;
@@ -166,7 +166,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#7c8cff',
       label: '本月累计产量',
       value: mq,
-      sub: `用电 ${mk.v}${mk.u} · 本生产日单耗 ${l.today.unitKwh === null ? '--' : l.today.unitKwh.toFixed(3)}${overTarget ? '（超标准）' : ''}`
+      sub: `用电 ${mk.v}${mk.u} · 本生产日单耗 ${l.today.unitKwh === null ? '--' : (l.today.unitKwh / 1000).toFixed(3)}${overTarget ? '（超标准）' : ''}`
     },
     {
       tag: '日',
@@ -185,7 +185,7 @@ const kpiCards = computed<KpiCard[]>(() => {
         : h?.partial
           ? '当前小时（进行中）'
           : '当前小时产量',
-      value: { v: int(hOut), u: '标箱' },
+      value: { v: int(hOut), u: '箱' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
     }
@@ -229,7 +229,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
     const w2 = worst;
     list.push({
       level: 'err',
-      text: `单位电耗 ${(w2.unitKwh ?? 0).toFixed(3)}，超阈值 ${thresholds.unitKwhHigh.toFixed(3)}`,
+      text: `单位电耗 ${((w2.unitKwh ?? 0) / 1000).toFixed(3)}，超阈值 ${(thresholds.unitKwhHigh / 1000).toFixed(3)}`,
       time: `${pad2(w2.clock)}:00:00`
     });
   }
@@ -280,7 +280,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
     ) {
       list.unshift({
         level: 'warn',
-        text: `本小时预计产量 ${((cur.projected ?? 0) / 1000).toFixed(3)} 千标箱，低于额定 ${Math.round(
+        text: `本小时预计产量 ${(cur.projected ?? 0).toFixed(3)} 箱，低于额定 ${Math.round(
           thresholds.outputLowRate * 100
         )}%`,
         time: `${pad2(cur.clock)}:00:00`
@@ -312,7 +312,7 @@ const trendOption = computed(() => (line.value ? lineTrendOption(line.value, dim
 const heatmapOption = computed(() => (line.value ? lineHeatmapOption(line.value) : null));
 const todayOption = computed(() =>
   line.value && ws.value
-    ? todayChartOption(line.value.hours, line.value.rated, ws.value.ongoingHour ?? -1)
+    ? todayChartOption(line.value.hours, line.value.ratedCases ?? line.value.rated, ws.value.ongoingHour ?? -1)
     : null
 );
 

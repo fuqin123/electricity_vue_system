@@ -92,7 +92,7 @@ const rows = computed<Row[]>(() => {
       isCurrent: h === ongoing,
       outputText: s.future ? '--' : int(s.output),
       kwhText,
-      unitText: s.unitKwh === null ? '--' : s.unitKwh.toFixed(3),
+      unitText: s.unitKwh === null ? '--' : (s.unitKwh / 1000).toFixed(3),
       unitWarn: warn,
       deltaText: dlt === null ? '--' : `${dlt > 0 ? '+' : ''}${dlt.toFixed(3)}%`,
       deltaColor: dlt === null ? '#5f6ba8' : dlt > 0 ? '#ec48bd' : '#35ed7e',
@@ -115,9 +115,9 @@ defineExpose({ received, expect });
       <thead>
         <tr>
           <th>时间</th>
-          <th>产量 标箱</th>
+          <th>产量 箱</th>
           <th>电耗 kWh</th>
-          <th>kWh/千标箱</th>
+          <th>kWh/箱</th>
           <th>环比</th>
           <th>状态</th>
         </tr>

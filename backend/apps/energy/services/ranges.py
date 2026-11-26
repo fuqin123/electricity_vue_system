@@ -1368,15 +1368,24 @@ def dashboard_range(
     else:
         days = _day_list(start_day, end_day, now)
         labels = [d.strftime("%m-%d") for d in days]
+        keys = [(d.strftime("%Y-%m-%d"), d.strftime("%m-%d")) for d in days]
+        # v1.8.6：与「本月累计」卡片、大屏同源，读日汇总的 partial 值，
+        # 不再用「24 小时全可信才算数」的严格口径 —— 否则刚清库/缺一个点位时
+        # 电力累计和单耗整条曲线都是空的（用户看到的就是「没有曲线」）。
+        scope = S.SCOPE_LINE if (per_line and lines) else S.SCOPE_WORKSHOP
+        day_rows = S.period_rows(
+            S.DIM_DAY, scope, lines[0] if (per_line and lines) else None,
+            [k for k, _label in keys], now=now,
+        )
         kwh_vals = [
-            round_kwh(_range_total_kwh(meters, B.day_start(d), B.day_end(d))) for d in days
+            round_kwh(day_rows[k].kwh) if (day_rows.get(k) and day_rows[k].kwh is not None) else None
+            for k, _label in keys
         ]
         out_vals, prod_unit = _production_day_series(lines, days)
         if per_line:
             water_vals = [None for _ in days]
             steam_vals = [None for _ in days]
         else:
-            keys = [(d.strftime("%Y-%m-%d"), d.strftime("%m-%d")) for d in days]
             water_vals = _utility_series(EnergyType.WATER, PeriodSummary.DIM_DAY, start_day, end_day, now, keys)
             steam_vals = _utility_series(EnergyType.STEAM, PeriodSummary.DIM_DAY, start_day, end_day, now, keys)
         start, end = start_day, end_day

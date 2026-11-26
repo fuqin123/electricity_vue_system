@@ -56,8 +56,8 @@ const strokeColor = computed(() => {
       <circle cx="75" cy="75" r="42" class="gauge__inner" />
     </svg>
     <div class="gauge__center">
-      <b>{{ actual > 0 ? actual.toFixed(3) : '--' }}</b>
-      <span>kWh/千标箱</span>
+      <b>{{ actual > 0 ? (actual / 1000).toFixed(3) : '--' }}</b>
+      <span>kWh/箱</span>
     </div>
   </div>
 </template>

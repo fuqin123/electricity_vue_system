@@ -59,7 +59,7 @@ function color(r: BenchRow) {
     <div v-for="r in rows" :key="r.key" class="bench__row" :class="r.cls">
       <span>{{ r.key }}</span>
       <div class="bench__bar"><i :style="{ width: width(r.value) + '%' }" /></div>
-      <b :style="{ color: color(r) }">{{ r.value === null ? '--' : r.value.toFixed(3) }}</b>
+      <b :style="{ color: color(r) }">{{ r.value === null ? '--' : (r.value / 1000).toFixed(3) }}</b>
     </div>
   </div>
 </template>

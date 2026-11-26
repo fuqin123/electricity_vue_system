@@ -569,14 +569,18 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
     d30 = S.recent_days(30, now)
     m12 = S.recent_months(12, now)
     y5 = S.recent_years(5, now)
-    plan_now = _plan_for(line, today, now)
+    case_ratio = _case_ratio(line)
+    plan_now = _plan_for(line, today, now, ratio=case_ratio)
     standard_value = STD.standard_for_line(line)
     standard_kwh = float(standard_value) if standard_value is not None else NULL
+    rated_cases = int((line.rated or 0) * case_ratio) if case_ratio else (line.rated or 0)
 
     return {
         "id": line.line_code,
         "name": line.line_name,
         "rated": line.rated or 0,
+        # 额定产能换算成「标箱/小时」，大屏按标箱编排小时计划
+        "ratedCases": rated_cases,
         "product": line.product or "",
         # 标准电单耗（kWh/千瓶）；未标定为 null，界面显示 --，不要回退到硬编码 8.2
         "standardUnitKwh": standard_kwh,
@@ -590,7 +594,7 @@ def build_line(line: ProductionLine, now: datetime | None = None, *, closed: boo
             if (today_kwh and today_out is not None and today_out > 0)
             else NULL,
             "plan": int(plan_now),
-            "planFull": int(line.rated * 24 * 0.88) if line.rated else 0,
+            "planFull": int((line.rated or 0) * 24 * 0.88 * (case_ratio or 1)) if line.rated else 0,
             "rate": round(float(today_out / plan_now * 100), 3)
             if (today_out is not None and plan_now > 0)
             else 0,
@@ -659,15 +663,40 @@ def _heat(line: ProductionLine, today: date_cls, now: datetime, real: bool) -> l
     return grid
 
 
-def _plan_for(line: ProductionLine, day: date_cls, now: datetime) -> Decimal:
-    """截至当前生产日已开始小时的应产（达成率分母，必须与统计窗口一致）。"""
+def _case_ratio(line: ProductionLine) -> float | None:
+    """瓶 → 标箱的换算比例（factor / in_count），取该线最近一条标箱产量行。
+
+    v1.8.6：额定产能是「瓶/小时」，而页面产量是**标箱**。计划产量与达成率
+    必须先用这个比例换算，否则会把 30000 瓶/时 直接当成 30000 标箱/时。
+    """
+    row = (
+        ProductionCaseHourly.objects.filter(
+            line=line, in_count__gt=0, factor__isnull=False
+        )
+        .order_by("-stat_date", "-stat_hour")
+        .values("in_count", "factor")
+        .first()
+    )
+    if not row:
+        return None
+    return float(row["factor"]) / float(row["in_count"])
+
+
+def _plan_for(
+    line: ProductionLine, day: date_cls, now: datetime, *, ratio: float | None = None
+) -> Decimal:
+    """截至当前生产日已开始小时的应产（达成率分母，必须与统计窗口一致）。
+
+    `ratio` 给定时把额定产能从「瓶」换算成「标箱」，与页面产量同口径。
+    """
     if day == B.production_day(now):
         hours = B.started_hours(day, now)
     elif day < B.production_day(now):
         hours = 24
     else:
         hours = 0
-    return Decimal((line.rated or 0) * 0.88 * hours)
+    bottles = Decimal((line.rated or 0) * 0.88 * hours)
+    return bottles * Decimal(str(ratio)) if ratio else bottles
 
 
 def _period_total(line: ProductionLine, dim: str, now: datetime) -> Decimal | None:

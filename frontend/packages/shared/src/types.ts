@@ -89,6 +89,8 @@ export interface LineData {
   name: string;
   /** 额定产能（瓶/小时） */
   rated: number;
+  /** 额定产能换算成标箱/小时（v1.8.6）；没有标箱数据时退回 rated */
+  ratedCases?: number;
   product: string;
   /** 标准电单耗（kWh/千瓶）；未标定为 null，界面显示 -- */
   standardUnitKwh: number | null;

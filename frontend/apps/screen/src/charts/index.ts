@@ -138,7 +138,7 @@ export const OVERVIEW_TREND: Record<TrendDim, TrendUnits> = {
   年: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e8, kwhUnit: '亿kWh', digits: 3 },
   月: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
   日: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
-  时: { outDiv: 1e3, outUnit: '千标箱', kwhDiv: 1e3, kwhUnit: '千kWh', digits: 3 }
+  时: { outDiv: 1, outUnit: '箱', kwhDiv: 1e3, kwhUnit: '千kWh', digits: 3 }
 };
 
 /** 单线（量级比车间小得多，电量用 kWh / 万kWh） */
@@ -146,7 +146,7 @@ export const LINE_TREND: Record<TrendDim, TrendUnits> = {
   年: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
   月: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
   日: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1, kwhUnit: 'kWh', digits: 3 },
-  时: { outDiv: 1e3, outUnit: '千标箱', kwhDiv: 1, kwhUnit: 'kWh', digits: 3 }
+  时: { outDiv: 1, outUnit: '箱', kwhDiv: 1, kwhUnit: 'kWh', digits: 3 }
 };
 
 /** 取某维度的数据源；「时」= 当日逐小时，其余 = 周期总计。序列一律时间正序，末项是本期。 */
@@ -285,7 +285,7 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
             : `本生产日用电：<b style="font-family:monospace">${n(d.kwh, ' kWh')}</b><br>` +
               `占车间合计：<b style="font-family:monospace">${n(d.share, '%')}</b><br>` +
               `本生产日产量：<b style="font-family:monospace">--</b>（产量未接入）<br>`) +
-          `单位电耗：<b style="font-family:monospace">${d.unitKwh === null ? '--' : d.unitKwh.toFixed(3)}</b> kWh/千标箱`
+          `单位电耗：<b style="font-family:monospace">${d.unitKwh === null ? '--' : (d.unitKwh / 1000).toFixed(3)}</b> kWh/箱`
         );
       }
     },
@@ -318,10 +318,10 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
           distance: 8,
           formatter: (p: unknown) => {
             const d = (p as { data: Row }).data;
-            const u = d.unitKwh === null ? '--' : d.unitKwh.toFixed(3);
+            const u = d.unitKwh === null ? '--' : (d.unitKwh / 1000).toFixed(3);
             const over = d.unitKwh !== null && d.unitKwh > thresholds.unitKwhHigh;
             if (byOutput) {
-              return `{a|${d.value ?? '--'} 万标箱}{b|  ·  }{${over ? 'e' : 'c'}|${u}}{d| kWh/千标箱}`;
+              return `{a|${d.value ?? '--'} 万标箱}{b|  ·  }{${over ? 'e' : 'c'}|${u}}{d| kWh/箱}`;
             }
             return `{a|${d.kwh ?? '--'} kWh}{b|  ·  }{c|${d.share ?? '--'}}{d| % 车间}`;
           },
@@ -347,7 +347,7 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number, current
     if (x.future) {
       const plan = Math.round(ratedTotal * PLAN_RATE * PROFILE[x.clock]);
       return {
-        value: +(plan / 1000).toFixed(3),
+        value: plan,
         itemStyle: {
           color: 'rgba(88,101,242,.08)',
           borderColor: 'rgba(88,101,242,.42)',
@@ -358,7 +358,7 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number, current
       };
     }
     // 产量未接入（null）时柱子留空（null），不能画成 0 高度的实心柱
-    return { value: x.output === null ? null : +(x.output / 1000).toFixed(3) };
+    return { value: x.output === null ? null : x.output };
   });
   const kwh = hours.map((x) => (x.kwh === null ? null : +(x.kwh / 1000).toFixed(3)));
 
@@ -387,7 +387,7 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number, current
           '<br>';
         arr.forEach((p) => {
           if (p.value === null || p.value === undefined) return;
-          const u = p.seriesName.includes('产量') ? '千标箱' : '千kWh';
+          const u = p.seriesName.includes('产量') ? '箱' : '千kWh';
           head += `${p.marker}${p.seriesName}：<b style="font-family:monospace">${p.value}</b> ${u}<br>`;
         });
         return head;
@@ -591,7 +591,7 @@ export function lineHeatmapOption(line: LineData): echarts.EChartsOption {
         const v = (p as { value: [number, number, number] }).value;
         return (
           `<b style="color:#c9d0f5">${daysAsc[v[1]]}  ${hours[v[0]]}:00</b><br>` +
-          `产量：<b style="font-family:monospace">${fmtInt(v[2] * 100)}</b> 标箱`
+          `产量：<b style="font-family:monospace">${fmtInt(v[2] * 100)}</b> 箱`
         );
       }
     },

@@ -405,6 +405,8 @@ export function energyCumulativeOption(
     });
   }
   if (showUnit) {
+    // v1.8.6：单耗曲线改用紫色，与「累计用量」蓝线、产量绿柱区分开
+    const unitColor = "#7c8cff";
     series.push({
       name: `累计单耗（${i.unitUseLabel}）`,
       type: "line",
@@ -414,8 +416,8 @@ export function energyCumulativeOption(
       smooth: true,
       symbol: "circle",
       symbolSize: 5,
-      lineStyle: { width: 1.8, color: C.amber, type: [6, 4] },
-      itemStyle: { color: C.amber, borderColor: "#ffffff", borderWidth: 1.5 },
+      lineStyle: { width: 1.8, color: unitColor, type: [6, 4] },
+      itemStyle: { color: unitColor, borderColor: "#ffffff", borderWidth: 1.5 },
     });
   }
 
@@ -464,9 +466,8 @@ export function energyCumulativeOption(
     },
     grid: {
       left: 4,
-      // 顶部给图例和纵轴单位各留一行：右侧轴的 name 默认落在绘图区上沿，
-      // 3 根轴时会被右上角图例盖住（v1.8.4 反馈，与「区间用电趋势」一致）
-      right: showUnit && showOutput ? 116 : 48,
+      // v1.8.6：电 / 水 / 汽三张累计图统一右侧留白，避免汽图右侧空出一大截
+      right: 116,
       top: 56,
       bottom: 2,
       containLabel: true,

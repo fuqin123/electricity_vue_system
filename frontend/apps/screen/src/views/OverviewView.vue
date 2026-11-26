@@ -64,12 +64,12 @@ const DIM_NOTE: Record<TrendDim, string> = {
 
 /* ── 综合单位电耗仪表 ─────────────────────────────────── */
 const gauge = computed(() => ({
-  actual: ws.value?.today.unitKwh ?? 0,
-  target: ws.value?.targetUnitKwh ?? null,
-  yesterday: ws.value?.yesterday.unitKwh ?? 0
+  actual: (ws.value?.today.unitKwh ?? 0) / 1000,
+  target: ws.value?.targetUnitKwh === null ? null : (ws.value?.targetUnitKwh ?? 0) / 1000,
+  yesterday: (ws.value?.yesterday.unitKwh ?? 0) / 1000
 }));
 const gaugeTargetText = computed(() =>
-  gauge.value.target === null ? '标准未标定' : `目标 ${gauge.value.target.toFixed(3)}`
+  gauge.value.target === null ? '标准未标定' : `目标 ${gauge.value.target.toFixed(3)} kWh/箱`
 );
 
 /* ── KPI 卡 ───────────────────────────────────────────── */
@@ -80,7 +80,7 @@ const kpiCards = computed<KpiCard[]>(() => {
   const h = w.hours[curH];
   /** yearly5 按时间正序，末项是今年、倒数第二项是去年（同比只用这一种取法） */
   const prevYear = w.yearly5.length > 1 ? w.yearly5[w.yearly5.length - 2] : null;
-  const hPlan = Math.round(w.lines.reduce((a, l) => a + l.rated, 0) * PLAN_RATE * PROFILE[h?.clock ?? 0]);
+  const hPlan = Math.round(w.lines.reduce((a, l) => a + (l.ratedCases ?? l.rated), 0) * PLAN_RATE * PROFILE[h?.clock ?? 0]);
   /** 当前小时产量：进行中先看整点预期，否则看实绩；产量未接入（null）→ 显示 -- */
   const hOut = h?.partial ? (h.projected ?? h.output ?? null) : (h?.output ?? null);
   const hRef = hOut ?? 0;
@@ -123,7 +123,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       color: '#f06fcb',
       // 查历史整日时第 23 小时早已结算，不能写「当前小时」（B-522）
       label: w.dayClosed ? `${pad2(h?.clock ?? 0)} 时段产量` : h?.partial ? '当前小时（进行中）' : '当前小时产量',
-      value: { v: int(hOut), u: '标箱' },
+      value: { v: int(hOut), u: '箱' },
       delta: prodOn ? hDelta : null,
       sub: `用电 ${hk.v}${hk.u}`
     }
@@ -139,7 +139,7 @@ const todayOption = computed(() =>
   ws.value
     ? todayChartOption(
         ws.value.hours,
-        ws.value.lines.reduce((a, l) => a + l.rated, 0),
+        ws.value.lines.reduce((a, l) => a + (l.ratedCases ?? l.rated), 0),
         ws.value.ongoingHour ?? -1
       )
     : null
