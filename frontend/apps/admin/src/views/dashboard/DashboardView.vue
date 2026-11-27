@@ -27,6 +27,7 @@ import {
   adminApi,
   big,
   energyApi,
+  wan,
   type AdminOverview,
   type DashboardResult,
   type DashboardEnergyBlock
@@ -160,6 +161,13 @@ function blockOf(key: 'electric' | 'water' | 'steam'): DashboardEnergyBlock | nu
 
 /** 产量单位以接口为准：v1.8.4 起优先标箱，历史数据才退回瓶 */
 const prodUnit = computed(() => dash.value?.productionUnit ?? '标箱');
+/**
+ * v1.8.7：累计产量按「万标箱」展示 —— 接口给的是标箱，这里只做展示换算，
+ * 避免图上一个 20000 的大数字（现场要求「x 万标箱」）。
+ */
+const outWanUnit = computed(() => `万${prodUnit.value}`);
+const outWan = (arr: (number | null)[]) =>
+  arr.map((v) => (v === null || v === undefined ? null : +(v / 1e4).toFixed(3)));
 const unitUseLabel = (usageUnit: string) => `${usageUnit}/千${prodUnit.value === '标箱' ? '箱' : '瓶'}`;
 
 const electricOption = computed(() => {
@@ -170,8 +178,8 @@ const electricOption = computed(() => {
     labels: d.labels,
     usage: b.cumulative,
     usageUnit: b.unit,
-    output: b.outputCumulative,
-    outputUnit: prodUnit.value,
+    output: outWan(b.outputCumulative),
+    outputUnit: outWanUnit.value,
     unitUse: b.unitCumulative,
     unitUseLabel: unitUseLabel(b.unit),
     color: '#1664ff',
@@ -187,8 +195,8 @@ const waterOption = computed(() => {
     labels: d.labels,
     usage: b.cumulative,
     usageUnit: b.unit,
-    output: b.outputCumulative,
-    outputUnit: prodUnit.value,
+    output: outWan(b.outputCumulative),
+    outputUnit: outWanUnit.value,
     unitUse: b.unitCumulative,
     unitUseLabel: unitUseLabel(b.unit),
     color: '#387bff',
@@ -204,8 +212,8 @@ const steamOption = computed(() => {
     labels: d.labels,
     usage: b.cumulative,
     usageUnit: b.unit,
-    output: b.outputCumulative,
-    outputUnit: prodUnit.value,
+    output: outWan(b.outputCumulative),
+    outputUnit: outWanUnit.value,
     unitUse: b.unitCumulative,
     unitUseLabel: unitUseLabel(b.unit),
     color: '#bd7e00',
@@ -308,11 +316,11 @@ const costNote = computed(() => {
       />
       <StatCard
         label="本月累计产量"
-        :value="big(month?.output ?? null, '').v"
-        :unit="month?.outputUnit ?? '标箱'"
+        :value="wan(month?.output ?? null, 3)"
+        :unit="`万${month?.outputUnit ?? prodUnit}`"
         color="#86909c"
         :loading="loading"
-        :foot="`本年累计 ${big(year?.output ?? null, '').v}${year?.outputUnit ?? '标箱'}`"
+        :foot="`本年累计 ${wan(year?.output ?? null, 3)}万${year?.outputUnit ?? prodUnit}`"
       />
       <StatCard
         label="最新一日单箱变动费用"

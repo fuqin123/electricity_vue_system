@@ -136,13 +136,7 @@ const trendUnits = computed(() => OVERVIEW_TREND[dim.value]);
 const trendOption = computed(() => (ws.value ? overviewTrendOption(ws.value, dim.value) : null));
 const compareOption = computed(() => (ws.value ? overviewLinesCompareOption(ws.value) : null));
 const todayOption = computed(() =>
-  ws.value
-    ? todayChartOption(
-        ws.value.hours,
-        ws.value.lines.reduce((a, l) => a + (l.ratedCases ?? l.rated), 0),
-        ws.value.ongoingHour ?? -1
-      )
-    : null
+  ws.value ? todayChartOption(ws.value.hours, ws.value.ongoingHour ?? -1) : null
 );
 
 </script>

@@ -311,9 +311,7 @@ const lineAlerts = computed<AlertItem[]>(() => {
 const trendOption = computed(() => (line.value ? lineTrendOption(line.value, dim.value) : null));
 const heatmapOption = computed(() => (line.value ? lineHeatmapOption(line.value) : null));
 const todayOption = computed(() =>
-  line.value && ws.value
-    ? todayChartOption(line.value.hours, line.value.ratedCases ?? line.value.rated, ws.value.ongoingHour ?? -1)
-    : null
+  line.value && ws.value ? todayChartOption(line.value.hours, ws.value.ongoingHour ?? -1) : null
 );
 
 const tableNote = computed(() => {

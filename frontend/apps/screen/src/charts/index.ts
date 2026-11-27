@@ -11,8 +11,6 @@ import {
   pad2,
   palette as P,
   thresholds,
-  PLAN_RATE,
-  PROFILE,
   type HourPoint,
   type LineData,
   type TrendDim,
@@ -138,14 +136,14 @@ export const OVERVIEW_TREND: Record<TrendDim, TrendUnits> = {
   年: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e8, kwhUnit: '亿kWh', digits: 3 },
   月: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
   日: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
-  时: { outDiv: 1, outUnit: '箱', kwhDiv: 1e3, kwhUnit: '千kWh', digits: 3 }
+  时: { outDiv: 1, outUnit: '箱', kwhDiv: 1, kwhUnit: 'kWh', digits: 3 }
 };
 
 /** 单线（量级比车间小得多，电量用 kWh / 万kWh） */
 export const LINE_TREND: Record<TrendDim, TrendUnits> = {
   年: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
   月: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
-  日: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1, kwhUnit: 'kWh', digits: 3 },
+  日: { outDiv: 1e4, outUnit: '万标箱', kwhDiv: 1e4, kwhUnit: '万kWh', digits: 3 },
   时: { outDiv: 1, outUnit: '箱', kwhDiv: 1, kwhUnit: 'kWh', digits: 3 }
 };
 
@@ -339,28 +337,23 @@ export function overviewLinesCompareOption(ws: WorkshopData): echarts.EChartsOpt
 }
 
 /* ══════════════════════════════════════════════════════════
-   本生产日分时产量与电耗（已产出实心 / 未到时段描边）
+   本生产日分时产量与电耗（已产出实心 / 未到时段留空）
    ══════════════════════════════════════════════════════════ */
-export function todayChartOption(hours: HourPoint[], ratedTotal: number, currentHour: number): echarts.EChartsOption {
+/**
+ * v1.8.7：不再画「未到时段的小时计划产量」。
+ * 计划柱按额定产能 × 88% × 时段系数算，通常远高于刚投产时的实际产量，
+ * 会把产量纵轴顶得很高、实际柱子被压成低矮的一条（现场反馈「纵轴太大、
+ * 实际产量看着很低」）。未到时段留空，纵轴只按实绩自适应。
+ */
+export function todayChartOption(hours: HourPoint[], currentHour: number): echarts.EChartsOption {
   const cats = hours.map((x) => pad2(x.clock));
   const out = hours.map((x) => {
-    if (x.future) {
-      const plan = Math.round(ratedTotal * PLAN_RATE * PROFILE[x.clock]);
-      return {
-        value: plan,
-        itemStyle: {
-          color: 'rgba(88,101,242,.08)',
-          borderColor: 'rgba(88,101,242,.42)',
-          borderWidth: 1,
-          borderType: [3, 3] as number[],
-          borderRadius: [3, 3, 0, 0] as number[]
-        }
-      };
-    }
-    // 产量未接入（null）时柱子留空（null），不能画成 0 高度的实心柱
-    return { value: x.output === null ? null : x.output };
+    // 产量未接入（null）或未到时段：柱子留空，不画成 0 高度的实心柱
+    if (x.future || x.output === null) return { value: null };
+    return { value: x.output };
   });
-  const kwh = hours.map((x) => (x.kwh === null ? null : +(x.kwh / 1000).toFixed(3)));
+  // 小时粒度电量直接用 kWh（v1.8.7：不再折成千kWh）
+  const kwh = hours.map((x) => (x.kwh === null ? null : x.kwh));
 
   return {
     animationDuration: 600,
@@ -368,6 +361,7 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number, current
       ...tip(),
       formatter: (ps: unknown) => {
         const arr = ps as Array<{ dataIndex: number; marker: string; seriesName: string; value: number | null }>;
+        if (!arr.length) return '';
         const idx = arr[0].dataIndex;
         const h = hours[idx];
         /**
@@ -387,7 +381,7 @@ export function todayChartOption(hours: HourPoint[], ratedTotal: number, current
           '<br>';
         arr.forEach((p) => {
           if (p.value === null || p.value === undefined) return;
-          const u = p.seriesName.includes('产量') ? '箱' : '千kWh';
+          const u = p.seriesName.includes('产量') ? '箱' : 'kWh';
           head += `${p.marker}${p.seriesName}：<b style="font-family:monospace">${p.value}</b> ${u}<br>`;
         });
         return head;
