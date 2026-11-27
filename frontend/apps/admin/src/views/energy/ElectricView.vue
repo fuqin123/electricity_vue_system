@@ -18,7 +18,7 @@ import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
-import { closedHourText, usageQuickSpans, usageQuickStart, useEnergyUsage, type UsageRow } from '@/utils/energyUsage';
+import { closedHourText, defaultRangeFor, usageQuickSpans, usageQuickStart, useEnergyUsage, type UsageRow } from '@/utils/energyUsage';
 import { notImplemented } from '@/utils/pending';
 
 const {
@@ -56,9 +56,18 @@ const router = useRouter();
 const QUICK = usageQuickSpans();
 
 function applyQuick(hours: number, gran: 'hour' | 'day' | 'month') {
+  // 先切粒度：钩子里的 watch 会套用该粒度的默认区间，随后再用快捷区间覆盖它。
+  // 顺序反了会被 watch 覆盖成「当月 / 近 12 个月」，近 7 日等快捷按钮就失效了。
+  granularity.value = gran;
   // 终点取「最后一个已结算整点」：小时用量要等整点过后才算得出（v1.4.4）
   range.value = [usageQuickStart(hours), closedHourText()];
-  granularity.value = gran;
+  void load();
+}
+
+/** 粒度切换：先套用该粒度的默认区间（日=当月、月=近12个月），再查询 */
+function onGranularityChange(g: 'hour' | 'day' | 'month') {
+  granularity.value = g;
+  range.value = defaultRangeFor(g);
   void load();
 }
 
@@ -128,7 +137,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
           style="width: 380px"
         />
         <span class="query__label">粒度</span>
-        <el-radio-group v-model="granularity" size="small" @change="load">
+        <el-radio-group v-model="granularity" size="small" @change="onGranularityChange">
           <el-radio-button value="hour">小时</el-radio-button>
           <el-radio-button value="day">日</el-radio-button>
           <el-radio-button value="month">月</el-radio-button>
@@ -231,15 +240,15 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
     <div class="stat-grid">
       <StatCard
         label="区间用电量"
-        :value="data ? big(data.totals.kwh ?? 0, '').v : '--'"
-        :unit="data ? big(data.totals.kwh ?? 0, 'kWh').u : 'kWh'"
+        :value="data ? (data.totals.kwh === null ? '--' : big(data.totals.kwh, '').v) : '--'"
+        :unit="data && data.totals.kwh !== null ? big(data.totals.kwh, 'kWh').u : 'kWh'"
         color="#1664ff"
         :loading="loading"
         :foot="totals ? `${totals.from} 至 ${totals.to} · ${totals.buckets} 个时段` : ''"
       />
       <StatCard
         label="区间折合电量"
-        :value="data ? int(data.totals.kwh ?? 0) : '--'"
+        :value="data ? int(data.totals.kwh) : '--'"
         unit="kWh"
         color="#387bff"
         :loading="loading"

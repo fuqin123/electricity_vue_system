@@ -22,7 +22,7 @@ import StatCard from '@/components/StatCard.vue';
 import ChartPanel from '@/components/ChartPanel.vue';
 import TablePage from '@/components/TablePage.vue';
 import type { TableColumn } from '@/components/table-types';
-import { closedHourText, usageQuickSpans, usageQuickStart, useEnergyUsage, type UsageRow } from '@/utils/energyUsage';
+import { closedHourText, defaultRangeFor, usageQuickSpans, usageQuickStart, useEnergyUsage, type UsageRow } from '@/utils/energyUsage';
 import { notImplemented } from '@/utils/pending';
 
 const props = defineProps<{ energy: 'water' | 'steam' }>();
@@ -63,9 +63,17 @@ const isSteam = computed(() => props.energy === 'steam');
 const QUICK = usageQuickSpans();
 
 function applyQuick(hours: number, gran: 'hour' | 'day' | 'month') {
+  // 先切粒度（触发默认区间），再用快捷区间覆盖，顺序不能反。
+  granularity.value = gran;
   // 终点取「最后一个已结算整点」：小时用量要等整点过后才算得出（v1.4.4）
   range.value = [usageQuickStart(hours), closedHourText()];
-  granularity.value = gran;
+  void load();
+}
+
+/** 粒度切换：先套用该粒度的默认区间（日=当月、月=近12个月），再查询 */
+function onGranularityChange(g: 'hour' | 'day' | 'month') {
+  granularity.value = g;
+  range.value = defaultRangeFor(g);
   void load();
 }
 
@@ -125,19 +133,6 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
       </template>
     </PageHeader>
 
-    <el-alert
-      :type="isSteam ? 'warning' : 'info'"
-      :closable="false"
-      show-icon
-      class="mb-16"
-      :title="isSteam ? '采集提醒' : '数据口径'"
-      :description="
-        isSteam
-          ? '蒸汽表必须启用温压补偿，否则压力波动会被误算成用量波动。车间只有蒸汽总表，无法拆分到产线。'
-          : '车间水表为总表，水耗无法拆分到产线，因此本页只按仪表区分、不按产线筛选。折算强度需用真实历史数据回填后才能用于考核。'
-      "
-    />
-
     <el-card shadow="never" class="mb-16">
       <div class="query__row">
         <span class="query__label">起止时间</span>
@@ -153,7 +148,7 @@ function fetchHours(query: PageQuery): Promise<PageResult<UsageRow>> {
           style="width: 380px"
         />
         <span class="query__label">粒度</span>
-        <el-radio-group v-model="granularity" size="small" @change="load">
+        <el-radio-group v-model="granularity" size="small" @change="onGranularityChange">
           <el-radio-button value="hour">小时</el-radio-button>
           <el-radio-button value="day">日</el-radio-button>
           <el-radio-button value="month">月</el-radio-button>

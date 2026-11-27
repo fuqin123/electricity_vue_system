@@ -128,6 +128,13 @@ def _read_snap7(device: PlcDevice, points: list[PlcPoint]) -> list[dict]:
     client = Client()
     timeout = max(0.2, (device.timeout_ms or 3000) / 1000)
     try:
+        # S7-200 SMART 现场实测需要 PG 连接类型（3），与 `scripts/plc_snap_test.py`
+        # 一致；snap7 3.x 才有该方法，老版本 / 其他型号没有就保持默认。
+        if hasattr(client, "set_connection_type"):
+            try:
+                client.set_connection_type(3)
+            except Exception:  # noqa: BLE001 - 不支持时按默认连接类型继续
+                pass
         client.connect(device.host, int(device.rack), int(device.slot), int(device.port or 102))
         if hasattr(client, "set_timeout"):
             try:

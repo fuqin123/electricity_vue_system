@@ -98,6 +98,32 @@ export function closedHourText(): string {
   return fmt(closedHour());
 }
 
+/** 当前生产月第一天 06:00（「日」粒度的默认起点） */
+function monthFirstDayStart(): Date {
+  const d = anchorDayStart();
+  return new Date(d.getFullYear(), d.getMonth(), 1, 6, 0, 0, 0);
+}
+
+/** 往前 n 个月的 1 日 06:00（「月」粒度的默认起点） */
+function monthsAgoStart(n: number): Date {
+  const d = anchorDayStart();
+  return new Date(d.getFullYear(), d.getMonth() - n, 1, 6, 0, 0, 0);
+}
+
+/**
+ * 各粒度的默认区间（v1.8.7）：
+ *   小时 —— 本生产日 06:00 → 最后一个已结算整点；
+ *   日   —— 当月 1 日 06:00 → 现在（当月已开始的全部日期）；
+ *   月   —— 近 12 个月（含当前生产月）。
+ * 由 `granularity` 变化自动套用，用户再点快捷区间时以快捷区间为准。
+ */
+export function defaultRangeFor(gran: UsageGranularity): [string, string] {
+  const to = closedHourText();
+  if (gran === 'day') return [fmt(monthFirstDayStart()), to];
+  if (gran === 'month') return [fmt(monthsAgoStart(11)), to];
+  return [usageQuickStart(0), to];
+}
+
 export interface UsageSelectionOption {
   /** 编码值：bindingType:<id> / binding:<id> / node:<code> / device:<name> / meter:<code> */
   value: string;
@@ -138,8 +164,17 @@ function selectionParams(value: string): {
 export function useEnergyUsage(energy: UsageEnergy) {
   const meta = META[energy];
 
-  const range = ref<[string, string]>([usageQuickStart(0), closedHourText()]);
+  const range = ref<[string, string]>(defaultRangeFor('hour'));
   const granularity = ref<UsageGranularity>('hour');
+  // 切换粒度时自动套用该粒度的默认区间（sync：保证视图的 @change="load"
+  // 读到的已经是新区间，而不是上一次的「本生产日」）
+  watch(
+    granularity,
+    (g) => {
+      range.value = defaultRangeFor(g);
+    },
+    { flush: 'sync' }
+  );
   const loading = ref(false);
   const data = ref<UsageRangeResult | null>(null);
   /** v1.8.1：图表 / 明细显示哪些指标 */

@@ -110,10 +110,33 @@ function page<T>(rows: T[], query: PageQuery): PageResult<T> {
 export interface RequestOptions extends RequestInit {
   /** 查询参数，自动拼接 */
   params?: Record<string, string | number | boolean | undefined | null>;
+  /**
+   * GET 结果在前端内存中的缓存时长（毫秒）。0 = 不缓存。
+   *
+   * v1.8.7：后台切页面/切回同一查询时不再重复等接口（月/年粒度的区间查询
+   * 要扫大量小时数据，现场反馈加载过慢）。默认 30s；写操作会清空整个缓存。
+   */
+  cacheTtlMs?: number;
+}
+
+/** 默认 GET 缓存时长：能源数据按小时更新，30s 内重复打开同一查询直接用缓存 */
+const DEFAULT_CACHE_TTL_MS = 30_000;
+/** key = 完整 URL（含参数）；promise 让并发请求只发一次 */
+const responseCache = new Map<string, { at: number; promise: Promise<unknown> }>();
+
+/** 手动清空接口缓存（退出登录、强制刷新时可用；prefix 可只清某一类路径） */
+export function clearApiCache(prefix?: string): void {
+  if (!prefix) {
+    responseCache.clear();
+    return;
+  }
+  for (const key of [...responseCache.keys()]) {
+    if (key.startsWith(prefix)) responseCache.delete(key);
+  }
 }
 
 export async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
-  const { params, ...init } = options;
+  const { params, cacheTtlMs = DEFAULT_CACHE_TTL_MS, ...init } = options;
   let fullUrl = API_BASE + url;
   if (params) {
     const qs = new URLSearchParams();
@@ -124,32 +147,54 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
     if (s) fullUrl += `${url.includes('?') ? '&' : '?'}${s}`;
   }
 
-  const token = typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    ...((init.headers as Record<string, string>) ?? {})
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  if (init.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
-
-  const res = await fetch(fullUrl, { ...init, headers });
-
-  if (!res.ok) {
-    // 后端出错时会带 {"detail": "..."} —— 把这句原样抛给界面，
-    // 否则现场只看到「HTTP 409」，不知道到底是「编号重复」还是别的
-    let detail = `HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      if (body && typeof body.detail === 'string') detail = body.detail;
-    } catch {
-      /* 非 JSON 响应，保持 HTTP 状态码文案 */
-    }
-    throw new Error(detail);
+  const method = (init.method ?? 'GET').toUpperCase();
+  const canCache = method === 'GET' && cacheTtlMs > 0;
+  if (canCache) {
+    const hit = responseCache.get(fullUrl);
+    if (hit && Date.now() - hit.at < cacheTtlMs) return hit.promise as Promise<T>;
+  } else if (method !== 'GET') {
+    // 配置/绑定等写操作后，所有 GET 缓存都可能过期，直接清空
+    responseCache.clear();
   }
 
-  const ct = res.headers.get('content-type') ?? '';
-  if (!ct.includes('application/json')) return (await res.text()) as unknown as T;
-  return (await res.json()) as T;
+  const run = (async () => {
+    const token = typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      ...((init.headers as Record<string, string>) ?? {})
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (init.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+
+    const res = await fetch(fullUrl, { ...init, headers });
+
+    if (!res.ok) {
+      // 后端出错时会带 {"detail": "..."} —— 把这句原样抛给界面，
+      // 否则现场只看到「HTTP 409」，不知道到底是「编号重复」还是别的
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body && typeof body.detail === 'string') detail = body.detail;
+      } catch {
+        /* 非 JSON 响应，保持 HTTP 状态码文案 */
+      }
+      throw new Error(detail);
+    }
+
+    const ct = res.headers.get('content-type') ?? '';
+    if (!ct.includes('application/json')) return (await res.text()) as unknown as T;
+    return (await res.json()) as T;
+  })();
+
+  if (canCache) {
+    responseCache.set(fullUrl, { at: Date.now(), promise: run });
+    // 失败不进缓存，否则用户接下来 30s 都会拿到同一个错误
+    run.catch(() => {
+      if (responseCache.get(fullUrl)?.promise === run) responseCache.delete(fullUrl);
+    });
+  }
+
+  return run;
 }
 
 /**
@@ -306,7 +351,9 @@ export const energyApi = {
       return delay({ tree: [], count: 0 } as MeterCategoryResult, 120);
     }
     return request<MeterCategoryResult>('/api/energy/meter-categories', {
-      params: { kind: params.kind }
+      params: { kind: params.kind },
+      // 分类树来自计量点/绑定配置，改动频率低：缓存 5 分钟，避免三个计量页来回切换时重复拉取
+      cacheTtlMs: 5 * 60_000
     });
   },
 

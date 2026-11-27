@@ -849,6 +849,7 @@ def usage_range(
         primary_code = _type_code(kind) if kind else EnergyType.ELECTRIC
         primary_vals: list[float | None] | None = None
         primary_unit = "kWh"
+        elec_vals: list[float | None] | None = None
         for code, gm in groups.items():
             # 单位按能源类型定，不看「排序后的第一块表」
             unit = unit_of(gm)
@@ -882,6 +883,11 @@ def usage_range(
                 util["water"] = vals
             elif code == EnergyType.STEAM:
                 util["steam"] = vals
+            if granularity != "hour" and code == EnergyType.ELECTRIC:
+                # 日 / 月粒度的合计与图表序列同口径（partial 值累加），
+                # 不能用严格 `_range_total_kwh` —— 那一版要求区间内每小时全表可信，
+                # 缺一个小时就整体 None，界面把 None 兜成 0，看起来像「没用过电」。
+                elec_vals = vals
             if code == primary_code and primary_vals is None:
                 primary_vals = vals
                 primary_unit = unit
@@ -916,17 +922,19 @@ def usage_range(
             granularity, start, end, klist=klist, hour_buckets=hour_buckets
         )
         elec_meters = groups.get(EnergyType.ELECTRIC, [])
-        kwh_total = (
-            _range_total_kwh(
+        if not elec_meters:
+            kwh_total = None
+        elif granularity == "hour":
+            kwh_total = _range_total_kwh(
                 elec_meters,
                 win_start,
                 win_end,
                 buckets=hour_buckets,
                 first_ok=first_ok,
             )
-            if elec_meters
-            else None
-        )
+        else:
+            # 日 / 月粒度：与图中电序列一致，累加已出的 partial 值（全空才 None）
+            kwh_total = _sum_optional(elec_vals or [])
         prod_real = any(v is not None for v in prod_values)
         out_total = Decimal(str(sum(v for v in prod_values if v is not None))) if prod_real else Decimal(0)
         payload = _range_payload(
@@ -1022,7 +1030,14 @@ def usage_range(
     win_start, win_end = _query_window(
         granularity, start, end, klist=klist, hour_buckets=hour_buckets
     )
-    kwh_total = _range_total_kwh(meters, win_start, win_end, buckets=hour_buckets)
+    if granularity == "hour":
+        kwh_total = _range_total_kwh(meters, win_start, win_end, buckets=hour_buckets)
+    else:
+        # ⚠ v1.8.7：日 / 月合计必须与上面 series 同口径（汇总表的 partial 值累加）。
+        #   原来这里仍走严格 `_range_total_kwh`（区间每小时全表可信才出数），
+        #   只要有一小时缺采就整段 None；前端把 None 兜成 0，用户看到「区间用电 0」。
+        #   图中却有曲线，两个数字互相矛盾。
+        kwh_total = _sum_optional(regular_usage or [])
 
     # ── 产量 / 单耗（v1.8.1）──
     # scope=line 用该线产量；车间合计 / 全部序列 / 水汽都用整个车间产量。

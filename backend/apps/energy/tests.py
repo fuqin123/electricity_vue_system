@@ -4161,6 +4161,30 @@ class MeterBindingTests(TestCase):
         )
         self.assertEqual(codes, ["TB-AUX-E1", "TB-E1", "TB-E2"])
 
+    def test_日粒度合计与曲线同口径_缺一小时也不显示0(self):
+        """v1.8.7：日/月合计必须与曲线同口径（partial 累加），不能因缺一个小时整段 None。
+
+        现场表现：切到「日 / 月」后曲线有数，但「区间用电」「区间折合电量」显示 0
+        —— 合计走了严格 `_range_total_kwh`（区间每小时全表可信才出数），
+        前端再把 None 兜成 0。
+        """
+        # 当日汇总行是 partial（缺 1 小时）：曲线读它出 777，
+        # 合计也必须给 777，而不是因为小时表缺一格就判 None。
+        EnergyDaily.objects.create(
+            line=self.line, energy_type=etype(), stat_date=self.day,
+            consumption=Decimal("777"), unit="kWh",
+            covered_count=23, expected_count=24, quality=PeriodSummary.Q_PARTIAL,
+        )
+        EnergyHourly.objects.filter(stat_date=self.day, stat_hour=8).delete()
+        now = datetime(2026, 9, 23, 12, 0)
+        rng = ranges.usage_range(
+            self.day, self.day, granularity="day", scope="line",
+            line_code="TB-L1", now=now,
+        )
+        vals = rng["series"][0]["values"]
+        self.assertEqual(vals[0], 777.0)
+        self.assertEqual(rng["totals"]["kwh"], 777.0, "合计不能是 None（界面会显示 0）")
+
     def test_按设备按类型按单表查询用量(self):
         ws_id, type_id, device1 = self._tree_fixture(device_name="一线")
         self._api(
